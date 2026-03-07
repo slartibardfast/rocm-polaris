@@ -1,0 +1,33 @@
+From: rocm-polaris project
+Subject: [PATCH] drm/amdkfd: skip PCIe atomics requirement for legacy GCN chips
+
+KFD refuses to initialize compute queues on GCN 1.2 (gfx8) devices
+when the platform does not support PCIe atomic operations. This blocks
+ROCm/HIP compute on older platforms (pre-Haswell Intel, pre-Zen AMD).
+
+GCN 1.2 GPUs handle atomics via their L2 cache without requiring
+PCIe-level atomic support. The PCIe atomics check was a conservative
+safety measure for system-wide multi-device coherency, which is not
+required for single-GPU compute workloads.
+
+This patch removes the PCIe atomics requirement for all legacy GCN
+chips (the pre-IP-version ASIC path), enabling KFD compute on GCN 1.2
+devices (Carrizo/gfx801, Tonga/gfx802, Fiji/Polaris/gfx803) on
+platforms that lack PCIe atomic operations.
+
+Signed-off-by: David Connolly <david@connol.ly>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -257,9 +257,6 @@
+ 		    asic_type != CHIP_TONGA)
+ 			kfd->device_info.supports_cwsr = true;
+
+-		if (asic_type != CHIP_HAWAII && !vf)
+-			kfd->device_info.needs_pci_atomics = true;
+ 	}
+ }
+

@@ -22,16 +22,20 @@
 - PKGBUILD packaging for Arch with `provides`/`conflicts` against `extra/rocblas`
 - Verify Arch's existing rocm-llvm, hsa-rocr, hip-runtime-amd, comgr packages work with gfx803 as-is
 
+### In scope (added)
+- `linux-lts-rocm-polaris` kernel package: disable `needs_pci_atomics` for gfx8 in `kfd_device.c`
+- Enables KFD compute on platforms without PCIe atomics (pre-Haswell Intel, pre-Zen AMD)
+- Based on Arch `linux-lts` 6.18.16 with identical config, adds one 3-line patch
+
 ### Out of scope
 - GCN 1.0 (gfx6xx) and GCN 1.1 (gfx7xx)
 - Performance tuning tables (Tensile, MIOpen) unless explicitly requested
-- Kernel driver changes (amdgpu already supports these GPUs)
 - Test infrastructure or CI config patches
 
 ## Known Caveats
 
 - **2GB VRAM:** Only quantized micro-models fit (Q4 ~1-2B parameter models)
-- **PCIe atomics:** gfx803 on some platforms lacks PCIe atomics support — BIOS/hardware limitation, not patchable
+- **PCIe atomics:** gfx803 on platforms without PCIe atomics (pre-Haswell Intel, pre-Zen AMD) is blocked by KFD at the kernel level. The check is in `kfd_device.c`: `needs_pci_atomics=true` for all non-Hawaii gfx8 chips, with no firmware version override. **Requires kernel patch or a platform with PCIe atomics.** Test host (dual Xeon X5650, Westmere) triggers this: `kfd: skipped device 1002:6995, PCI rejects atomics 730<0`
 - **Arch `extra/` conflicts:** Our packages must declare `provides`/`conflicts` to coexist or replace official packages
 
 ## Phase 1: Assessment (COMPLETE)
@@ -118,3 +122,5 @@ gfx803 from its CMake target list. We only need to rebuild rocBLAS.
 | 2026-03-07 | Only rocBLAS needs a patch | CMake target list dropped gfx803 at ROCm 6.0; runtime code intact |
 | 2026-03-07 | Use Arch's existing ROCm packages as base | LLVM/ROCR/HIP source still supports gfx8; avoid unnecessary rebuilds |
 | 2026-03-07 | Only rebuild rocBLAS | Only component with gfx803 explicitly removed from build config |
+| 2026-03-07 | Kernel patch needed for test platform | Xeon X5650 lacks PCIe atomics; KFD skips GPU. Patch kfd_device.c |
+| 2026-03-07 | Test 01 confirmed: Arch rocm-llvm has gfx8 | `llc -march=amdgcn -mcpu=help` shows gfx801/802/803 subtargets |
