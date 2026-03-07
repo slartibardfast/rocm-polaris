@@ -18,14 +18,11 @@
 ## Scope
 
 ### In scope
-- rocBLAS: rebuild with gfx803 in target list (only component needing a patch)
-- PKGBUILD packaging for Arch with `provides`/`conflicts` against `extra/rocblas`
-- Verify Arch's existing rocm-llvm, hsa-rocr, hip-runtime-amd, comgr packages work with gfx803 as-is
-
-### In scope (added)
-- `linux-lts-rocm-polaris` kernel package: disable `needs_pci_atomics` for gfx8 in `kfd_device.c`
-- Enables KFD compute on platforms without PCIe atomics (pre-Haswell Intel, pre-Zen AMD)
-- Based on Arch `linux-lts` 6.18.16 with identical config, adds one 3-line patch
+- **`linux-lts-rocm-polaris`** kernel: disable `needs_pci_atomics` for gfx8, add `rmmio_remap` for VI (**DONE**: PCIe atomics patch; **TODO**: MMIO remap)
+- **`hsa-rocr-polaris`**: patch DoorbellType check to accept type 1 (pre-Vega) GPUs
+- **`hip-runtime-amd-polaris`** (optional): remove OpenCL gfx8 gate in `runtimeRocSupported()`
+- **`rocblas-gfx803`**: rebuild with gfx803 in target list (**PKGBUILD ready**)
+- PKGBUILD packaging for all above with `provides`/`conflicts` against `extra/` packages
 
 ### Out of scope
 - GCN 1.0 (gfx6xx) and GCN 1.1 (gfx7xx)
@@ -38,21 +35,32 @@
 - **PCIe atomics:** gfx803 on platforms without PCIe atomics (pre-Haswell Intel, pre-Zen AMD) is blocked by KFD at the kernel level. The check is in `kfd_device.c`: `needs_pci_atomics=true` for all non-Hawaii gfx8 chips, with no firmware version override. **Requires kernel patch or a platform with PCIe atomics.** Test host (dual Xeon X5650, Westmere) triggers this: `kfd: skipped device 1002:6995, PCI rejects atomics 730<0`
 - **Arch `extra/` conflicts:** Our packages must declare `provides`/`conflicts` to coexist or replace official packages
 
-## Phase 1: Assessment (COMPLETE)
+## Phase 1: Assessment (COMPLETE — revised after testing)
 
 Cloned ROCm 7.2.0 submodules and grepped all repos for gfx8xx support status.
 
 ### Findings
 
-**Key discovery: AMD removed gfx8 from build targets, not from source code.** The code supporting gfx801/802/803 is still present across all components.
+**Initial discovery: AMD removed gfx8 from build targets, not from source code.** However, deeper testing revealed additional runtime gates beyond build targets.
 
-| Component | Source Code | Build Targets | Patches Needed |
-|-----------|-------------|---------------|----------------|
-| llvm-project (LLVM/Clang/comgr) | Fully present | Included | **None** |
-| ROCR-Runtime (HSA) | Fully present | Included | **None** |
-| clr (HIP/ROCclr) | Fully present | HIP path open, OpenCL gated | **None** for HIP |
-| HIP (API headers) | Delegates to clr | N/A | **None** |
-| rocBLAS | Runtime code present | Dropped from CMake at 6.0 | **CMake target list** |
+| Component | Source Code | Build Targets | Runtime Gates | Patches Needed |
+|-----------|-------------|---------------|---------------|----------------|
+| llvm-project (LLVM/Clang/comgr) | Fully present | Included | None | **None** |
+| ROCR-Runtime (HSA) | Fully present | Included | **DoorbellType!=2 rejects pre-Vega** | **amd_gpu_agent.cpp:124** |
+| clr (HIP/ROCclr) | Fully present | HIP path open | OpenCL gated by `runtimeRocSupported()` | **device.hpp:1457** (OpenCL only) |
+| HIP (API headers) | Delegates to clr | N/A | None | **None** |
+| rocBLAS | Runtime code present | Dropped from CMake at 6.0 | None | **CMake target list** |
+| Kernel (KFD) | Fully present | N/A | `needs_pci_atomics`, missing `rmmio_remap` | **kfd_device.c, vi.c** |
+
+### Runtime Gates Discovered During Testing
+
+1. **KFD `needs_pci_atomics`** (`kfd_device.c:260`): Blocks GPU on platforms without PCIe atomic ops. **FIXED** in `linux-lts-rocm-polaris`.
+
+2. **ROCR DoorbellType check** (`amd_gpu_agent.cpp:124`): `if (node_props.Capability.ui32.DoorbellType != 2)` throws `HSA_STATUS_ERROR`. Polaris uses DoorbellType=1 (pre-Vega). This is the primary blocker for `hsa_init()`. **Requires hsa-rocr rebuild.**
+
+3. **MMIO remap missing for VI** (`kfd_chardev.c:1134`): `rmmio_remap.bus_addr` is never set for Volcanic Islands GPUs (no NBIO subsystem). KFD returns `-ENOMEM` for `KFD_IOC_ALLOC_MEM_FLAGS_MMIO_REMAP`. The thunk prints "Failed to map remapped mmio page" but continues — **non-fatal warning**, may need kernel patch for full functionality.
+
+4. **CLR OpenCL gate** (`device.hpp:1457`): `!IS_HIP && versionMajor_ == 8` returns false. **HIP path unaffected.** Only matters if OpenCL is needed.
 
 #### Detail: llvm-project
 - `GCNProcessors.td`: gfx801 (carrizo), gfx802 (iceland/tonga), gfx803 (fiji/polaris10/polaris11) all defined
@@ -82,34 +90,39 @@ Cloned ROCm 7.2.0 submodules and grepped all repos for gfx8xx support status.
 - `CMakeLists.txt`: gfx803 present in TARGET_LIST_ROCM_5.6 and 5.7, **removed from 6.0+**
 - Patch: add `gfx803` to TARGET_LIST_ROCM_7.1 (or whichever list 7.2 selects)
 
-### Assessment Summary
+### Assessment Summary (Revised)
 
-This project is much simpler than anticipated. The primary work is:
-1. **PKGBUILD** that builds from source with gfx803 in GPU_TARGETS
-2. **rocBLAS CMake patch** to add gfx803 back to the target list
-3. **Verification** on WX 2100 hardware
+Initial assessment was overly optimistic — "no runtime patches needed" was wrong. While the source code is intact, ROCm 7.2.0 has multiple runtime checks that reject pre-Vega GPUs. The project requires:
 
-No LLVM patches. No runtime patches. No HIP patches.
+1. **Kernel patches** (2): PCIe atomics bypass (done), MMIO remap for VI (TODO)
+2. **hsa-rocr patch** (1): Accept DoorbellType 1 — this is the primary blocker
+3. **rocBLAS patch** (1): Re-enable gfx803 build target (done)
+4. **clr patch** (1, optional): Remove OpenCL gfx8 gate
 
-## Strategy (Revised)
+No LLVM patches needed. No HIP API header patches needed.
 
-**Key insight:** Arch's existing ROCm 7.2.0 packages (rocm-llvm, hsa-rocr, hip-runtime-amd, comgr)
-should already support gfx803 since the source code is intact. Only rocBLAS explicitly dropped
-gfx803 from its CMake target list. We only need to rebuild rocBLAS.
+## Strategy (Revised — Comprehensive `-polaris` Builds)
 
-### Phase 2: rocBLAS PKGBUILD
-- Write PKGBUILD for `rocblas-gfx803` that rebuilds rocBLAS with gfx803 in target list
-- Apply `patches/rocBLAS/0001-re-enable-gfx803-target.patch`
-- `provides=('rocblas')` / `conflicts=('rocblas')` to replace Arch's package
-- Depends on Arch's existing rocm-llvm, hip-runtime-amd, comgr, etc.
+Build custom `-polaris` packages for every component with a gfx8 gate:
+
+### Phase 2a: hsa-rocr-polaris (CRITICAL PATH)
+- Patch `amd_gpu_agent.cpp:124`: accept DoorbellType 1 for gfx8
+- Build `hsa-rocr-polaris` package: `provides=('hsa-rocr=7.2.0')` / `conflicts=('hsa-rocr')`
+- This unblocks `hsa_init()` and `rocminfo`
+
+### Phase 2b: Kernel MMIO remap (MAY BE NEEDED)
+- Add `rmmio_remap.bus_addr` initialization for VI/Polaris in kernel
+- Without this, HDP flush via MMIO is unavailable — may cause performance issues or runtime errors
+- Can defer if hsa-rocr-polaris alone gets rocminfo working
+
+### Phase 2c: rocBLAS (PKGBUILD READY)
+- Apply existing `0001-re-enable-gfx803-target.patch`
+- Build with `makepkg -s`
 
 ### Phase 3: Verify + Test
-- Install Arch's ROCm stack: `pacman -S rocm-hip-runtime rocminfo`
-- Install our custom rocblas-gfx803 package
-- Verify `rocminfo` detects WX 2100 as gfx803 (requires hardware)
-- Verify comgr can compile trivial HIP kernel for gfx803
-- Test inference workload (e.g., llama.cpp with small quantized model)
-- If Arch's base packages fail, expand scope to rebuild those too
+- Install hsa-rocr-polaris, verify `rocminfo` detects WX 2100
+- Run `hipcc` compile test for gfx803
+- Install rocblas-gfx803, test inference workload
 
 ## Decisions Log
 
@@ -118,9 +131,9 @@ gfx803 from its CMake target list. We only need to rebuild rocBLAS.
 | 2026-03-07 | Target ROCm 7.2.0 | Matches Arch extra/, latest upstream |
 | 2026-03-07 | Scope limited to gfx801/802/803 | GCN 1.2 only, matching project charter |
 | 2026-03-07 | WX 2100 as primary test hardware | Available single-slot gfx803 card for micro-LLM use case |
-| 2026-03-07 | No LLVM/ROCR/HIP patches needed | Source code fully supports gfx8; only build targets removed |
-| 2026-03-07 | Only rocBLAS needs a patch | CMake target list dropped gfx803 at ROCm 6.0; runtime code intact |
-| 2026-03-07 | Use Arch's existing ROCm packages as base | LLVM/ROCR/HIP source still supports gfx8; avoid unnecessary rebuilds |
-| 2026-03-07 | Only rebuild rocBLAS | Only component with gfx803 explicitly removed from build config |
 | 2026-03-07 | Kernel patch needed for test platform | Xeon X5650 lacks PCIe atomics; KFD skips GPU. Patch kfd_device.c |
 | 2026-03-07 | Test 01 confirmed: Arch rocm-llvm has gfx8 | `llc -march=amdgcn -mcpu=help` shows gfx801/802/803 subtargets |
+| 2026-03-07 | **hsa-rocr needs patching** | DoorbellType!=2 check in `amd_gpu_agent.cpp:124` rejects Polaris (type 1). Root cause of `hsa_init` failure. |
+| 2026-03-07 | **MMIO remap missing for VI** | `rmmio_remap.bus_addr` never set for Polaris in kernel. KFD returns -ENOMEM for MMIO_REMAP alloc. Non-fatal but may affect HDP flush perf. |
+| 2026-03-07 | Revised strategy: comprehensive -polaris builds | Stock Arch packages have multiple runtime gates; build custom packages for all gated components |
+| 2026-03-07 | Community prior art: xuhuisheng/rocm-gfx803 | Built custom hsa-rocr starting at ROCm 5.3.0; confirms runtime patching needed. NULL0xFF/rocm-gfx803 uses ROCm 6.1.5 on EPYC (has PCIe atomics). |
