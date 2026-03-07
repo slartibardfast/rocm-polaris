@@ -1,0 +1,15 @@
+[submodule "submodules/HIP"]
+	path = submodules/HIP
+	url = https://github.com/ROCm/HIP.git
+[submodule "submodules/clr"]
+	path = submodules/clr
+	url = https://github.com/ROCm/clr.git
+[submodule "submodules/ROCR-Runtime"]
+	path = submodules/ROCR-Runtime
+	url = https://github.com/ROCm/ROCR-Runtime.git
+[submodule "submodules/rocBLAS"]
+	path = submodules/rocBLAS
+	url = https://github.com/ROCm/rocBLAS.git
+[submodule "submodules/llvm-project"]
+	path = submodules/llvm-project
+	url = https://github.com/ROCm/llvm-project.git
