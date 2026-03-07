@@ -18,12 +18,9 @@
 ## Scope
 
 ### In scope
-- LLVM/Clang AMDGPU backend: re-enable gfx801/gfx802/gfx803 targets
-- ROCR-Runtime (HSA): device enumeration and firmware loading for gfx8xx
-- HIP runtime: device-to-ISA mapping for gfx8xx
-- ROCclr / amd_comgr: compiler runtime support
-- rocBLAS: only if needed for inference workloads
-- PKGBUILD packaging for Arch with `provides`/`conflicts` against `extra/`
+- rocBLAS: rebuild with gfx803 in target list (only component needing a patch)
+- PKGBUILD packaging for Arch with `provides`/`conflicts` against `extra/rocblas`
+- Verify Arch's existing rocm-llvm, hsa-rocr, hip-runtime-amd, comgr packages work with gfx803 as-is
 
 ### Out of scope
 - GCN 1.0 (gfx6xx) and GCN 1.1 (gfx7xx)
@@ -90,20 +87,25 @@ This project is much simpler than anticipated. The primary work is:
 
 No LLVM patches. No runtime patches. No HIP patches.
 
-## Phases (Revised)
+## Strategy (Revised)
 
-### Phase 2: PKGBUILD + rocBLAS patch
-- Write PKGBUILD that builds llvm-project, ROCR-Runtime, clr, HIP, rocBLAS from source
-- Pass `-DGPU_TARGETS="gfx801;gfx802;gfx803"` (or append to default list)
-- Patch rocBLAS CMakeLists.txt to include gfx803 in target list
-- Set up `provides`/`conflicts` against Arch `extra/` packages
+**Key insight:** Arch's existing ROCm 7.2.0 packages (rocm-llvm, hsa-rocr, hip-runtime-amd, comgr)
+should already support gfx803 since the source code is intact. Only rocBLAS explicitly dropped
+gfx803 from its CMake target list. We only need to rebuild rocBLAS.
 
-### Phase 3: Build + Test
-- `makepkg -s` clean build
-- Verify `llc --version | grep gfx803`
-- Verify `rocminfo` detects WX 2100 as gfx803
+### Phase 2: rocBLAS PKGBUILD
+- Write PKGBUILD for `rocblas-gfx803` that rebuilds rocBLAS with gfx803 in target list
+- Apply `patches/rocBLAS/0001-re-enable-gfx803-target.patch`
+- `provides=('rocblas')` / `conflicts=('rocblas')` to replace Arch's package
+- Depends on Arch's existing rocm-llvm, hip-runtime-amd, comgr, etc.
+
+### Phase 3: Verify + Test
+- Install Arch's ROCm stack: `pacman -S rocm-hip-runtime rocminfo`
+- Install our custom rocblas-gfx803 package
+- Verify `rocminfo` detects WX 2100 as gfx803 (requires hardware)
 - Verify comgr can compile trivial HIP kernel for gfx803
 - Test inference workload (e.g., llama.cpp with small quantized model)
+- If Arch's base packages fail, expand scope to rebuild those too
 
 ## Decisions Log
 
@@ -114,3 +116,5 @@ No LLVM patches. No runtime patches. No HIP patches.
 | 2026-03-07 | WX 2100 as primary test hardware | Available single-slot gfx803 card for micro-LLM use case |
 | 2026-03-07 | No LLVM/ROCR/HIP patches needed | Source code fully supports gfx8; only build targets removed |
 | 2026-03-07 | Only rocBLAS needs a patch | CMake target list dropped gfx803 at ROCm 6.0; runtime code intact |
+| 2026-03-07 | Use Arch's existing ROCm packages as base | LLVM/ROCR/HIP source still supports gfx8; avoid unnecessary rebuilds |
+| 2026-03-07 | Only rebuild rocBLAS | Only component with gfx803 explicitly removed from build config |
