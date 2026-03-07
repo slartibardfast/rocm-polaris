@@ -37,15 +37,14 @@ diff --git a/runtime/hsa-runtime/image/image_runtime.cpp b/runtime/hsa-runtime/i
 
    get_instance().store(instance, std::memory_order_release);
    return instance;
-@@ -271,7 +271,10 @@
+@@ -271,7 +271,9 @@
    // Image is only supported on a GPU device.
 
    if (device_type == HSA_DEVICE_TYPE_GPU) {
 -    image_manager(component)->GetImageInfoMaxDimension(
 +    auto* mgr = image_manager(component);
-+    if (mgr == NULL)
-+      return HSA_STATUS_ERROR_INVALID_AGENT;
-+    mgr->GetImageInfoMaxDimension(
++    if (mgr != NULL)
++      mgr->GetImageInfoMaxDimension(
          component, geometry, width, height, depth, array_size);
    }
 
