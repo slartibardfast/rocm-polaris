@@ -1,0 +1,21 @@
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
+@@ -242,14 +242,10 @@
+ 	if (!topo_dev)
+ 		return -EINVAL;
+
+-	/* AQL queues on GFX7 and GFX8 appear twice their actual size */
+-	if (properties->type == KFD_QUEUE_TYPE_COMPUTE &&
+-	    properties->format == KFD_QUEUE_FORMAT_AQL &&
+-	    topo_dev->node_props.gfx_target_version >= 70000 &&
+-	    topo_dev->node_props.gfx_target_version < 90000)
+-		expected_queue_size = properties->queue_size / 2;
+-	else
+-		expected_queue_size = properties->queue_size;
++	/* The ring buffer BO is always the full queue_size from userspace.
++	 * The GFX7/8 AQL "double size" is a CP register encoding detail,
++	 * not a BO allocation convention, so do not halve here. */
++	expected_queue_size = properties->queue_size;
+
+ 	vm = drm_priv_to_vm(pdd->drm_priv);
+ 	err = amdgpu_bo_reserve(vm->root.bo, false);

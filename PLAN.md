@@ -94,7 +94,7 @@ Cloned ROCm 7.2.0 submodules and grepped all repos for gfx8xx support status.
 
 Initial assessment was overly optimistic — "no runtime patches needed" was wrong. While the source code is intact, ROCm 7.2.0 has multiple runtime checks that reject pre-Vega GPUs. The project requires:
 
-1. **Kernel patches** (2): PCIe atomics bypass (done), MMIO remap for VI (TODO)
+1. **Kernel patches** (3): PCIe atomics bypass (done), AQL queue size fix (done), MMIO remap for VI (TODO)
 2. **hsa-rocr patch** (1): Accept DoorbellType 1 — this is the primary blocker
 3. **rocBLAS patch** (1): Re-enable gfx803 build target (done)
 4. **clr patch** (1, optional): Remove OpenCL gfx8 gate
@@ -137,3 +137,4 @@ Build custom `-polaris` packages for every component with a gfx8 gate:
 | 2026-03-07 | **MMIO remap missing for VI** | `rmmio_remap.bus_addr` never set for Polaris in kernel. KFD returns -ENOMEM for MMIO_REMAP alloc. Non-fatal but may affect HDP flush perf. |
 | 2026-03-07 | Revised strategy: comprehensive -polaris builds | Stock Arch packages have multiple runtime gates; build custom packages for all gated components |
 | 2026-03-07 | Community prior art: xuhuisheng/rocm-gfx803 | Built custom hsa-rocr starting at ROCm 5.3.0; confirms runtime patching needed. NULL0xFF/rocm-gfx803 uses ROCm 6.1.5 on EPYC (has PCIe atomics). |
+| 2026-03-07 | **KFD AQL queue ring buffer size mismatch** | `kfd_queue.c:250` halves `expected_queue_size` for AQL on GFX7/8, but ROCR allocates full-size ring buffer BO. `kfd_queue_buffer_get` requires exact BO size match → EINVAL on any queue > 2KB. Utility queue passes by accident (2048-byte expected → 0 pages → size check skipped). Fix: remove the halving — it's a CP register encoding detail, not a BO allocation convention. Only affects GFX7/8 code path. |
