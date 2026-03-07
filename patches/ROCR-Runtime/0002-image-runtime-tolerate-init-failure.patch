@@ -1,0 +1,51 @@
+# Tolerate image manager init failure for individual GPUs
+#
+# When ImageManagerKv::Initialize() fails (e.g. AddrCreate fails for
+# GCN 1.2 GPUs), CreateImageManager returns an error which causes
+# hsa_iterate_agents to abort, destroying the entire ImageRuntime
+# singleton. This makes ImageRuntime::instance() return NULL, and all
+# 17 call sites in hsa_ext_image.cpp dereference it without checking,
+# causing segfaults during HIP device enumeration.
+#
+# Fix: if a GPU's image manager fails to initialize, skip that GPU
+# and continue instead of aborting the entire image runtime. The GPU
+# won't support image operations but compute dispatch works fine.
+#
+# Also add NULL guard in GetImageInfoMaxDimension for GPUs without
+# image support, and remove the non-empty image_managers_ assertion.
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+diff --git a/runtime/hsa-runtime/image/image_runtime.cpp b/runtime/hsa-runtime/image/image_runtime.cpp
+--- a/runtime/hsa-runtime/image/image_runtime.cpp
++++ b/runtime/hsa-runtime/image/image_runtime.cpp
+@@ -127,7 +127,8 @@
+
+     if (hsa_error_code != HSA_STATUS_SUCCESS) {
+       delete image_manager;
+-      return hsa_error_code;
++      // Continue without image support for this GPU.
++      return HSA_STATUS_SUCCESS;
+     }
+
+     runtime->image_managers_[agent.handle] = image_manager;
+@@ -188,7 +189,6 @@
+   }
+
+   assert(instance->kernarg_pool_.handle != 0);
+-  assert(instance->image_managers_.size() != 0);
+
+   get_instance().store(instance, std::memory_order_release);
+   return instance;
+@@ -271,7 +271,10 @@
+   // Image is only supported on a GPU device.
+
+   if (device_type == HSA_DEVICE_TYPE_GPU) {
+-    image_manager(component)->GetImageInfoMaxDimension(
++    auto* mgr = image_manager(component);
++    if (mgr == NULL)
++      return HSA_STATUS_ERROR_INVALID_AGENT;
++    mgr->GetImageInfoMaxDimension(
+         component, geometry, width, height, depth, array_size);
+   }
+

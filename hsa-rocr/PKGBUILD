@@ -19,8 +19,10 @@ conflicts=('hsa-rocr' 'hsakmt-roct')
 replaces=('hsa-rocr' 'hsakmt-roct')
 makedepends=('cmake' 'rocm-llvm' 'xxd')
 source=("rocm-${pkgver}.tar.gz::$url/archive/rocm-$pkgver.tar.gz"
-        '0001-allow-doorbell-type-1-for-gfx8.patch')
+        '0001-allow-doorbell-type-1-for-gfx8.patch'
+        '0002-image-runtime-tolerate-init-failure.patch')
 sha256sums=('728ea7e9bf16e6ed217a0fd1a8c9afaba2dae2e7908fa4e27201e67c803c5638'
+            'SKIP'
             'SKIP')
 _dirname="$(basename "$url")-rocm-$pkgver"/projects/rocr-runtime/
 options=(!lto)
@@ -28,6 +30,7 @@ options=(!lto)
 prepare() {
   cd "$_dirname"
   patch -Np1 -i "$srcdir/0001-allow-doorbell-type-1-for-gfx8.patch"
+  patch -Np1 -i "$srcdir/0002-image-runtime-tolerate-init-failure.patch"
 }
 
 build() {
