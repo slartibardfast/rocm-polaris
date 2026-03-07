@@ -1,0 +1,25 @@
+# Allow DoorbellType 1 (pre-Vega) GPUs in HSA runtime
+#
+# ROCm 7.2.0 rejects GPUs with DoorbellType != 2, which excludes all
+# GCN 1.2 (gfx801/802/803) GPUs that use the older doorbell mechanism.
+# The runtime code already handles both doorbell types through generic
+# HSA APIs — this check is a policy gate, not a functional requirement.
+#
+# Remove the DoorbellType == 2 restriction to allow Polaris/Fiji/Tonga/
+# Carrizo GPUs to initialize through hsa_init().
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+diff --git a/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp b/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+--- a/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
++++ b/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+@@ -121,9 +121,6 @@
+   const bool is_apu_node = (properties_.NumCPUCores > 0);
+   profile_ = (is_apu_node) ? HSA_PROFILE_FULL : HSA_PROFILE_BASE;
+
+-  if (node_props.Capability.ui32.DoorbellType != 2)
+-    throw AMD::hsa_exception(HSA_STATUS_ERROR, "Agent creation failed.\nThe GPU node uses a deprecated doorbell type\n");
+-
+   hsa_status_t err = driver().GetClockCounters(node_id(), &t0_);
+   t1_ = t0_;
+   historical_clock_ratio_ = 0.0;
