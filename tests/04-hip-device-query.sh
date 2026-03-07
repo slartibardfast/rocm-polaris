@@ -16,6 +16,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 cat > "$tmpdir/devquery.cpp" << 'SRC'
 #include <hip/hip_runtime.h>
 #include <cstdio>
+#include <cstring>
 
 int main() {
     int count = 0;
@@ -28,9 +29,8 @@ int main() {
     for (int i = 0; i < count; i++) {
         hipDeviceProp_t props;
         hipGetDeviceProperties(&props, i);
-        printf("Device %d: %s (gfx%x%x%x)\n", i, props.name,
-               props.gcnArchMajor, props.gcnArchMinor, props.gcnArchPatch);
-        if (props.gcnArchMajor == 8)
+        printf("Device %d: %s (%s)\n", i, props.name, props.gcnArchName);
+        if (strncmp(props.gcnArchName, "gfx80", 5) == 0)
             pass = 1;
     }
     if (pass)
