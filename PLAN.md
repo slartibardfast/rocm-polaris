@@ -137,4 +137,46 @@ Build custom `-polaris` packages for every component with a gfx8 gate:
 | 2026-03-07 | **MMIO remap missing for VI** | `rmmio_remap.bus_addr` never set for Polaris in kernel. KFD returns -ENOMEM for MMIO_REMAP alloc. Non-fatal but may affect HDP flush perf. |
 | 2026-03-07 | Revised strategy: comprehensive -polaris builds | Stock Arch packages have multiple runtime gates; build custom packages for all gated components |
 | 2026-03-07 | Community prior art: xuhuisheng/rocm-gfx803 | Built custom hsa-rocr starting at ROCm 5.3.0; confirms runtime patching needed. NULL0xFF/rocm-gfx803 uses ROCm 6.1.5 on EPYC (has PCIe atomics). |
-| 2026-03-07 | **KFD AQL queue ring buffer size mismatch** | `kfd_queue.c:250` halves `expected_queue_size` for AQL on GFX7/8, but ROCR allocates full-size ring buffer BO. `kfd_queue_buffer_get` requires exact BO size match → EINVAL on any queue > 2KB. Utility queue passes by accident (2048-byte expected → 0 pages → size check skipped). Fix: remove the halving — it's a CP register encoding detail, not a BO allocation convention. Only affects GFX7/8 code path. |
+| 2026-03-07 | **KFD AQL queue ring buffer size mismatch** (see Debugging Notes below) | `kfd_queue.c:250` halves `expected_queue_size` for AQL on GFX7/8, but ROCR allocates full-size ring buffer BO. `kfd_queue_buffer_get` requires exact BO size match → EINVAL on any queue > 2KB. Utility queue passes by accident (2048-byte expected → 0 pages → size check skipped). Fix: remove the halving — it's a CP register encoding detail, not a BO allocation convention. Only affects GFX7/8 code path. |
+
+## Debugging Notes
+
+### AQL Queue EINVAL — Root Cause Analysis
+
+**Symptom:** Any HIP operation that dispatches GPU work (hipMemset, kernel launch) crashes with SIGSEGV. The segfault occurs in `ScratchCache::freeMain` (`scratch_cache.h:177`) during error cleanup after `AqlQueue` constructor throws — the real error is `AMDKFD_IOC_CREATE_QUEUE` returning EINVAL.
+
+**Observation:** The *first* CREATE_QUEUE (utility/internal queue, ring_size=4096) succeeds. The *second* (user queue, ring_size=65536) fails. Both have identical ctl_stack_size, eop_size, ctx_save_restore_size, priority, queue_type.
+
+**Debugging approach:**
+
+1. **strace** confirmed the ioctl failure: `ioctl(3, AMDKFD_IOC_CREATE_QUEUE, ...) = -1 EINVAL`. But strace can't decode KFD ioctl struct fields — it just shows the pointer address.
+
+2. **LD_PRELOAD ioctl interceptor** — wrote a small C shared library that intercepts `ioctl()`, checks if the request matches `AMDKFD_IOC_CREATE_QUEUE` (by matching the ioctl type/nr bytes `'K'/0x02`), and dumps all struct fields before and after the real call. This revealed the exact parameter values for both calls:
+   ```
+   Queue 1 (OK):   ring_size=4096,  eop=4096, ctx_size=2789376, ctl_stack=4096
+   Queue 2 (FAIL): ring_size=65536, eop=4096, ctx_size=2789376, ctl_stack=4096
+   ```
+   All fields identical except ring_base address and ring_size. This narrowed the problem to ring buffer validation.
+
+3. **Kernel source analysis** — traced the ioctl handler chain:
+   - `kfd_ioctl_create_queue` → `set_queue_properties_from_user` (basic validation — all params pass)
+   - → `kfd_queue_acquire_buffers` (BO ownership validation — **newer code, added after GFX8 was dropped**)
+   - → `kfd_queue_buffer_get` (looks up VM mapping by address, requires exact size match)
+
+4. **Found the halving** at `kfd_queue.c:245-250`:
+   ```c
+   /* AQL queues on GFX7 and GFX8 appear twice their actual size */
+   if (format == AQL && gfx_version < 90000)
+       expected_queue_size = queue_size / 2;
+   ```
+   This halves the expected BO size for the ring buffer lookup on GFX7/8.
+
+5. **Traced the allocation side** — ROCR's `AqlQueue::AllocRegisteredRingBuffer` allocates `queue_size_pkts * sizeof(AqlPacket)` = full size. The BO mapping in the GPU VM is the full allocation.
+
+6. **Size mismatch confirmed:**
+   - Queue 1: `expected = 4096/2 = 2048 bytes = 0 pages` → size==0 skips the check → **passes by accident**
+   - Queue 2: `expected = 65536/2 = 32768 = 8 pages`, but BO mapping is 16 pages → **mismatch → EINVAL**
+
+**Key insight:** The BO validation (`kfd_queue_acquire_buffers` / `kfd_queue_buffer_get`) was added to prevent userspace from passing arbitrary addresses. It was implemented after GFX8 was already dropped from ROCm, so the AQL size halving was never tested against real GFX8 hardware. The halving is correct for the CP hardware register encoding but wrong for BO validation — the BO is always the full size.
+
+**Fix:** Remove the GFX7/8 AQL size halving in `kfd_queue_acquire_buffers`. Kernel patch `0005-kfd-fix-aql-queue-ring-buffer-size-check-for-gfx8.patch`. Only affects code paths where `gfx_target_version < 90000`, which is exclusively GFX7/8 — no impact on GFX9+.
