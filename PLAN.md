@@ -105,24 +105,33 @@ No LLVM patches needed. No HIP API header patches needed.
 
 Build custom `-polaris` packages for every component with a gfx8 gate:
 
-### Phase 2a: hsa-rocr-polaris (CRITICAL PATH)
+### Phase 2a: hsa-rocr-polaris (DONE)
 - Patch `amd_gpu_agent.cpp:124`: accept DoorbellType 1 for gfx8
-- Build `hsa-rocr-polaris` package: `provides=('hsa-rocr=7.2.0')` / `conflicts=('hsa-rocr')`
-- This unblocks `hsa_init()` and `rocminfo`
+- Patch `image_runtime.cpp`: skip image dimension query when image_manager is NULL
+- Built `hsa-rocr-polaris` 7.2.0-1: `provides=('hsa-rocr=7.2.0')` / `conflicts=('hsa-rocr')`
+- **Result:** `hsa_init()` works, `rocminfo` detects WX 2100, HIP device enumeration works
 
-### Phase 2b: Kernel MMIO remap (MAY BE NEEDED)
+### Phase 2b: Kernel AQL queue fix (DONE)
+- `kfd_queue.c:250` halved expected ring buffer size for GFX7/8 AQL — mismatch with ROCR allocation
+- Patch `0005-kfd-fix-aql-queue-ring-buffer-size-check-for-gfx8.patch` removes the halving
+- Built `linux-lts-rocm-polaris` 6.18.16-2
+- **Result:** Both queue creations succeed (`hsa_queue_create` returns 0)
+
+### Phase 2c: Kernel MMIO remap (MAY BE NEEDED)
 - Add `rmmio_remap.bus_addr` initialization for VI/Polaris in kernel
 - Without this, HDP flush via MMIO is unavailable — may cause performance issues or runtime errors
-- Can defer if hsa-rocr-polaris alone gets rocminfo working
+- Can defer unless it turns out to be the GPU dispatch hang cause
 
-### Phase 2c: rocBLAS (PKGBUILD READY)
+### Phase 2d: rocBLAS (PKGBUILD READY)
 - Apply existing `0001-re-enable-gfx803-target.patch`
 - Build with `makepkg -s`
 
-### Phase 3: Verify + Test
-- Install hsa-rocr-polaris, verify `rocminfo` detects WX 2100
-- Run `hipcc` compile test for gfx803
-- Install rocblas-gfx803, test inference workload
+### Phase 3: GPU dispatch debugging (CURRENT)
+- HSA queue creation works, but GPU command execution appears to hang
+- HIP test (`hipcc --offload-arch=gfx803`) hangs in HIP runtime static init after queues and memory allocations succeed
+- Pure HSA test (`hsa_queue_create`) works — queue creation confirmed fixed
+- Next: investigate whether GPU dispatches (blit kernels, hipMemset) actually execute or hang on the GPU
+- Possible causes: trap handler, CWSR, HDP flush, doorbell write semantics, or blit kernel code object incompatibility with gfx803
 
 ## Decisions Log
 
@@ -138,6 +147,7 @@ Build custom `-polaris` packages for every component with a gfx8 gate:
 | 2026-03-07 | Revised strategy: comprehensive -polaris builds | Stock Arch packages have multiple runtime gates; build custom packages for all gated components |
 | 2026-03-07 | Community prior art: xuhuisheng/rocm-gfx803 | Built custom hsa-rocr starting at ROCm 5.3.0; confirms runtime patching needed. NULL0xFF/rocm-gfx803 uses ROCm 6.1.5 on EPYC (has PCIe atomics). |
 | 2026-03-07 | **KFD AQL queue ring buffer size mismatch** (see Debugging Notes below) | `kfd_queue.c:250` halves `expected_queue_size` for AQL on GFX7/8, but ROCR allocates full-size ring buffer BO. `kfd_queue_buffer_get` requires exact BO size match → EINVAL on any queue > 2KB. Utility queue passes by accident (2048-byte expected → 0 pages → size check skipped). Fix: remove the halving — it's a CP register encoding detail, not a BO allocation convention. Only affects GFX7/8 code path. |
+| 2026-03-08 | **Queue creation confirmed fixed** | After kernel 6.18.16-2, both CREATE_QUEUE ioctls return 0. Pure HSA test creates queue and destroys it successfully. HIP test hangs in runtime static init after all ioctls succeed — GPU dispatch execution issue, not queue creation. |
 
 ## Debugging Notes
 
