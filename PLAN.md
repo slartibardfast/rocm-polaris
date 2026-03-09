@@ -207,10 +207,76 @@ Audited all six suspected causes against the ROCR-Runtime 7.2.0 and kernel sourc
    - CWSR is enabled (`supports_cwsr=true` for Polaris 12).
    - MEC firmware loaded: version 0x2da, feature version 49.
 
-**Investigation plan:**
-1. **Test `sched_policy=1` (NO_HWS mode)** — bypasses HWS entirely, loads queues directly to MEC pipe/queue slots via MMIO registers. If queues work in NO_HWS mode, the problem is definitively in HWS queue mapping. Requires kernel module parameter: `amdgpu.sched_policy=1`.
-2. **If NO_HWS works:** investigate the MAP_QUEUES packet format in `kfd_packet_manager_vi.c` — compare field-by-field with the MEC firmware expectations. The `queue_type` and `engine_sel` fields may need adjustment for gfx8.
-3. **If NO_HWS also fails:** the problem is in MQD setup itself (`kfd_mqd_manager_vi.c`) or in the `hqd_load` path for direct queue loading.
+#### MQD comparison: VI vs V9 (2026-03-09)
+
+Systematic field-by-field comparison of `kfd_mqd_manager_vi.c` vs `kfd_mqd_manager_v9.c` for AQL queues. Cross-referenced against gfx_8_0 hardware register headers to determine which bits actually exist on gfx8.
+
+**Missing from VI MQD — bits that EXIST on gfx8 hardware:**
+
+1. **`DOORBELL_BIF_DROP`** (bit 1 of `cp_hqd_pq_doorbell_control`) — set by V9/V10/V11/V12 `update_mqd` for AQL queues. The bit exists in `gfx_8_0_sh_mask.h` and `gfx_8_1_sh_mask.h`. VI MQD never sets it. This controls how the Bus Interface handles doorbell writes for AQL queues — likely critical for the MEC to properly process wptr updates via doorbell.
+
+2. **`UNORD_DISPATCH`** (bit 28 of `cp_hqd_pq_control`) — set unconditionally by V9 `init_mqd`. Exists in `gfx_8_0_sh_mask.h`. VI never sets it. Enables unordered dispatch (packets can be processed out of order when dependencies allow).
+
+**Missing from VI MQD — bits that do NOT exist on gfx8 (no action):**
+
+3. `QUEUE_FULL_EN` (bit 14 of `cp_hqd_pq_control`) — V9+ only. Not in gfx_8_0 register headers.
+4. `WPP_CLAMP_EN` (bit 13 of `cp_hqd_pq_control`) — V9+ only.
+5. `cp_hqd_aql_control` register — V9+ only. Not in `vi_structs.h`.
+6. `cp_hqd_hq_status0` bit 14 (DISPATCH_PTR) — bit 14 is reserved on gfx8 (only bits 0-9 defined).
+
+**Identical between VI and V9:**
+
+- `NO_UPDATE_RPTR` and `SLOT_BASED_WPTR` (AQL-specific `cp_hqd_pq_control` bits) — both set
+- `RPTR_BLOCK_SIZE = 5` — both set
+- EOP buffer setup — both configure `eop_control`, `eop_base_addr`
+- Doorbell offset calculation — both set `DOORBELL_OFFSET` in doorbell control
+- CWSR context save/restore — both configure identically
+- Quantum settings — both identical
+- `cp_hqd_persistent_state` — both set `PRELOAD_REQ` and `PRELOAD_SIZE=0x53`
+- `cp_hqd_iq_rptr = 1` for AQL — both set
+
+**Other VI vs V9 differences (not AQL-specific):**
+
+- V9 sets `CP_MQD_CONTROL__PRIV_STATE` without `MTYPE`, VI sets both `PRIV_STATE` and `MTYPE_UC`
+- V9 sets `IB_EXE_DISABLE`, VI sets `IB_ATC` and `MTYPE` in `cp_hqd_ib_control`
+- V9 sets `cp_hqd_iq_timer = 0`, VI sets ATC and MTYPE bits in it
+- These reflect legitimate V8↔V9 memory model differences (ATC/MTYPE vs UTCL2)
+
+#### Attack plan (2026-03-09)
+
+**Priority 1: Kernel patch — add missing AQL bits to VI MQD manager**
+
+Patch `kfd_mqd_manager_vi.c` to add two missing AQL-specific bits:
+
+```c
+// In __update_mqd(), within the AQL format block:
+if (q->format == KFD_QUEUE_FORMAT_AQL) {
+    m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK |
+            2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
+    m->cp_hqd_pq_doorbell_control |= 1 <<
+            CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_BIF_DROP__SHIFT;  // NEW
+}
+
+// In init_mqd(), add UNORD_DISPATCH to pq_control init:
+m->cp_hqd_pq_control = 5 << CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT |
+        CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK;  // NEW
+```
+
+Rationale: `DOORBELL_BIF_DROP` is set for AQL queues on every generation from V9 through V12. The bit exists on gfx8 hardware but VI's MQD manager never sets it. This is the most likely cause of the MEC firmware not activating AQL queues — without this bit, the doorbell/wptr mechanism for AQL may not function correctly, preventing the CP from fetching packets.
+
+`UNORD_DISPATCH` is set unconditionally by V9 `init_mqd`. While less likely to be the root cause, it exists on gfx8 and should be set for correct AQL behavior.
+
+**Priority 2: Test with `sched_policy=1` (NO_HWS) if MQD patch fails**
+
+Bypasses HWS entirely, loads queues directly via MMIO registers (`kgd_hqd_load` in `amdgpu_amdkfd_gfx_v8.c`). The direct-load path explicitly sets `DOORBELL_EN` and `CP_HQD_ACTIVE` — fields that HWS normally manages. If dispatch works in NO_HWS but not CPSCH, the problem is in HWS queue activation, not MQD contents. Requires reboot with `amdgpu.sched_policy=1`.
+
+**Priority 3: MAP_QUEUES packet format audit**
+
+If both the MQD patch and NO_HWS fail, investigate the MAP_QUEUES PM4 packet built by `kfd_packet_manager_vi.c`. The packet structure was verified correct during the investigation, but edge cases in `queue_type` or `engine_sel` fields could affect how the MEC interprets the mapping command for gfx8.
+
+**Priority 4: MEC firmware version investigation**
+
+MEC firmware v0x2da (feature 49) loaded for Polaris 12. If all software approaches fail, the MEC firmware itself may have a bug in its queue mapping path for gfx8. This would require firmware-level debugging or finding an older firmware version that predates the gfx8 support removal.
 
 ## Decisions Log
 
