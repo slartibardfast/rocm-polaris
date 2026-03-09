@@ -266,13 +266,17 @@ Rationale: `DOORBELL_BIF_DROP` is set for AQL queues on every generation from V9
 
 `UNORD_DISPATCH` is set unconditionally by V9 `init_mqd`. While less likely to be the root cause, it exists on gfx8 and should be set for correct AQL behavior.
 
-**Priority 2: Test with `sched_policy=1` (NO_HWS) if MQD patch fails**
+**Priority 1b: ROCR patch — 32-bit doorbell write for gfx8** (DONE)
+
+ROCR unconditionally writes 64 bits to the doorbell via `*(signal_.hardware_doorbell_ptr) = uint64_t(value)` (`amd_aql_queue.cpp:478`). On gfx8, doorbells are 4 bytes wide with 4-byte stride — the 8-byte write overflows into the adjacent queue's doorbell slot. Patch adds `legacy_doorbell_` flag (ISA major < 9) and uses 32-bit store for gfx8. Created `hsa-rocr/0003-use-32bit-doorbell-write-for-gfx8.patch`, bumped hsa-rocr-polaris to 7.2.0-2.
+
+**Priority 2: MAP_QUEUES packet format audit** — ELIMINATED
+
+Full audit of `kfd_packet_manager_vi.c` vs `kfd_packet_manager_v9.c` confirmed the MAP_QUEUES packet is structurally correct for VI. Differences are legitimate V8↔V9 hardware variations (no `extended_engine_sel`, 21-bit vs 26-bit doorbell offset field). `queue_type`, `engine_sel`, and all address fields are correctly set. Not a cause.
+
+**Priority 3: Test with `sched_policy=1` (NO_HWS) if patches fail**
 
 Bypasses HWS entirely, loads queues directly via MMIO registers (`kgd_hqd_load` in `amdgpu_amdkfd_gfx_v8.c`). The direct-load path explicitly sets `DOORBELL_EN` and `CP_HQD_ACTIVE` — fields that HWS normally manages. If dispatch works in NO_HWS but not CPSCH, the problem is in HWS queue activation, not MQD contents. Requires reboot with `amdgpu.sched_policy=1`.
-
-**Priority 3: MAP_QUEUES packet format audit**
-
-If both the MQD patch and NO_HWS fail, investigate the MAP_QUEUES PM4 packet built by `kfd_packet_manager_vi.c`. The packet structure was verified correct during the investigation, but edge cases in `queue_type` or `engine_sel` fields could affect how the MEC interprets the mapping command for gfx8.
 
 **Priority 4: MEC firmware version investigation**
 
