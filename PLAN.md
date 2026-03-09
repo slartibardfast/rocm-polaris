@@ -117,10 +117,11 @@ Build custom `-polaris` packages for every component with a gfx8 gate:
 - Built `linux-lts-rocm-polaris` 6.18.16-2
 - **Result:** Both queue creations succeed (`hsa_queue_create` returns 0)
 
-### Phase 2c: Kernel MMIO remap (MAY BE NEEDED)
-- Add `rmmio_remap.bus_addr` initialization for VI/Polaris in kernel
-- Without this, HDP flush via MMIO is unavailable — may cause performance issues or runtime errors
-- Can defer unless it turns out to be the GPU dispatch hang cause
+### Phase 2c: Kernel MMIO remap (NOT NEEDED)
+- `nbio_v2_3.c:set_reg_remap()` already sets `rmmio_remap.bus_addr` for standard PAGE_SIZE (4096)
+- ROCR doesn't use SDMA HDP flush for gfx8 anyway (gfx9+ only)
+- Compute shader blits (the path gfx8 uses) don't require HDP flush
+- **Eliminated as a concern during Phase 3 deep review**
 
 ### Phase 2d: rocBLAS (PKGBUILD READY)
 - Apply existing `0001-re-enable-gfx803-target.patch`
@@ -130,27 +131,79 @@ Build custom `-polaris` packages for every component with a gfx8 gate:
 
 **Symptom:** HIP test (`hipcc --offload-arch=gfx803`) hangs in runtime static init. Both `CREATE_QUEUE` ioctls return 0, many `ALLOC_MEMORY`/`MAP_MEMORY` succeed, then no more ioctls — HIP spins at 100% CPU in userspace. Pure HSA queue test (`hsa_queue_create` + `hsa_queue_destroy`) works fine — the hang is in GPU command dispatch, not queue creation.
 
-**Suspected causes (ordered by likelihood):**
+**Note:** The pure HSA test only tested queue lifecycle, not actual dispatch. `tests/hsa_dispatch_test.c` exists with a barrier packet test but has not been run since the kernel AQL fix.
 
-1. **Blit kernel dispatch hang.** HIP init uses blit kernels (precompiled gfx803 code objects in ROCR) for internal memory operations (fill, copy). If the blit kernel dispatch writes to the doorbell but the GPU never completes the packet, ROCR's `WaitOnSignal` spins forever. The blit kernel objects exist in `blit_kernel.cpp` for gfx803 — but they may have been compiled with assumptions about features unavailable on our hardware (e.g., flat scratch, GWS).
+#### Deep codebase review (2026-03-09)
 
-2. **HDP flush / cache coherency.** Polaris has no NBIO, so `rmmio_remap.bus_addr` is never set. ROCR's `HdpFlush()` may silently no-op or write to an invalid address. If the GPU doesn't see updated memory (AQL packets written by the CPU), it processes stale data or never sees the dispatch. This connects to the Phase 2c MMIO remap TODO.
+Audited all six suspected causes against the ROCR-Runtime 7.2.0 and kernel source. Findings below.
 
-3. **Doorbell write semantics.** Polaris uses 32-bit doorbells (DoorbellType=1), Vega+ uses 64-bit (DoorbellType=2). Our ROCR patch accepts DoorbellType=1, but downstream code may still write 64-bit doorbell values. If the doorbell stride or write size is wrong, the CP never wakes up to process the queue. Check `amd_gpu_agent.cpp` doorbell stride calculation and `AqlQueue::SubmitPacket` doorbell write path.
+**VALIDATED — not the cause:**
 
-4. **CWSR (Compute Wave Save/Restore) trap handler.** KFD installs a trap handler for context switching. The CWSR image may be compiled for gfx9+ only, or the `ctx_save_restore_size` negotiation may assume features not present on gfx8. If the trap handler is invalid, the first wave dispatch could hang or fault silently. Check `kfd_device.c` CWSR firmware loading path for gfx8.
+1. **~~HDP flush / cache coherency~~** — ELIMINATED.
+   - ROCR explicitly disables SDMA HDP flush for gfx8 (`amd_blit_sdma.cpp:159`: `GetMajorVersion() >= 9` guard).
+   - MMIO remap IS correctly set up for Polaris when `PAGE_SIZE <= 4096` (`nbio_v2_3.c:set_reg_remap()`).
+   - Compute shader blits (used for gfx8) don't use HDP flush at all.
+   - Phase 2c MMIO remap kernel patch is NOT needed.
 
-5. **Scratch memory setup.** If the `AqlQueue` constructor configures scratch (private memory) incorrectly for gfx8 — wrong wave size, wrong scratch segment size, or wrong flat scratch init — the first kernel dispatch will hang on scratch access. ROCR's `ScratchCache` and queue scratch setup may have gfx9-only assumptions.
+2. **~~CWSR trap handler~~** — ELIMINATED.
+   - Kernel has ISA-specific `cwsr_trap_gfx8_hex` binary (`cwsr_trap_handler.h`).
+   - KFD correctly selects it via `KFD_GC_VERSION(kfd) < IP_VERSION(9, 0, 1)`.
+   - MQD manager for VI properly configures CWSR fields.
+   - `ctx_save_restore_size` calculation uses correct `CNTL_STACK_BYTES_PER_WAVE = 8` for gfx8.
 
-6. **Signal/completion mechanism.** ROCR creates HSA signals for synchronization. If signal completion uses interrupts (`KFD_IOC_WAIT_EVENTS`) and the interrupt path for gfx8 is broken, the CPU side won't detect completion. However, the 100% CPU spin suggests ROCR is polling (not interrupt-waiting), so this is less likely.
+3. **~~Scratch memory setup~~** — ELIMINATED.
+   - gfx8 shares scratch path with gfx9, only difference: `need_queue_scratch_base = (major > 8)` affects offset calc.
+   - `FillBufRsrcWord{1,3}` SRD format identical for gfx8 and gfx9.
+   - `FillComputeTmpRingSize` handles `main_size == 0` correctly (zeros the register).
+   - Blit kernels use only flat memory ops, no scratch required (private_segment_size from code object metadata).
+
+4. **~~Blit kernel ISA compatibility~~** — ELIMINATED.
+   - Pre-compiled gfx8 binaries exist in `amd_blit_shaders.h` (V1 header, checked into source).
+   - Assembly macros auto-select correct gfx8 instructions: `v_add_u32` (not `v_add_co_u32`).
+   - All ops are basic: `flat_load/store`, `s_load`, `v_add`, `v_cmp`, `s_endpgm`. All valid on gfx803.
+   - **Note:** gfx8 not in CMake TARGET_DEVS (blit shaders or trap handlers), but V1 header fallback provides the binaries.
+
+5. **~~ROCR trap handler~~** — ELIMINATED.
+   - `BindTrapHandler()` at line 2284: gfx8 gets `kCodeTrapHandler8` from V1 header.
+   - `TrapHandlerKfdExceptions` for gfx8 also uses `kCodeTrapHandler8` (V1 fallback).
+   - `SetTrapHandler()` KFD ioctl installs it correctly.
+
+**CONFIRMED — relevant findings:**
+
+6. **SDMA disabled for gfx8** (`amd_gpu_agent.cpp:806`).
+   - `use_sdma = (GetMajorVersion() != 8)` — all blit operations use **compute shader dispatch** via AQL queue.
+   - This means blit Fill/Copy kernels are dispatched as regular AQL kernel packets on the utility queue.
+   - Every memory operation (hipMemset, hipMemcpy, internal fill) goes through `BlitKernel::SubmitLinearFillCommand()` → AQL dispatch → doorbell write.
+
+7. **64-bit doorbell write on 32-bit doorbell hardware** (`amd_aql_queue.cpp:478`).
+   - `*(signal_.hardware_doorbell_ptr) = uint64_t(value)` — unconditional 64-bit store.
+   - `signal_.hardware_doorbell_ptr` is `volatile uint64_t*` (`amd_hsa_signal.h:65`).
+   - `Queue_DoorBell` (uint32*) and `Queue_DoorBell_aql` (uint64*) are a **union** (`hsakmttypes.h:766-771`).
+   - Thunk sets doorbell offset at `queue_id * DOORBELL_SIZE(gfxv)` = `queue_id * 4` for gfx8.
+   - **Result:** 8-byte write to a 4-byte-strided doorbell aperture. The lower 4 bytes go to queue N's doorbell, the upper 4 bytes overflow into queue N+1's doorbell slot.
+   - For small write indices (< 2^32), upper 4 bytes = 0, which may be benign (CP sees doorbell value 0 for adjacent queue, likely ignored if write_ptr ≤ read_ptr).
+   - **But:** x86 `mov qword` to UC MMIO is a single 8-byte PCIe transaction. The gfx8 doorbell controller may or may not handle 8-byte writes to 4-byte registers correctly — hardware-dependent behavior.
+   - **Status:** Possible cause, but needs empirical testing. The thunk's own test code (`AqlQueue.cpp:50`) also writes via uint64* for AQL queues, suggesting AMD may have designed the doorbell controller to handle this even on gfx8.
+
+8. **HIP init does NOT dispatch during static init** — dispatches are deferred.
+   - `InitDma()` sets up lazy pointers (`lazy_ptr<Queue>`) — queues created on first access.
+   - `VirtualGPU::create()` calls `acquireQueue()` (creates HSA queue → CREATE_QUEUE ioctl) and `KernelBlitManager::create()` (loads blit kernel objects) but does NOT dispatch.
+   - First actual GPU dispatch happens on **first HIP API call that moves data** (hipMemset, hipMemcpy, hipLaunchKernel).
+   - The 100% CPU spin may be in the first blit dispatch triggered by such a call in our test program.
+
+**Revised suspected causes (re-ranked):**
+
+1. **First GPU dispatch never completes.** We have never tested whether any AQL packet dispatched to the GPU actually executes and signals completion. The `hsa_dispatch_test.c` barrier test must be run to determine if the fundamental dispatch mechanism works on our hardware with the current patches.
+
+2. **Doorbell write width (64-bit on 32-bit hardware).** If the gfx8 doorbell controller does NOT handle 8-byte writes, the CP never sees valid doorbell values. Fix would be casting to `uint32_t*` for gfx8. However, this may be a non-issue if the hardware latches only the lower 4 bytes.
+
+3. **Something in CLR/HIP first-dispatch path.** If basic HSA dispatch works, the problem is HIP-specific — possibly in how CLR sets up the first blit kernel dispatch, kernel arguments, or signal management.
 
 **Investigation plan:**
-- Write a minimal HSA dispatch test: create queue, submit a trivial no-op AQL packet, ring doorbell, poll completion signal — isolates whether *any* GPU dispatch works
-- If no-op dispatch hangs: problem is doorbell/CP/HDP (causes 2-3)
-- If no-op dispatch works but blit kernel hangs: problem is kernel code or scratch (causes 1, 5)
-- Check `HSA_ENABLE_INTERRUPT=0` env var to force polling mode (rules out cause 6)
-- Add `HSA_DEBUG` or ROCR debug logging to see where init stalls
-- Inspect MMIO remap / HDP flush path for Polaris specifically
+1. **Run `hsa_dispatch_test.c`** — barrier packet test. If it hangs, the problem is fundamental (doorbell/CP). If it completes, basic dispatch works and the problem is higher up.
+2. **Extend test with a blit-style kernel dispatch** — submit a Fill kernel AQL packet manually to test compute shader dispatch.
+3. **If doorbell suspected:** patch `StoreRelaxed()` to write `uint32_t` for gfx8, rebuild hsa-rocr-polaris, retest.
+4. **If dispatch works but HIP hangs:** instrument CLR's first blit dispatch path with debug logging.
 
 ## Decisions Log
 
