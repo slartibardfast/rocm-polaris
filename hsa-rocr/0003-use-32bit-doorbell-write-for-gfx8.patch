@@ -1,0 +1,49 @@
+# Use 32-bit doorbell writes for gfx8 (pre-Vega) GPUs
+#
+# gfx8 doorbells are 4 bytes wide with 4-byte stride (queue_id * 4).
+# gfx9+ doorbells are 8 bytes wide with 8-byte stride (queue_id * 8).
+# ROCR unconditionally writes 64 bits via hardware_doorbell_ptr, which
+# on gfx8 overflows into the adjacent queue's doorbell slot.
+#
+# Add a cached flag for legacy (32-bit) doorbells and use a 32-bit
+# store in StoreRelaxed() when targeting gfx8.
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+diff --git a/runtime/hsa-runtime/core/inc/amd_aql_queue.h b/runtime/hsa-runtime/core/inc/amd_aql_queue.h
+--- a/runtime/hsa-runtime/core/inc/amd_aql_queue.h
++++ b/runtime/hsa-runtime/core/inc/amd_aql_queue.h
+@@ -297,6 +297,9 @@
+   // Handle of agent, which queue is attached to
+   GpuAgent* agent_;
+
++  // True if gfx8 (4-byte doorbells), false for gfx9+ (8-byte doorbells)
++  bool legacy_doorbell_;
++
+   // Handle of scratch memory descriptor
+   ScratchInfo queue_scratch_;
+
+diff --git a/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp b/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+--- a/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
++++ b/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+@@ -88,6 +88,7 @@
+       pm4_ib_size_b_(0x1000),
+       dynamicScratchState(0),
+       exceptionState(0),
++      legacy_doorbell_(agent->supported_isas()[0]->GetMajorVersion() < 9),
+       suspended_(false),
+       priority_(HSA_QUEUE_PRIORITY_NORMAL),
+       exception_signal_(nullptr) {
+@@ -475,7 +476,11 @@
+   } else {
+     // Hardware doorbell supports AQL semantics.
+     _mm_sfence();
+-    *(signal_.hardware_doorbell_ptr) = uint64_t(value);
++    if (legacy_doorbell_) {
++      *(volatile uint32_t*)(signal_.hardware_doorbell_ptr) = uint32_t(value);
++    } else {
++      *(signal_.hardware_doorbell_ptr) = uint64_t(value);
++    }
+     /* signal_ is allocated as uncached so we do not need read-back to flush WC */
+   }
+   return;
