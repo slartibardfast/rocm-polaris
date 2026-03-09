@@ -191,19 +191,26 @@ Audited all six suspected causes against the ROCR-Runtime 7.2.0 and kernel sourc
    - First actual GPU dispatch happens on **first HIP API call that moves data** (hipMemset, hipMemcpy, hipLaunchKernel).
    - The 100% CPU spin may be in the first blit dispatch triggered by such a call in our test program.
 
-**Revised suspected causes (re-ranked):**
+**Revised suspected causes (re-ranked after empirical testing):**
 
-1. **First GPU dispatch never completes.** We have never tested whether any AQL packet dispatched to the GPU actually executes and signals completion. The `hsa_dispatch_test.c` barrier test must be run to determine if the fundamental dispatch mechanism works on our hardware with the current patches.
+1. **~~First GPU dispatch never completes~~** — CONFIRMED. `hsa_dispatch_test.c` barrier packet times out. Queue `read_dispatch_id` stays at 0 — CP never fetches the packet. Problem is fundamental: the command processor isn't processing KFD-managed queues.
 
-2. **Doorbell write width (64-bit on 32-bit hardware).** If the gfx8 doorbell controller does NOT handle 8-byte writes, the CP never sees valid doorbell values. Fix would be casting to `uint32_t*` for gfx8. However, this may be a non-issue if the hardware latches only the lower 4 bytes.
+2. **~~Doorbell write width~~** — ELIMINATED. Tested both 32-bit and 64-bit doorbell writes in `hsa_doorbell32_test.c`. Both time out identically. The doorbell mapping is valid (`/dev/kfd` mmap, correct 4-byte stride), and the doorbell pointer (0x21b004) is in a properly mapped page.
 
-3. **Something in CLR/HIP first-dispatch path.** If basic HSA dispatch works, the problem is HIP-specific — possibly in how CLR sets up the first blit kernel dispatch, kernel arguments, or signal management.
+3. **HWS (Hardware Scheduler) not activating queues** — PRIME SUSPECT.
+   - DRM compute rings work perfectly (fence_info shows all fences signaled = emitted). GPU compute hardware is functional.
+   - KFD uses HWS/CPSCH mode (sched_policy=0). MAP_QUEUES PM4 packets are sent via runlist.
+   - `map_queues_cpsch` is fire-and-forget — no wait for HWS acknowledgment on the map path.
+   - `unmap_queues_cpsch` DOES wait for fence and succeeds — so HWS is responsive to unmap commands.
+   - **Hypothesis:** HWS receives MAP_QUEUES but silently fails to activate the queue for gfx8. The MEC firmware (v0x2da) may have a queue mapping bug specific to Polaris, or the MAP_QUEUES packet format for VI may be subtly wrong.
+   - Polaris 12 uses `gfx_v8_kfd2kgd` + `kfd_packet_manager_vi.c` for PM4 packets.
+   - CWSR is enabled (`supports_cwsr=true` for Polaris 12).
+   - MEC firmware loaded: version 0x2da, feature version 49.
 
 **Investigation plan:**
-1. **Run `hsa_dispatch_test.c`** — barrier packet test. If it hangs, the problem is fundamental (doorbell/CP). If it completes, basic dispatch works and the problem is higher up.
-2. **Extend test with a blit-style kernel dispatch** — submit a Fill kernel AQL packet manually to test compute shader dispatch.
-3. **If doorbell suspected:** patch `StoreRelaxed()` to write `uint32_t` for gfx8, rebuild hsa-rocr-polaris, retest.
-4. **If dispatch works but HIP hangs:** instrument CLR's first blit dispatch path with debug logging.
+1. **Test `sched_policy=1` (NO_HWS mode)** — bypasses HWS entirely, loads queues directly to MEC pipe/queue slots via MMIO registers. If queues work in NO_HWS mode, the problem is definitively in HWS queue mapping. Requires kernel module parameter: `amdgpu.sched_policy=1`.
+2. **If NO_HWS works:** investigate the MAP_QUEUES packet format in `kfd_packet_manager_vi.c` — compare field-by-field with the MEC firmware expectations. The `queue_type` and `engine_sel` fields may need adjustment for gfx8.
+3. **If NO_HWS also fails:** the problem is in MQD setup itself (`kfd_mqd_manager_vi.c`) or in the `hqd_load` path for direct queue loading.
 
 ## Decisions Log
 
