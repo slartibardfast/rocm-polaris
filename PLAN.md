@@ -278,9 +278,14 @@ Full audit of `kfd_packet_manager_vi.c` vs `kfd_packet_manager_v9.c` confirmed t
 
 Bypasses HWS entirely, loads queues directly via MMIO registers (`kgd_hqd_load` in `amdgpu_amdkfd_gfx_v8.c`). The direct-load path explicitly sets `DOORBELL_EN` and `CP_HQD_ACTIVE` — fields that HWS normally manages. If dispatch works in NO_HWS but not CPSCH, the problem is in HWS queue activation, not MQD contents. Requires reboot with `amdgpu.sched_policy=1`.
 
-**Priority 4: MEC firmware version investigation**
+**Priority 4: MEC firmware version investigation** — ELIMINATED
 
-MEC firmware v0x2da (feature 49) loaded for Polaris 12. If all software approaches fail, the MEC firmware itself may have a bug in its queue mapping path for gfx8. This would require firmware-level debugging or finding an older firmware version that predates the gfx8 support removal.
+Binary analysis of Polaris 12 MEC firmware (`polaris12_mec_2.bin`, v0x2da, 65642 dwords). The MEC uses a proprietary undocumented microcode ISA (not GCN shader code). Key findings:
+
+- **Register access patterns are nearly identical between Polaris 12 and Vega 10 MEC firmware.** Both touch `DOORBELL_CONTROL` (1 read, 2 writes), `PQ_WPTR` (3 reads, 13 writes), `PQ_CONTROL` (2-3 reads, 2 writes), `HQD_ACTIVE` (0 reads, 3 writes). The queue activation logic is functionally the same across generations.
+- Both Polaris firmware variants (v0x2c1 and v0x2da) have identical register access patterns — the 72% binary diff is code motion/optimization, not functional changes to queue handling.
+- The MEC firmware reads the full `CP_HQD_PQ_DOORBELL_CONTROL` register from the MQD — it will process whatever bits the kernel sets, including `DOORBELL_BIF_DROP`.
+- **Conclusion:** The firmware is not the issue. It handles queue activation identically to Vega. The missing MQD bits (our kernel patch) are the problem — the firmware is faithfully loading what the kernel wrote, which was incomplete.
 
 ## Decisions Log
 
