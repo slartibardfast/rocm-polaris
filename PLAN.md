@@ -126,12 +126,31 @@ Build custom `-polaris` packages for every component with a gfx8 gate:
 - Apply existing `0001-re-enable-gfx803-target.patch`
 - Build with `makepkg -s`
 
-### Phase 3: GPU dispatch debugging (CURRENT)
-- HSA queue creation works, but GPU command execution appears to hang
-- HIP test (`hipcc --offload-arch=gfx803`) hangs in HIP runtime static init after queues and memory allocations succeed
-- Pure HSA test (`hsa_queue_create`) works — queue creation confirmed fixed
-- Next: investigate whether GPU dispatches (blit kernels, hipMemset) actually execute or hang on the GPU
-- Possible causes: trap handler, CWSR, HDP flush, doorbell write semantics, or blit kernel code object incompatibility with gfx803
+### Phase 3: GPU dispatch hang debugging (CURRENT)
+
+**Symptom:** HIP test (`hipcc --offload-arch=gfx803`) hangs in runtime static init. Both `CREATE_QUEUE` ioctls return 0, many `ALLOC_MEMORY`/`MAP_MEMORY` succeed, then no more ioctls — HIP spins at 100% CPU in userspace. Pure HSA queue test (`hsa_queue_create` + `hsa_queue_destroy`) works fine — the hang is in GPU command dispatch, not queue creation.
+
+**Suspected causes (ordered by likelihood):**
+
+1. **Blit kernel dispatch hang.** HIP init uses blit kernels (precompiled gfx803 code objects in ROCR) for internal memory operations (fill, copy). If the blit kernel dispatch writes to the doorbell but the GPU never completes the packet, ROCR's `WaitOnSignal` spins forever. The blit kernel objects exist in `blit_kernel.cpp` for gfx803 — but they may have been compiled with assumptions about features unavailable on our hardware (e.g., flat scratch, GWS).
+
+2. **HDP flush / cache coherency.** Polaris has no NBIO, so `rmmio_remap.bus_addr` is never set. ROCR's `HdpFlush()` may silently no-op or write to an invalid address. If the GPU doesn't see updated memory (AQL packets written by the CPU), it processes stale data or never sees the dispatch. This connects to the Phase 2c MMIO remap TODO.
+
+3. **Doorbell write semantics.** Polaris uses 32-bit doorbells (DoorbellType=1), Vega+ uses 64-bit (DoorbellType=2). Our ROCR patch accepts DoorbellType=1, but downstream code may still write 64-bit doorbell values. If the doorbell stride or write size is wrong, the CP never wakes up to process the queue. Check `amd_gpu_agent.cpp` doorbell stride calculation and `AqlQueue::SubmitPacket` doorbell write path.
+
+4. **CWSR (Compute Wave Save/Restore) trap handler.** KFD installs a trap handler for context switching. The CWSR image may be compiled for gfx9+ only, or the `ctx_save_restore_size` negotiation may assume features not present on gfx8. If the trap handler is invalid, the first wave dispatch could hang or fault silently. Check `kfd_device.c` CWSR firmware loading path for gfx8.
+
+5. **Scratch memory setup.** If the `AqlQueue` constructor configures scratch (private memory) incorrectly for gfx8 — wrong wave size, wrong scratch segment size, or wrong flat scratch init — the first kernel dispatch will hang on scratch access. ROCR's `ScratchCache` and queue scratch setup may have gfx9-only assumptions.
+
+6. **Signal/completion mechanism.** ROCR creates HSA signals for synchronization. If signal completion uses interrupts (`KFD_IOC_WAIT_EVENTS`) and the interrupt path for gfx8 is broken, the CPU side won't detect completion. However, the 100% CPU spin suggests ROCR is polling (not interrupt-waiting), so this is less likely.
+
+**Investigation plan:**
+- Write a minimal HSA dispatch test: create queue, submit a trivial no-op AQL packet, ring doorbell, poll completion signal — isolates whether *any* GPU dispatch works
+- If no-op dispatch hangs: problem is doorbell/CP/HDP (causes 2-3)
+- If no-op dispatch works but blit kernel hangs: problem is kernel code or scratch (causes 1, 5)
+- Check `HSA_ENABLE_INTERRUPT=0` env var to force polling mode (rules out cause 6)
+- Add `HSA_DEBUG` or ROCR debug logging to see where init stalls
+- Inspect MMIO remap / HDP flush path for Polaris specifically
 
 ## Decisions Log
 
