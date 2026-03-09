@@ -1,0 +1,21 @@
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -175,7 +175,8 @@
+
+ 	m->cp_hqd_pq_control = 5 << CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT |
+ 			atc_bit << CP_HQD_PQ_CONTROL__PQ_ATC__SHIFT |
+-			mtype << CP_HQD_PQ_CONTROL__MTYPE__SHIFT;
++			mtype << CP_HQD_PQ_CONTROL__MTYPE__SHIFT |
++			CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK;
+ 	m->cp_hqd_pq_control |=	order_base_2(q->queue_size / 4) - 1;
+ 	pr_debug("cp_hqd_pq_control 0x%x\n", m->cp_hqd_pq_control);
+
+@@ -221,6 +222,8 @@
+ 	if (q->format == KFD_QUEUE_FORMAT_AQL) {
+ 		m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK |
+ 				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
++		m->cp_hqd_pq_doorbell_control |= 1 <<
++			CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_BIF_DROP__SHIFT;
+ 	}
+
+ 	if (mm->dev->kfd->cwsr_enabled && q->ctx_save_restore_area_address)
