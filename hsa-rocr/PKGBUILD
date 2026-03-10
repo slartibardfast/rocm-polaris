@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=2
+pkgrel=3
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -21,8 +21,10 @@ makedepends=('cmake' 'rocm-llvm' 'xxd')
 source=("rocm-${pkgver}.tar.gz::$url/archive/rocm-$pkgver.tar.gz"
         '0001-allow-doorbell-type-1-for-gfx8.patch'
         '0002-image-runtime-tolerate-init-failure.patch'
-        '0003-use-32bit-doorbell-write-for-gfx8.patch')
+        '0003-use-32bit-doorbell-write-for-gfx8.patch'
+        '0004-rptr-bounce-buffer-for-no-atomics-platforms.patch')
 sha256sums=('728ea7e9bf16e6ed217a0fd1a8c9afaba2dae2e7908fa4e27201e67c803c5638'
+            'SKIP'
             'SKIP'
             'SKIP'
             'SKIP')
@@ -34,6 +36,7 @@ prepare() {
   patch -Np1 -i "$srcdir/0001-allow-doorbell-type-1-for-gfx8.patch"
   patch -Np1 -i "$srcdir/0002-image-runtime-tolerate-init-failure.patch"
   patch -Np1 -i "$srcdir/0003-use-32bit-doorbell-write-for-gfx8.patch"
+  patch -Np1 -i "$srcdir/0004-rptr-bounce-buffer-for-no-atomics-platforms.patch"
 }
 
 build() {
