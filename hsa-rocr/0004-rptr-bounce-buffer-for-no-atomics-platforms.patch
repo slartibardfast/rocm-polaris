@@ -1,0 +1,275 @@
+# RPTR bounce buffer: software signal completion for no-atomics platforms
+#
+# On platforms without PCIe AtomicOps (e.g. Westmere Xeon), GFX8 CP signal
+# writes to system memory use PCIe AtomicOp TLPs which the root complex drops
+# silently.  The read_dispatch_id (RPTR) still advances after packet processing,
+# so we can detect completion from CPU.
+#
+# This patch adds a per-queue bounce buffer that:
+# 1. Scans newly submitted AQL packets for completion_signal fields
+# 2. Monitors read_dispatch_id for completion
+# 3. Decrements signals from CPU when the CP has processed the packet
+#
+# Also forces polling-based signal wait (HSA_ENABLE_INTERRUPT=0 equivalent)
+# on no-atomics platforms, since event mailbox writes fail the same way.
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+--- a/runtime/hsa-runtime/core/inc/amd_gpu_agent.h
++++ b/runtime/hsa-runtime/core/inc/amd_gpu_agent.h
+@@ -421,6 +421,9 @@
+   // @brief returns true if agent uses MES scheduler
+   __forceinline const bool isMES() const { return (isa_->GetMajorVersion() >= 11) ? true : false; };
+ 
++  // @brief returns true if CPU<->GPU link lacks 64-bit PCIe atomic support
++  __forceinline bool NoPlatformAtomics() const { return no_platform_atomics_; }
++
+   // @brief returns the libdrm device handle
+   __forceinline amdgpu_device_handle libDrmDev() const { return ldrm_dev_; }
+ 
+@@ -840,6 +843,9 @@
+   bool xgmi_cpu_gpu_;
+   /// @brief Is PCIe large BAR enabled.
+   bool large_bar_enabled_;
++
++  /// @brief True when CPU<->GPU link lacks 64-bit PCIe atomic support.
++  bool no_platform_atomics_;
+ };
+ 
+ }  // namespace amd
+--- a/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
++++ b/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+@@ -226,6 +226,8 @@
+   auto link_info = core::Runtime::runtime_singleton_->GetLinkInfo(first_cpu->node_id(), node_id());
+   xgmi_cpu_gpu_ = (link_info.info.link_type == HSA_AMD_LINK_INFO_TYPE_XGMI);
+ 
++  no_platform_atomics_ = !link_info.info.atomic_support_64bit;
++
+   if (link_info.num_hop >= 1) {
+     large_bar_enabled_ = true;
+   }
+--- a/runtime/hsa-runtime/core/inc/amd_aql_queue.h
++++ b/runtime/hsa-runtime/core/inc/amd_aql_queue.h
+@@ -43,6 +43,8 @@
+ #ifndef HSA_RUNTIME_CORE_INC_AMD_HW_AQL_COMMAND_PROCESSOR_H_
+ #define HSA_RUNTIME_CORE_INC_AMD_HW_AQL_COMMAND_PROCESSOR_H_
+ 
++#include <vector>
++
+ #include "core/inc/runtime.h"
+ #include "core/inc/signal.h"
+ #include "core/inc/queue.h"
+@@ -227,6 +229,15 @@
+   /// @brief Async reclaim alternate scratch memory
+   void AsyncReclaimAltScratch();
+ 
++  /// @brief Scan newly submitted packets for completion signals (no-atomics bounce buffer).
++  void ScanNewPackets();
++
++  /// @brief Complete pending signals whose packets have been processed by CP.
++  void ProcessCompletions();
++
++  /// @brief Process completions on all queues with active bounce buffers.
++  static void ProcessAllBounceBuffers();
++
+  protected:
+   bool _IsA(Queue::rtti_t id) const override { return id == &rtti_id(); }
+ 
+@@ -299,6 +310,20 @@
+   // True if gfx8 (4-byte doorbells), false for gfx9+ (8-byte doorbells)
+   bool legacy_doorbell_;
+ 
++  // RPTR bounce buffer for platforms without PCIe atomics.
++  bool no_atomics_;
++
++  struct PendingCompletion {
++    uint64_t complete_idx;   // read_dispatch_id value at which this packet is done
++    hsa_signal_t signal;     // completion_signal saved from the AQL packet
++  };
++  std::vector<PendingCompletion> pending_completions_;
++  uint64_t last_scanned_idx_;
++  KernelMutex bounce_lock_;
++
++  static KernelMutex bounce_list_lock_;
++  static std::vector<AqlQueue*> bounce_queues_;
++
+   // Handle of scratch memory descriptor
+   ScratchInfo queue_scratch_;
+ 
+--- a/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
++++ b/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+@@ -76,6 +76,9 @@
+ namespace rocr {
+ namespace AMD {
+ 
++KernelMutex AqlQueue::bounce_list_lock_;
++std::vector<AqlQueue*> AqlQueue::bounce_queues_;
++
+ #define SCRATCH_ALT_RATIO 4
+ 
+ AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_size_pkts,
+@@ -97,6 +100,8 @@
+       dynamicScratchState(0),
+       exceptionState(0),
+       legacy_doorbell_(agent->supported_isas()[0]->GetMajorVersion() < 9),
++      no_atomics_(agent->NoPlatformAtomics()),
++      last_scanned_idx_(0),
+       suspended_(false),
+       priority_(HSA_QUEUE_PRIORITY_NORMAL),
+       exception_signal_(nullptr) {
+@@ -341,9 +346,20 @@
+   QueueGuard.Dismiss();
+   EventGuard.Dismiss();
+   SignalGuard.Dismiss();
++
++  if (no_atomics_) {
++    ScopedAcquire<KernelMutex> lock(&bounce_list_lock_);
++    bounce_queues_.push_back(this);
++  }
+ }
+ 
+ AqlQueue::~AqlQueue() {
++  if (no_atomics_) {
++    ScopedAcquire<KernelMutex> lock(&bounce_list_lock_);
++    auto it = std::find(bounce_queues_.begin(), bounce_queues_.end(), this);
++    if (it != bounce_queues_.end()) bounce_queues_.erase(it);
++  }
++
+   // Remove error handler synchronously.
+   // Sequences error handler callbacks with queue destroy.
+   dynamicScratchState |= ERROR_HANDLER_TERMINATE;
+@@ -470,6 +486,8 @@
+ }
+ 
+ void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
++  ScanNewPackets();
++
+   if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
+         core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
+     HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
+@@ -491,6 +509,85 @@
+   StoreRelaxed(value);
+ }
+ 
++void AqlQueue::ScanNewPackets() {
++  if (!no_atomics_) return;
++
++  uint64_t write_idx = atomic::Load(&amd_queue_.write_dispatch_id,
++                                    std::memory_order_acquire);
++  if (write_idx <= last_scanned_idx_) return;
++
++  ScopedAcquire<KernelMutex> lock(&bounce_lock_);
++  // Re-check after acquiring lock.
++  write_idx = atomic::Load(&amd_queue_.write_dispatch_id,
++                           std::memory_order_acquire);
++  if (write_idx <= last_scanned_idx_) return;
++
++  const uint32_t queue_mask = amd_queue_.hsa_queue.size - 1;
++  const char* ring_base = static_cast<const char*>(amd_queue_.hsa_queue.base_address);
++
++  for (uint64_t idx = last_scanned_idx_; idx < write_idx; idx++) {
++    uint32_t slot = static_cast<uint32_t>(idx & queue_mask);
++    // AQL packets are 64 bytes.  Read header to determine packet type,
++    // then extract completion_signal from the appropriate offset.
++    const uint16_t* header_ptr = reinterpret_cast<const uint16_t*>(
++        ring_base + slot * 64);
++    uint16_t header = atomic::Load(header_ptr, std::memory_order_acquire);
++    uint8_t pkt_type = header & 0xFF;
++
++    hsa_signal_t sig = {0};
++    if (pkt_type == HSA_PACKET_TYPE_KERNEL_DISPATCH ||
++        pkt_type == HSA_PACKET_TYPE_AGENT_DISPATCH) {
++      // completion_signal at offset 56
++      const hsa_signal_t* sig_ptr = reinterpret_cast<const hsa_signal_t*>(
++          ring_base + slot * 64 + 56);
++      sig = *sig_ptr;
++    } else if (pkt_type == HSA_PACKET_TYPE_BARRIER_AND ||
++               pkt_type == HSA_PACKET_TYPE_BARRIER_OR) {
++      // completion_signal at offset 24
++      const hsa_signal_t* sig_ptr = reinterpret_cast<const hsa_signal_t*>(
++          ring_base + slot * 64 + 24);
++      sig = *sig_ptr;
++    }
++
++    if (sig.handle != 0) {
++      pending_completions_.push_back({idx + 1, sig});
++    }
++  }
++  last_scanned_idx_ = write_idx;
++}
++
++void AqlQueue::ProcessCompletions() {
++  if (!no_atomics_ || pending_completions_.empty()) return;
++
++  ScopedAcquire<KernelMutex> lock(&bounce_lock_);
++  if (pending_completions_.empty()) return;
++
++  uint64_t read_idx = atomic::Load(&amd_queue_.read_dispatch_id,
++                                   std::memory_order_acquire);
++
++  size_t completed = 0;
++  for (const auto& entry : pending_completions_) {
++    if (read_idx >= entry.complete_idx) {
++      amd_signal_t* sig = reinterpret_cast<amd_signal_t*>(entry.signal.handle);
++      atomic::Sub(&sig->value, int64_t(1), std::memory_order_release);
++      completed++;
++    } else {
++      break;  // FIFO: remaining entries are also incomplete
++    }
++  }
++  if (completed > 0) {
++    pending_completions_.erase(pending_completions_.begin(),
++                               pending_completions_.begin() + completed);
++  }
++}
++
++void AqlQueue::ProcessAllBounceBuffers() {
++  ScopedAcquire<KernelMutex> lock(&bounce_list_lock_);
++  for (AqlQueue* q : bounce_queues_) {
++    q->ProcessCompletions();
++  }
++}
++
+ hsa_status_t AqlQueue::GetInfo(hsa_queue_info_attribute_t attribute, void* value) {
+   switch (attribute) {
+     case HSA_AMD_QUEUE_INFO_AGENT:
+--- a/runtime/hsa-runtime/core/runtime/default_signal.cpp
++++ b/runtime/hsa-runtime/core/runtime/default_signal.cpp
+@@ -41,6 +41,7 @@
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ #include "core/inc/default_signal.h"
++#include "core/inc/amd_aql_queue.h"
+ 
+ #if defined(__i386__) || defined(__x86_64__)
+ #include <mwaitxintrin.h>
+@@ -92,6 +93,9 @@
+   while (true) {
+     if (!IsValid()) return 0;
+ 
++    // Process bounce buffer completions for no-atomics platforms.
++    AMD::AqlQueue::ProcessAllBounceBuffers();
++
+     int64_t value = atomic::Load(&signal_.value, std::memory_order_relaxed);
+ 
+     if (CheckSignalCondition(value, condition, compare_value)) {
+--- a/runtime/hsa-runtime/core/runtime/runtime.cpp
++++ b/runtime/hsa-runtime/core/runtime/runtime.cpp
+@@ -2396,6 +2396,17 @@
+     return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+   }
+ 
++  // Disable interrupt-based signal wait if any GPU lacks PCIe atomic support.
++  // On such platforms, CP signal writes and event mailbox writes both fail
++  // (PCIe AtomicOp TLPs dropped by root complex).  Force polling mode so the
++  // RPTR bounce buffer can complete signals from CPU.
++  for (core::Agent* agent : gpu_agents_) {
++    if (static_cast<AMD::GpuAgent*>(agent)->NoPlatformAtomics()) {
++      g_use_interrupt_wait = false;
++      break;
++    }
++  }
++
+   asyncSignals_.reset(new AsyncEventsInfo(false));
+   asyncExceptions_.reset(new AsyncEventsInfo(g_use_interrupt_wait));
+ 

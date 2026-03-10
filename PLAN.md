@@ -193,19 +193,39 @@ Audited all six suspected causes against the ROCR-Runtime 7.2.0 and kernel sourc
 
 **Revised suspected causes (re-ranked after empirical testing):**
 
-1. **~~First GPU dispatch never completes~~** — CONFIRMED. `hsa_dispatch_test.c` barrier packet times out. Queue `read_dispatch_id` stays at 0 — CP never fetches the packet. Problem is fundamental: the command processor isn't processing KFD-managed queues.
+1. **~~First GPU dispatch never completes~~** — CONFIRMED. `hsa_dispatch_test.c` barrier packet times out. Queue `read_dispatch_id` stays at 0 — CP never fetches the packet.
 
-2. **~~Doorbell write width~~** — ELIMINATED. Tested both 32-bit and 64-bit doorbell writes in `hsa_doorbell32_test.c`. Both time out identically. The doorbell mapping is valid (`/dev/kfd` mmap, correct 4-byte stride), and the doorbell pointer (0x21b004) is in a properly mapped page.
+2. **~~Doorbell write width~~** — ELIMINATED. Tested both 32-bit and 64-bit doorbell writes. Both time out identically.
 
-3. **HWS (Hardware Scheduler) not activating queues** — PRIME SUSPECT.
-   - DRM compute rings work perfectly (fence_info shows all fences signaled = emitted). GPU compute hardware is functional.
-   - KFD uses HWS/CPSCH mode (sched_policy=0). MAP_QUEUES PM4 packets are sent via runlist.
-   - `map_queues_cpsch` is fire-and-forget — no wait for HWS acknowledgment on the map path.
-   - `unmap_queues_cpsch` DOES wait for fence and succeeds — so HWS is responsive to unmap commands.
-   - **Hypothesis:** HWS receives MAP_QUEUES but silently fails to activate the queue for gfx8. The MEC firmware (v0x2da) may have a queue mapping bug specific to Polaris, or the MAP_QUEUES packet format for VI may be subtly wrong.
-   - Polaris 12 uses `gfx_v8_kfd2kgd` + `kfd_packet_manager_vi.c` for PM4 packets.
-   - CWSR is enabled (`supports_cwsr=true` for Polaris 12).
-   - MEC firmware loaded: version 0x2da, feature version 49.
+3. **~~HWS not activating queues~~** — DISPROVEN. HQD register dump shows `CP_HQD_ACTIVE=1`, `DOORBELL_HIT=1`. Queue IS active. (Note: running in NO_HWS mode via `sched_policy=2`, so this is direct MMIO load, not MEC firmware.)
+
+4. **Missing WPTR polling trigger in V8 kgd_hqd_load** — PRIME SUSPECT.
+
+#### HQD register dump breakthrough (2026-03-09)
+
+Used `tests/hsa_mqd_debug.c` to hold a queue open; dumped live HQD registers from `/sys/kernel/debug/kfd/hqds`:
+
+| Register | Value | Meaning |
+|----------|-------|---------|
+| CP_HQD_ACTIVE | 1 | Queue IS active |
+| DOORBELL_EN | 1 | Doorbell enabled |
+| DOORBELL_HIT | 1 | Doorbell write received by hardware |
+| DOORBELL_BIF_DROP | 0 | Not set (see analysis) |
+| CP_HQD_PQ_WPTR | 0 | Write pointer never updated from poll |
+| PQ_RPTR | 0 | No packets processed |
+| WPTR_POLL_ADDR | 0x00221038 | GPU VA for WPTR polling |
+| CP_HQD_VMID | 8 | Process VMID |
+
+**Root cause:** CP received doorbell (`DOORBELL_HIT=1`) but WPTR stays at 0. The V8 `kgd_hqd_load()` in `amdgpu_amdkfd_gfx_v8.c` reads the initial WPTR from userspace and writes it to the register once, but **never triggers the CP's WPTR polling mechanism** for subsequent updates. V9's `kgd_hqd_load()` explicitly writes `CP_PQ_WPTR_POLL_CNTL1` with a queue bitmask to trigger a one-shot WPTR poll from memory. V8 omits this entirely.
+
+With `SLOT_BASED_WPTR=2` (required for AQL queues), the doorbell is a notification to read WPTR from `WPTR_POLL_ADDR`. Without the polling trigger, the CP sees the doorbell but never reads the updated WPTR, so `PQ_WPTR` stays at 0 and no packets are fetched.
+
+**Key registers:**
+- `CP_PQ_WPTR_POLL_CNTL` (0x3083): Global enable, with `EN` bit [31] and `PERIOD` [7:0]
+- `CP_PQ_WPTR_POLL_CNTL1` (0x3084): Per-queue bitmask — writing triggers one-shot poll
+- Both exist on gfx8 (`gfx_8_0_d.h:295-296`). DRM init disables EN (`gfx_v8_0.c:4556`), matching V9 behavior. V9's kgd_hqd_load only writes CNTL1 (not CNTL), suggesting CNTL1 triggers polling regardless of EN.
+
+**Fix:** Kernel patch `0007-kfd-gfx8-enable-wptr-polling-in-hqd-load.patch` — adds `CP_PQ_WPTR_POLL_CNTL1` write to V8 kgd_hqd_load, matching V9.
 
 #### MQD comparison: VI vs V9 (2026-03-09)
 
@@ -286,6 +306,27 @@ Binary analysis of Polaris 12 MEC firmware (`polaris12_mec_2.bin`, v0x2da, 65642
 - Both Polaris firmware variants (v0x2c1 and v0x2da) have identical register access patterns — the 72% binary diff is code motion/optimization, not functional changes to queue handling.
 - The MEC firmware reads the full `CP_HQD_PQ_DOORBELL_CONTROL` register from the MQD — it will process whatever bits the kernel sets, including `DOORBELL_BIF_DROP`.
 - **Conclusion:** The firmware is not the issue. It handles queue activation identically to Vega. The missing MQD bits (our kernel patch) are the problem — the firmware is faithfully loading what the kernel wrote, which was incomplete.
+
+### Phase 4: RPTR Bounce Buffer — Software Signal Completion (CURRENT)
+
+**Root cause (confirmed):** GFX8 CP writes completion signals to system memory using PCIe AtomicOp TLPs. Westmere root complex drops them silently. RPTR (`read_dispatch_id`) advances correctly — it's written to the `amd_queue_v2_t` struct via a different mechanism.
+
+**Solution:** ROCR patch `0004-rptr-bounce-buffer-for-no-atomics-platforms.patch` adds a per-queue RPTR bounce buffer:
+1. `ScanNewPackets()` — called from doorbell write path (`StoreRelaxed`), reads newly submitted AQL packets and saves their `completion_signal` handles
+2. `ProcessCompletions()` — called from BusyWaitSignal polling loop, checks `read_dispatch_id`, decrements saved signals from CPU when packets complete
+3. `ProcessAllBounceBuffers()` — static method iterating all bounce-buffer queues, called from `default_signal.cpp`
+4. Forces `g_use_interrupt_wait = false` for no-atomics platforms (event mailbox writes fail the same way)
+5. No-atomics detection via iolink topology (`atomic_support_64bit` flag), same mechanism SDMA uses
+
+**Files modified:** `amd_gpu_agent.{h,cpp}`, `amd_aql_queue.{h,cpp}`, `default_signal.cpp`, `runtime.cpp`
+
+**Key design decisions:**
+- Don't modify packets in ring buffer — let CP's failed signal write be harmless, bounce buffer handles it from CPU
+- Use existing iolink `NoAtomics64bit` flag (kernel already sets it when `pci_atomic_requested=false`)
+- Per-queue `bounce_lock_` mutex for thread safety; static `bounce_list_lock_` for global queue registry
+- Double-checked locking pattern in `ScanNewPackets()` for fast-path (no-op when no new packets)
+
+**Status:** Patch written and verified to apply cleanly. PKGBUILD bumped to 7.2.0-3. Needs build and test.
 
 ## Decisions Log
 
