@@ -227,6 +227,8 @@ With `SLOT_BASED_WPTR=2` (required for AQL queues), the doorbell is a notificati
 
 **Fix:** Kernel patch `0007-kfd-gfx8-enable-wptr-polling-in-hqd-load.patch` — adds `CP_PQ_WPTR_POLL_CNTL1` write to V8 kgd_hqd_load, matching V9.
 
+**Trace diagnostic (2026-03-10):** After kernel 6.18.16-5 (DOORBELL_BIF_DROP fix), doorbells reach CP (`DOORBELL_HIT=1`) but `CP_HQD_PQ_WPTR` stays 0. Added `pr_info` to patch 0007 to log: `poll_cntl` before/after, `CNTL1` mask, `WPTR_POLL_ADDR` from MQD, initial `WPTR` register value, and `PQ_CONTROL` bits. Kernel 6.18.16-6. If polling is fundamentally broken, Phase 2 fallback: remove `SLOT_BASED_WPTR=2` and use GFX7-style direct doorbell→WPTR (doorbell value IS the WPTR, no polling needed).
+
 #### MQD comparison: VI vs V9 (2026-03-09)
 
 Systematic field-by-field comparison of `kfd_mqd_manager_vi.c` vs `kfd_mqd_manager_v9.c` for AQL queues. Cross-referenced against gfx_8_0 hardware register headers to determine which bits actually exist on gfx8.
