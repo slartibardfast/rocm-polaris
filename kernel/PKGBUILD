@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=8
+pkgrel=9
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -41,6 +41,7 @@ source=(
   0005-kfd-fix-aql-queue-ring-buffer-size-check-for-gfx8.patch
   0006-kfd-vi-add-missing-aql-mqd-bits-doorbell-bif-drop-unord-dispatch.patch
   0008-kfd-vi-conditional-slot-based-wptr-for-aql-queues.patch
+  0009-drm-amdgpu-honor-uncached-flag-in-ttm-caching-mode.patch
   config
 )
 validpgpkeys=(
@@ -56,6 +57,7 @@ sha256sums=('4f21c01f4d04c1d1b3ed794153f8900802c92497be620b07c4869530f2d28ee3'
             '90fc62e4796567cfa6a70671530eb155d7b98990bb1778b9987774860497f3c6'
             '317194725ad5c1ea387afd3bb2e22345ad56643d09dc715f448703bc208fed91'
             'f8129f96bf341c4548dea38f2cb261518fa536ebc8663e135ca40314fe983de9'
+            'SKIP'
             'b364eae3a55fc2d3fd3029866b8f90430bc0c307cfa22a3e190ac1c13fcf8aa2')
 export KBUILD_BUILD_HOST=archlinux
 export KBUILD_BUILD_USER=$pkgbase

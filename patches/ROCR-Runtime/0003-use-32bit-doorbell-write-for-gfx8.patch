@@ -173,7 +173,7 @@
  uint64_t AqlQueue::LoadWriteIndexAcquire() {
    return atomic::Load(&amd_queue_.write_dispatch_id, std::memory_order_acquire);
  }
-@@ -475,7 +521,21 @@
+@@ -475,7 +521,22 @@
    } else {
      // Hardware doorbell supports AQL semantics.
      _mm_sfence();
@@ -181,10 +181,11 @@
 +    if (legacy_doorbell_) {
 +      if (no_atomics_) {
 +        // SLOT_BASED_WPTR=0: doorbell value directly becomes CP_HQD_PQ_WPTR.
-+        // Convert AQL packet index to dword offset in ring buffer.
-+        // Each AQL packet = 64 bytes = 16 dwords.  Mask wraps at ring size.
++        // AQL doorbell convention: value = last valid packet index.
++        // CP WPTR convention: points past last packet (next empty slot).
++        // Convert: (value + 1) * 16 dwords per packet, masked to ring size.
 +        uint32_t wptr_mask = (amd_queue_.hsa_queue.size * 16) - 1;
-+        uint32_t wptr_dwords = static_cast<uint32_t>(value * 16) & wptr_mask;
++        uint32_t wptr_dwords = static_cast<uint32_t>((value + 1) * 16) & wptr_mask;
 +        *(volatile uint32_t*)(signal_.hardware_doorbell_ptr) = wptr_dwords;
 +      } else {
 +        // SLOT_BASED_WPTR=2: doorbell is notification, value is dispatch index.

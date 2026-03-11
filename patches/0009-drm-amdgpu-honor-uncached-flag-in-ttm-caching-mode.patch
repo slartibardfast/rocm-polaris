@@ -1,0 +1,28 @@
+# Honor AMDGPU_GEM_CREATE_UNCACHED in TTM caching mode selection
+#
+# On non-coherent platforms (gfx8 without ATC/IOMMU, e.g. Polaris on
+# Westmere Xeon), GPU PCIe writes to system memory bypass CPU cache.
+# ROCR sets AMDGPU_GEM_CREATE_UNCACHED on kernarg pool allocations to
+# request coherent memory, but amdgpu_ttm_tt_new() only checks
+# AMDGPU_GEM_CREATE_CPU_GTT_USWC — UNCACHED buffers get ttm_cached,
+# so CPU reads see stale cache lines after GPU writes.
+#
+# Check UNCACHED before USWC and use ttm_uncached caching mode.
+# This makes kernarg/staging memory CPU-uncached, ensuring GPU writes
+# are visible to CPU without explicit cache flushes.
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -1131,7 +1131,9 @@
+ 	else
+ 		gtt->pool_id = abo->xcp_id;
+
+-	if (abo->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC)
++	if (abo->flags & AMDGPU_GEM_CREATE_UNCACHED)
++		caching = ttm_uncached;
++	else if (abo->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC)
+ 		caching = ttm_write_combined;
+ 	else
+ 		caching = ttm_cached;

@@ -558,3 +558,66 @@ HSA_ENABLE_INTERRUPT=0 ./tests/hip_smoke
 **Key insight:** The BO validation (`kfd_queue_acquire_buffers` / `kfd_queue_buffer_get`) was added to prevent userspace from passing arbitrary addresses. It was implemented after GFX8 was already dropped from ROCm, so the AQL size halving was never tested against real GFX8 hardware. The halving is correct for the CP hardware register encoding but wrong for BO validation — the BO is always the full size.
 
 **Fix:** Remove the GFX7/8 AQL size halving in `kfd_queue_acquire_buffers`. Kernel patch `0005-kfd-fix-aql-queue-ring-buffer-size-check-for-gfx8.patch`. Only affects code paths where `gfx_target_version < 90000`, which is exclusively GFX7/8 — no impact on GFX9+.
+
+## Phase 4: CPU Cache Coherency for Non-Coherent Platforms
+
+### Problem
+
+On gfx8 without ATC/IOMMU (Polaris on Westmere Xeon), GPU PCIe writes to system memory bypass CPU cache. CPU reads see stale cached data. This breaks:
+- `hsa_memory_copy` VRAM→system (ROCR path)
+- HIP `hipMemcpy` D2H (ROCclr staging buffer path)
+- Any GPU→system DMA where CPU reads the result
+
+### Root Cause Analysis
+
+Three parallel code traces identified:
+
+1. **ROCR `CopyMemory`** (runtime.cpp): `DmaCopy` writes to system memory, but CPU cache still holds stale data. **Fixed by patch 0005** — adds `FlushCpuCache()` after GPU→system DmaCopy on no-atomics platforms.
+
+2. **ROCclr D2H path**: `hipMemcpy(D2H)` → staging buffer → GPU shader copies VRAM→staging → `addSystemScope()` (GPU cache flush) → `Barriers.WaitCurrent()` → CPU `memcpy(host, staging)`. No CPU cache flush between GPU write and CPU read. Staging buffer allocated from GPU-accessible system memory.
+
+3. **Kernel TTM bug** (`amdgpu_ttm.c:1134-1137`): ROCR sets `AMDGPU_GEM_CREATE_UNCACHED` on kernarg pool allocations, but `amdgpu_ttm_tt_new()` only checks `AMDGPU_GEM_CREATE_CPU_GTT_USWC`. UNCACHED buffers get `ttm_cached` — CPU maps them write-back cached despite the uncached request.
+
+### Fix Strategy
+
+**Kernel patch 0009** (`0009-drm-amdgpu-honor-uncached-flag-in-ttm-caching-mode.patch`): Check `AMDGPU_GEM_CREATE_UNCACHED` before `CPU_GTT_USWC` in `amdgpu_ttm_tt_new()`, use `ttm_uncached` caching mode. This makes ALL kernarg/staging memory CPU-uncached, fixing coherency globally for both ROCR and ROCclr without separate patches in each userspace component.
+
+**ROCR patch 0005** (`0005-flush-cpu-cache-after-gpu-writes-to-system-memory.patch`): Belt-and-suspenders `FlushCpuCache()` after GPU→system DmaCopy. Works even if kernel patch isn't applied (e.g., on older kernels). Minimal overhead (one clflush per cache line for the copy destination).
+
+### Why kernel fix over userspace-only
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Kernel 0009 (UNCACHED→ttm_uncached) | Fixes ALL paths globally, one patch | Requires kernel rebuild + reboot |
+| ROCR 0005 (FlushCpuCache in CopyMemory) | Works on any kernel | Only fixes ROCR's DmaCopy path |
+| ROCclr patch (flush in readBuffer) | Fixes HIP path | Another component to patch/maintain |
+
+Kernel 0009 is the comprehensive fix. ROCR 0005 provides defense-in-depth for the ROCR path regardless of kernel version. If kernel 0009 makes memory truly uncached, the ROCR flush becomes a no-op (flushing uncached lines is harmless).
+
+### Verification Plan
+
+```bash
+# 1. Rebuild kernel
+cd kernel && rm -rf src pkg && makepkg -Csf
+sudo pacman -U linux-lts-rocm-polaris-6.18.16-9*.pkg.tar.zst --overwrite='*'
+# kexec to new kernel
+
+# 2. Verify kernarg pool is now uncached
+./tests/hsa_cache_timing  # expect ratio >> 1.0x vs WB baseline
+
+# 3. Test ROCR path (already passes with 0005)
+HSA_ENABLE_INTERRUPT=0 ./tests/hsa_memcopy_test2
+
+# 4. Test HIP path (THE key test)
+timeout 30 /opt/rocm/bin/hipcc --offload-arch=gfx803 -o /tmp/hip_smoke tests/hip_smoke.cpp
+HSA_ENABLE_INTERRUPT=0 timeout 10 /tmp/hip_smoke
+# Expected: step 5d (memcpy D2H) now returns correct data
+```
+
+### Status
+
+- [x] ROCR patch 0005: cache flush in CopyMemory (hsa-rocr-polaris 7.2.0-6 INSTALLED)
+- [x] Kernel patch 0009: honor UNCACHED in TTM (PKGBUILD ready, pkgrel=9)
+- [ ] Kernel 6.18.16-9 build and install
+- [ ] HIP hipMemcpy verification
+- [ ] `hsa_memcopy_test` fill path segfault investigation
