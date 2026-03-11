@@ -401,7 +401,7 @@ Binary analysis of Polaris 12 MEC firmware (`polaris12_mec_2.bin`, v0x2da, 65642
 - Per-queue `bounce_lock_` mutex for thread safety; static `bounce_list_lock_` for global queue registry
 - Double-checked locking pattern in `ScanNewPackets()` for fast-path (no-op when no new packets)
 
-**Status:** Patch applied and built into hsa-rocr-polaris 7.2.0-5. **Unblocked by Phase 3c** — kernel 6.18.16-8 clears `NO_UPDATE_RPTR` so CP writes RPTR to GPU-visible buffer; ROCR converts to `read_dispatch_id`. Ready for testing after reboot.
+**Status: VERIFIED.** Barrier dispatch completes successfully after fixing `completion_signal` offset bug (was 24, correct is 56 — same for all AQL packet types). Full pipeline: CP processes packet → RPTR written to GPU buffer → `UpdateReadDispatchId()` converts dword→dispatch_id → `ProcessCompletions()` decrements signal from CPU → wait returns.
 
 ### Test expectations (Phase 3c+4)
 
@@ -456,6 +456,9 @@ sudo ./tests/hsa_hqd_check
 | 2026-03-11 | **NO_UPDATE_RPTR=1 incompatible with SLOT_BASED_WPTR=0** | Testing showed `*rptr_gpu_buf_` stayed 0 — CP does not write to rptr_report_addr with NO_UPDATE_RPTR=1 + SLOT_BASED_WPTR=0. DRM gfx8 uses NO_UPDATE_RPTR=0 in this mode. |
 | 2026-03-11 | **Kernel 0008: conditional NO_UPDATE_RPTR** | Both NO_UPDATE_RPTR and SLOT_BASED_WPTR now only set when platform has atomics. No-atomics path gets neither flag, matching DRM gfx8 compute queue config. CP writes dword offset RPTR to rptr_report_addr. |
 | 2026-03-11 | **ROCR: dword→dispatch_id conversion** | With NO_UPDATE_RPTR=0, CP writes wrapping dword offset (not dispatch ID). ROCR tracks delta with wrap-around (last_rptr_dwords_), divides by 16 to get AQL packet count, accumulates into monotonic read_dispatch_id. |
+| 2026-03-11 | **Phase 3c VERIFIED: read_dispatch_id advances** | After kernel 6.18.16-8 boot, `read_dispatch_id` correctly reads 1 after barrier packet. GPU-visible RPTR buffer + dword conversion working. |
+| 2026-03-11 | **Bounce buffer signal offset bug** | `ScanNewPackets()` used offset 24 for barrier `completion_signal`, correct is 56. All AQL packet types have `completion_signal` at offset 56. Fixed, signal now decremented correctly. |
+| 2026-03-11 | **Phase 3c+4 VERIFIED: barrier dispatch completes** | `hsa_dispatch_test` returns `signal=0` — full pipeline working: CP → RPTR buffer → dispatch_id → bounce buffer → signal. |
 
 ## Debugging Notes
 
