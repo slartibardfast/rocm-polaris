@@ -432,6 +432,63 @@ sudo ./tests/hsa_hqd_check
 
 **If `read_dispatch_id` advances but signal never fires:** Bounce buffer scan/completion logic issue. Check `ScanNewPackets()` captures the signal, `ProcessCompletions()` sees the advanced index.
 
+### Phase 5: HIP Runtime Smoke Test (NEXT)
+
+**Goal:** Verify HIP userspace works end-to-end on gfx803, from device query through kernel dispatch. This determines whether we need a custom `hip-runtime-amd-polaris` package or can use stock Arch `hip-runtime-amd`.
+
+**Prerequisite state (all VERIFIED):**
+- HSA init, device enumeration, queue creation ✓
+- AQL barrier dispatch with signal completion ✓
+- Kernel: direct doorbell WPTR, RPTR reporting, bounce buffer signals ✓
+
+**Test sequence (incremental, each depends on prior):**
+
+| Step | Test | What it exercises | Pass criteria |
+|------|------|-------------------|---------------|
+| 5a | `hipInit(0)` + `hipGetDeviceCount` | HIP runtime init, CLR device enumeration | Returns `hipSuccess`, count ≥ 1 |
+| 5b | `hipGetDeviceProperties(&props, 0)` | Device property population, ISA query | `props.gcnArchName` = `"gfx803"` |
+| 5c | `hipSetDevice(0)` + `hipMalloc` + `hipFree` | VRAM allocation via KFD | No errors |
+| 5d | `hipMemset(ptr, 0x42, N)` | Blit kernel dispatch (Fill shader on utility queue) | Memory filled correctly |
+| 5e | `hipMemcpy(host, dev, N, D2H)` | Blit kernel dispatch (Copy shader) | Data matches |
+| 5f | Trivial kernel launch (`__global__ void set(int *p) { *p = 42; }`) | Full dispatch: code object load, kernarg setup, kernel dispatch packet, scratch, signal | Output = 42 |
+
+**Known risk areas:**
+
+1. **CLR `runtimeRocSupported()`** (`device.hpp:1457`): blocks gfx8 for OpenCL but HIP path is open. Should not affect steps 5a-5f. If it does, we need `hip-runtime-amd-polaris`.
+
+2. **Scratch memory allocation**: gfx8 scratch path differs from gfx9+ (`need_queue_scratch_base` = false for gfx8). Phase 3 review ELIMINATED this as a code issue, but we haven't tested it under real dispatch. Step 5f exercises this.
+
+3. **Code object loading**: `hipcc --offload-arch=gfx803` must produce valid code objects. Arch `rocm-llvm` has gfx803 targets (verified Phase 1). But `amd_comgr` links against ROCR — if our patches changed any symbol visibility, comgr could fail at runtime.
+
+4. **Blit kernel ISA**: Pre-compiled gfx8 blit binaries exist in `amd_blit_shaders.h` (V1 header). Steps 5d/5e confirm they actually execute correctly on hardware.
+
+5. **Multi-queue interaction**: HIP creates an internal utility queue (for blits) and a user queue. Both share the doorbell aperture with 4-byte stride. Our 32-bit doorbell write (patch 0003) prevents overflow into adjacent slots. Steps 5d/5e implicitly test both queues working simultaneously.
+
+6. **Bounce buffer under load**: Steps 5d-5f generate multiple AQL packets with completion signals. `ProcessCompletions()` must handle rapid signal accumulation and FIFO completion ordering.
+
+**Build & test commands:**
+```bash
+# Compile test (uses stock hipcc from Arch)
+hipcc --offload-arch=gfx803 -o tests/hip_smoke tests/hip_smoke.cpp
+
+# Run (HSA_ENABLE_INTERRUPT=0 forces polling — required for bounce buffer)
+HSA_ENABLE_INTERRUPT=0 ./tests/hip_smoke
+```
+
+**Failure diagnosis:**
+- `hipInit` fails → CLR or ROCR init issue; check `HSA_ENABLE_SDMA=0` env var, `strace` for failing ioctls
+- `hipGetDeviceProperties` fails → CLR device property population; may hit image dimension query (patched in 0002)
+- `hipMalloc` fails → KFD memory allocation; check `dmesg` for KFD errors
+- `hipMemset` hangs → Blit kernel dispatch broken; use `hsa_hqd_check` to see if CP is processing, `hsa_rptr_debug` for RPTR state
+- `hipMemset` returns but data wrong → Blit shader ISA issue or memory coherency; dump buffer contents
+- Kernel launch hangs → Code object load failure or kernarg issue; add `AMD_LOG_LEVEL=4` for CLR debug output
+- Kernel launch returns but wrong result → Kernel ISA execution or memory mapping issue
+
+**Decision point after Phase 5:**
+- If 5a-5f pass with stock `hip-runtime-amd` → no custom CLR package needed, proceed to rocBLAS
+- If 5a fails → need `hip-runtime-amd-polaris` with CLR gate patch
+- If 5d-5f fail → deeper dispatch debugging, may need additional ROCR patches
+
 ## Decisions Log
 
 | Date | Decision | Rationale |
