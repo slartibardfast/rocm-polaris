@@ -352,25 +352,45 @@ Binary analysis of Polaris 12 MEC firmware (`polaris12_mec_2.bin`, v0x2da, 65642
 
 **Status:** Phase 3b VERIFIED. Kernel and ROCR patches confirmed working via HQD registers. Phase 3c needed to solve `read_dispatch_id` before bounce buffer can function.
 
-### Phase 3c: read_dispatch_id — RPTR Reporting (NEXT)
+### Phase 3c: read_dispatch_id — GPU-Visible RPTR Buffer (CURRENT)
 
-**Problem:** With `NO_UPDATE_RPTR=1`, the CP writes the read pointer to `cp_hqd_pq_rptr_report_addr` instead of the HQD register. But `rptr_report_addr` is set to `&amd_queue_.read_dispatch_id` — a **CPU heap VA**. On gfx8 without UTCL2, the CP cannot translate this VA via GPUVM. Result: `read_dispatch_id` stays 0, ROCR can never detect packet completion.
+**Problem:** With `NO_UPDATE_RPTR=1`, the CP writes the 64-bit AQL dispatch ID to `rptr_report_addr`. ROCR sets `rptr_report_addr = &amd_queue_.read_dispatch_id` — a CPU heap VA. On gfx8 without UTCL2, the CP cannot translate this VA via GPUVM → write fails silently → `read_dispatch_id` stays 0 forever.
 
-**Key difference from DRM:** DRM compute queues set `rptr_report_addr` to a GPU-accessible buffer (`ring->rptr_gpu_addr` — VRAM or GTT writeback buffer) and do NOT set `NO_UPDATE_RPTR`. KFD AQL queues use a user-space address.
+**All consumers blocked:**
+- `ProcessCompletions()` (bounce buffer) — signals never fire → dispatch hangs
+- `AcquireWriteIndex()` (blit kernel) — ring appears full after ~256 packets → deadlock
+- Scratch reclaim — scratch never freed → OOM
 
-**Data flow:**
-- ROCR sets `Queue_read_ptr_aql = &amd_queue_.read_dispatch_id` (`amd_aql_queue.cpp:139`)
-- libhsakmt passes this to KFD ioctl as `read_pointer_address` (`queues.c:748`)
-- KFD stores it as `q->read_ptr` and writes it to MQD `cp_hqd_pq_rptr_report_addr` (`kfd_mqd_manager_vi.c:202-203`)
-- CP attempts to write RPTR to this address via GPUVM — fails silently on gfx8
+**Approach: ROCR-only GPU-visible buffer.** `system_allocator()` returns kernarg pool memory (CPU VA = GPU VA, mapped in GPU page tables via KFD unified VA). Point `rptr_report_addr` at this buffer instead of `&amd_queue_.read_dispatch_id`. Copy from GPU buffer to `amd_queue_.read_dispatch_id` on every `LoadReadIndex*` call.
 
-**Potential approaches:**
-1. **Clear `NO_UPDATE_RPTR`** — CP would update the hardware RPTR register instead. But AQL queues need `NO_UPDATE_RPTR` for correct `SLOT_BASED_WPTR` behavior (the bits are interdependent per AMD documentation).
-2. **Allocate `rptr_report_addr` in GPU-accessible memory** — either VRAM or GTT, with a GPU VA that the CP can write to. Would need ROCR to allocate a separate VRAM/GTT BO for the read pointer, then map it to CPU for polling. This is what DRM does.
-3. **Poll hardware RPTR register directly** — read `CP_HQD_PQ_RPTR` from debugfs or a mapped MMIO range. Not practical for userspace polling.
-4. **Kernel-side RPTR forwarding** — periodically copy hardware RPTR to the userspace address. Adds kernel complexity and latency.
+**Evidence this works:**
+- Ring buffer (`ring_buf_`) uses `system_allocator()` — CP reads AQL packets from it (confirmed by RPTR=WPTR=0x10)
+- PM4 IB buffer (`pm4_ib_buf_`) uses `system_allocator()` — same pattern
+- KFD kernel queues use `kfd_gtt_sa_allocate()` for their rptr buffer — equivalent
+- DRM writeback buffers use GPU-accessible GTT memory for RPTR — same concept
 
-**Investigation needed:** Does clearing `NO_UPDATE_RPTR` actually break `SLOT_BASED_WPTR=0`? DRM gfx8 compute queues use `SLOT_BASED_WPTR=0` WITHOUT `NO_UPDATE_RPTR` and they work. The `NO_UPDATE_RPTR` may only be needed for `SLOT_BASED_WPTR=2` (memory polling mode). If so, our conditional path (`SLOT_BASED_WPTR=0` for no-atomics) could safely clear it.
+**Why not other approaches:**
+- Clear `NO_UPDATE_RPTR`: HW register advances but ROCR has no way to read it (no userspace MMIO)
+- Kernel-side RPTR forwarding: 1ms timer latency, kernel complexity, overkill
+- New KFD ioctl: syscall overhead per poll, maintenance burden
+- Software RPTR tracking: can't know when CP finished processing
+
+**Changes:**
+
+1. **ROCR patch 0003** (extend): Add `rptr_gpu_buf_` member (uint64_t*) and `UpdateReadDispatchId()` method. Allocate 4KB from `system_allocator()` in constructor (no-atomics only). Set `Queue_read_ptr_aql = rptr_gpu_buf_` instead of `&amd_queue_.read_dispatch_id`. Copy GPU buffer → `amd_queue_.read_dispatch_id` on every `LoadReadIndexAcquire`/`LoadReadIndexRelaxed`. Free in destructor before `FreeQueueMemory()`.
+
+2. **ROCR patch 0004** (extend): Add `UpdateReadDispatchId()` call at top of `ProcessCompletions()`.
+
+3. **No kernel changes.** Keep `NO_UPDATE_RPTR=1` — correct because it makes CP write 64-bit dispatch ID to `rptr_report_addr`.
+
+4. **PKGBUILD:** bump pkgrel 4 → 5, update sha256sums.
+
+**Memory lifecycle:**
+- Create: `system_allocator()` → kernarg pool → GPU-mapped via KFD unified VA → passed as `Queue_read_ptr_aql` → MQD `rptr_report_addr`
+- Run: CP writes dispatch ID to `rptr_gpu_buf_` (GPU VA = CPU VA). `UpdateReadDispatchId()` copies to `amd_queue_.read_dispatch_id` on every `LoadReadIndex*` and `ProcessCompletions()`.
+- Destroy: `system_deallocator()` frees buffer after KFD DestroyQueue.
+
+**Risk: Low.** Same allocator path as ring buffer and PM4 IB (proven GPU-writable). 4KB per queue overhead negligible. No kernel changes. All existing `read_dispatch_id` consumers work transparently via copy. Memory ordering safe: kernarg pool is fine-grain coherent memory, x86 loads are inherently acquire.
 
 ### Phase 4: RPTR Bounce Buffer — Software Signal Completion
 
@@ -413,6 +433,7 @@ Binary analysis of Polaris 12 MEC firmware (`polaris12_mec_2.bin`, v0x2da, 65642
 | 2026-03-11 | **Move no_atomics_ to ROCR patch 0003** | Doorbell WPTR encoding (0003) is the first consumer of no_atomics_; patch 0004 (bounce buffer) depends on it. Keeps patches independently testable. |
 | 2026-03-11 | **CP packet processing VERIFIED** | HQD registers show RPTR=WPTR=0x10 — CP consumed the barrier packet. Direct doorbell WPTR fix confirmed working. |
 | 2026-03-11 | **read_dispatch_id broken by NO_UPDATE_RPTR** | `rptr_report_addr` is CPU heap VA, unreachable via GPUVM (same root cause as WPTR poll). DRM gfx8 uses VRAM writeback buffer instead. Bounce buffer blocked until resolved. |
+| 2026-03-11 | **GPU-visible RPTR buffer via system_allocator()** | Allocate rptr_report_addr from kernarg pool (CPU VA = GPU VA). Same proven path as ring_buf_ and pm4_ib_buf_. ROCR-only fix, no kernel changes. Copies to amd_queue_.read_dispatch_id on LoadReadIndex* for transparent consumer compatibility. |
 
 ## Debugging Notes
 
