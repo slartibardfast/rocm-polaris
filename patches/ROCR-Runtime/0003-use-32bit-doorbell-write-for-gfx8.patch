@@ -1,24 +1,72 @@
-# Use 32-bit doorbell writes for gfx8 (pre-Vega) GPUs
+# 32-bit doorbell writes with conditional WPTR encoding for gfx8
 #
 # gfx8 doorbells are 4 bytes wide with 4-byte stride (queue_id * 4).
 # gfx9+ doorbells are 8 bytes wide with 8-byte stride (queue_id * 8).
 # ROCR unconditionally writes 64 bits via hardware_doorbell_ptr, which
 # on gfx8 overflows into the adjacent queue's doorbell slot.
 #
-# Add a cached flag for legacy (32-bit) doorbells and use a 32-bit
-# store in StoreRelaxed() when targeting gfx8.
+# When the platform lacks PCIe atomics, the kernel sets SLOT_BASED_WPTR=0
+# (direct doorbell mode) where the doorbell value IS the CP_HQD_PQ_WPTR.
+# In this mode, the value must be a dword offset into the ring buffer
+# (each AQL packet = 64 bytes = 16 dwords), masked to the ring size.
+#
+# When PCIe atomics are available, SLOT_BASED_WPTR=2 (memory polling)
+# is used and the doorbell write is just a notification — value is the
+# dispatch index.
+#
+# Also adds NoPlatformAtomics() to GpuAgent (detection via iolink
+# topology flags) and a per-queue no_atomics_ flag, which patch 0004
+# (RPTR bounce buffer) also uses.
 #
 # Signed-off-by: David Connolly <david@connol.ly>
 
+diff --git a/runtime/hsa-runtime/core/inc/amd_gpu_agent.h b/runtime/hsa-runtime/core/inc/amd_gpu_agent.h
+--- a/runtime/hsa-runtime/core/inc/amd_gpu_agent.h
++++ b/runtime/hsa-runtime/core/inc/amd_gpu_agent.h
+@@ -421,6 +421,9 @@
+   // @brief returns true if agent uses MES scheduler
+   __forceinline const bool isMES() const { return (isa_->GetMajorVersion() >= 11) ? true : false; };
+
++  // @brief returns true if CPU<->GPU link lacks 64-bit PCIe atomic support
++  __forceinline bool NoPlatformAtomics() const { return no_platform_atomics_; }
++
+   // @brief returns the libdrm device handle
+   __forceinline amdgpu_device_handle libDrmDev() const { return ldrm_dev_; }
+
+@@ -840,6 +843,9 @@
+   bool xgmi_cpu_gpu_;
+   /// @brief Is PCIe large BAR enabled.
+   bool large_bar_enabled_;
++
++  /// @brief True when CPU<->GPU link lacks 64-bit PCIe atomic support.
++  bool no_platform_atomics_;
+ };
+
+ }  // namespace amd
+diff --git a/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp b/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+--- a/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
++++ b/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+@@ -226,6 +226,8 @@
+   auto link_info = core::Runtime::runtime_singleton_->GetLinkInfo(first_cpu->node_id(), node_id());
+   xgmi_cpu_gpu_ = (link_info.info.link_type == HSA_AMD_LINK_INFO_TYPE_XGMI);
+
++  no_platform_atomics_ = !link_info.info.atomic_support_64bit;
++
+   if (link_info.num_hop >= 1) {
+     large_bar_enabled_ = true;
+   }
 diff --git a/runtime/hsa-runtime/core/inc/amd_aql_queue.h b/runtime/hsa-runtime/core/inc/amd_aql_queue.h
 --- a/runtime/hsa-runtime/core/inc/amd_aql_queue.h
 +++ b/runtime/hsa-runtime/core/inc/amd_aql_queue.h
-@@ -297,6 +297,9 @@
+@@ -297,6 +297,12 @@
    // Handle of agent, which queue is attached to
    GpuAgent* agent_;
 
 +  // True if gfx8 (4-byte doorbells), false for gfx9+ (8-byte doorbells)
 +  bool legacy_doorbell_;
++
++  // True when platform lacks PCIe atomics (from agent)
++  bool no_atomics_;
 +
    // Handle of scratch memory descriptor
    ScratchInfo queue_scratch_;
@@ -26,21 +74,32 @@ diff --git a/runtime/hsa-runtime/core/inc/amd_aql_queue.h b/runtime/hsa-runtime/
 diff --git a/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp b/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
 --- a/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
 +++ b/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
-@@ -88,6 +88,7 @@
+@@ -88,6 +88,8 @@
        pm4_ib_size_b_(0x1000),
        dynamicScratchState(0),
        exceptionState(0),
 +      legacy_doorbell_(agent->supported_isas()[0]->GetMajorVersion() < 9),
++      no_atomics_(agent->NoPlatformAtomics()),
        suspended_(false),
        priority_(HSA_QUEUE_PRIORITY_NORMAL),
        exception_signal_(nullptr) {
-@@ -475,7 +476,11 @@
+@@ -475,7 +477,21 @@
    } else {
      // Hardware doorbell supports AQL semantics.
      _mm_sfence();
 -    *(signal_.hardware_doorbell_ptr) = uint64_t(value);
 +    if (legacy_doorbell_) {
-+      *(volatile uint32_t*)(signal_.hardware_doorbell_ptr) = uint32_t(value);
++      if (no_atomics_) {
++        // SLOT_BASED_WPTR=0: doorbell value directly becomes CP_HQD_PQ_WPTR.
++        // Convert AQL packet index to dword offset in ring buffer.
++        // Each AQL packet = 64 bytes = 16 dwords.  Mask wraps at ring size.
++        uint32_t wptr_mask = (amd_queue_.hsa_queue.size * 16) - 1;
++        uint32_t wptr_dwords = static_cast<uint32_t>(value * 16) & wptr_mask;
++        *(volatile uint32_t*)(signal_.hardware_doorbell_ptr) = wptr_dwords;
++      } else {
++        // SLOT_BASED_WPTR=2: doorbell is notification, value is dispatch index.
++        *(volatile uint32_t*)(signal_.hardware_doorbell_ptr) = uint32_t(value);
++      }
 +    } else {
 +      *(signal_.hardware_doorbell_ptr) = uint64_t(value);
 +    }

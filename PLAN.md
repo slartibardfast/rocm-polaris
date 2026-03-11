@@ -309,9 +309,72 @@ Binary analysis of Polaris 12 MEC firmware (`polaris12_mec_2.bin`, v0x2da, 65642
 - The MEC firmware reads the full `CP_HQD_PQ_DOORBELL_CONTROL` register from the MQD — it will process whatever bits the kernel sets, including `DOORBELL_BIF_DROP`.
 - **Conclusion:** The firmware is not the issue. It handles queue activation identically to Vega. The missing MQD bits (our kernel patch) are the problem — the firmware is faithfully loading what the kernel wrote, which was incomplete.
 
-### Phase 4: RPTR Bounce Buffer — Software Signal Completion (CURRENT)
+### Phase 3b: Direct Doorbell WPTR — Conditional SLOT_BASED_WPTR (CURRENT)
 
-**Root cause (confirmed):** GFX8 CP writes completion signals to system memory using PCIe AtomicOp TLPs. Westmere root complex drops them silently. RPTR (`read_dispatch_id`) advances correctly — it's written to the `amd_queue_v2_t` struct via a different mechanism.
+**Root cause:** WPTR polling is broken on gfx8 without PCIe atomics. With `SLOT_BASED_WPTR=2`, the CP polls `cp_hqd_pq_wptr_poll_addr` to read the write pointer. That address is a CPU heap VA (`&amd_queue_.write_dispatch_id`). With `PQ_ATC=0` and no UTCL2 (gfx8), the CP cannot translate it via GPUVM. Result: `CP_HQD_PQ_WPTR` stays at 0, no packets fetched — even though `DOORBELL_HIT=1`.
+
+**Fix:** Conditional `SLOT_BASED_WPTR`: use 0 (direct doorbell) when platform lacks PCIe atomics, 2 (memory polling) when atomics are available. DRM's own gfx8 compute queues use `SLOT_BASED_WPTR=0` with `WDOORBELL32(ring->doorbell_index, lower_32_bits(ring->wptr))` — proven hardware path.
+
+**Changes:**
+
+1. **Kernel patch 0008** (`kfd_mqd_manager_vi.c`): Conditional `SLOT_BASED_WPTR` in `__update_mqd()`. Module parameter `gfx8_wptr_poll` (0=auto, -1=force direct, 1=force poll). Keys off `mm->dev->kfd->pci_atomic_requested`.
+
+2. **Kernel patch 0007 removed from PKGBUILD.** WPTR polling register writes in `amdgpu_amdkfd_gfx_v8.c` are unnecessary: with `SLOT_BASED_WPTR=0` there's no polling, and with `SLOT_BASED_WPTR=2` the upstream code handles it.
+
+3. **ROCR patch 0003 modified** (`amd_aql_queue.cpp`): Conditional WPTR encoding in `StoreRelaxed()`. With `no_atomics_` (SLOT_BASED_WPTR=0), doorbell value is dword offset = `(dispatch_id * 16) & mask`. Without `no_atomics_` (SLOT_BASED_WPTR=2), doorbell value is dispatch index (notification only). Also moves `no_atomics_` field + `NoPlatformAtomics()` agent detection from patch 0004 into 0003 (first consumer).
+
+4. **ROCR patch 0004 modified**: Removes agent detection hunks (now in 0003). Adds `last_scanned_idx_` to constructor. All bounce buffer logic unchanged.
+
+5. **PKGBUILDs**: kernel 6.18.16-7 (swap 0007→0008), hsa-rocr 7.2.0-4 (updated 0003/0004).
+
+**Detection summary:**
+| Layer | Flag | Source |
+|-------|------|--------|
+| Kernel | `kfd->pci_atomic_requested` | `amdgpu_amdkfd_have_atomics_support()` |
+| Kernel | `gfx8_wptr_poll` | Module parameter (override) |
+| ROCR | `no_platform_atomics_` (GpuAgent) | iolink `NoAtomics64bit` topology flag |
+| ROCR | `no_atomics_` (AqlQueue) | Per-queue cache from agent |
+
+**HQD register verification (2026-03-11):** After booting kernel 6.18.16-7 + hsa-rocr 7.2.0-4, used `hsa_wptr_debug` test tool (rings doorbell then sleeps 10s for register capture). `/sys/kernel/debug/kfd/hqds` dump of the user queue:
+
+| Register | Value | Meaning |
+|----------|-------|---------|
+| CP_HQD_PQ_WPTR | 0x00000010 | 16 dwords = 1 AQL packet submitted |
+| CP_HQD_PQ_RPTR | 0x00000010 | **RPTR caught up — packet consumed by CP** |
+| DOORBELL_HIT | 1 | Doorbell ring received |
+| PQ_CONTROL | 0x1801850d | SLOT_BASED_WPTR=0, NO_UPDATE_RPTR=1, UNORD_DISPATCH=1 |
+
+**CP IS processing packets.** The direct doorbell WPTR fix works — RPTR matches WPTR, meaning the CP fetched and executed the barrier packet. The dispatch test still times out because:
+
+1. **`read_dispatch_id` stays 0** — `NO_UPDATE_RPTR=1` prevents CP from writing RPTR back to `rptr_report_addr` (CPU VA `&amd_queue_.read_dispatch_id`). Same root cause as the WPTR poll address: it's a CPU heap VA unreachable via GPUVM on gfx8 without UTCL2. The hardware RPTR register advances (confirmed above), but ROCR never sees it.
+
+2. **Signal completion fails** — CP's AtomicOp TLP for signal decrement is dropped by Westmere root complex (no PCIe atomics). This was the known issue the bounce buffer was designed for.
+
+**Status:** Phase 3b VERIFIED. Kernel and ROCR patches confirmed working via HQD registers. Phase 3c needed to solve `read_dispatch_id` before bounce buffer can function.
+
+### Phase 3c: read_dispatch_id — RPTR Reporting (NEXT)
+
+**Problem:** With `NO_UPDATE_RPTR=1`, the CP writes the read pointer to `cp_hqd_pq_rptr_report_addr` instead of the HQD register. But `rptr_report_addr` is set to `&amd_queue_.read_dispatch_id` — a **CPU heap VA**. On gfx8 without UTCL2, the CP cannot translate this VA via GPUVM. Result: `read_dispatch_id` stays 0, ROCR can never detect packet completion.
+
+**Key difference from DRM:** DRM compute queues set `rptr_report_addr` to a GPU-accessible buffer (`ring->rptr_gpu_addr` — VRAM or GTT writeback buffer) and do NOT set `NO_UPDATE_RPTR`. KFD AQL queues use a user-space address.
+
+**Data flow:**
+- ROCR sets `Queue_read_ptr_aql = &amd_queue_.read_dispatch_id` (`amd_aql_queue.cpp:139`)
+- libhsakmt passes this to KFD ioctl as `read_pointer_address` (`queues.c:748`)
+- KFD stores it as `q->read_ptr` and writes it to MQD `cp_hqd_pq_rptr_report_addr` (`kfd_mqd_manager_vi.c:202-203`)
+- CP attempts to write RPTR to this address via GPUVM — fails silently on gfx8
+
+**Potential approaches:**
+1. **Clear `NO_UPDATE_RPTR`** — CP would update the hardware RPTR register instead. But AQL queues need `NO_UPDATE_RPTR` for correct `SLOT_BASED_WPTR` behavior (the bits are interdependent per AMD documentation).
+2. **Allocate `rptr_report_addr` in GPU-accessible memory** — either VRAM or GTT, with a GPU VA that the CP can write to. Would need ROCR to allocate a separate VRAM/GTT BO for the read pointer, then map it to CPU for polling. This is what DRM does.
+3. **Poll hardware RPTR register directly** — read `CP_HQD_PQ_RPTR` from debugfs or a mapped MMIO range. Not practical for userspace polling.
+4. **Kernel-side RPTR forwarding** — periodically copy hardware RPTR to the userspace address. Adds kernel complexity and latency.
+
+**Investigation needed:** Does clearing `NO_UPDATE_RPTR` actually break `SLOT_BASED_WPTR=0`? DRM gfx8 compute queues use `SLOT_BASED_WPTR=0` WITHOUT `NO_UPDATE_RPTR` and they work. The `NO_UPDATE_RPTR` may only be needed for `SLOT_BASED_WPTR=2` (memory polling mode). If so, our conditional path (`SLOT_BASED_WPTR=0` for no-atomics) could safely clear it.
+
+### Phase 4: RPTR Bounce Buffer — Software Signal Completion
+
+**Root cause (confirmed):** GFX8 CP writes completion signals to system memory using PCIe AtomicOp TLPs. Westmere root complex drops them silently. The bounce buffer depends on `read_dispatch_id` advancing to detect completion — blocked until Phase 3c resolves RPTR reporting.
 
 **Solution:** ROCR patch `0004-rptr-bounce-buffer-for-no-atomics-platforms.patch` adds a per-queue RPTR bounce buffer:
 1. `ScanNewPackets()` — called from doorbell write path (`StoreRelaxed`), reads newly submitted AQL packets and saves their `completion_signal` handles
@@ -328,7 +391,7 @@ Binary analysis of Polaris 12 MEC firmware (`polaris12_mec_2.bin`, v0x2da, 65642
 - Per-queue `bounce_lock_` mutex for thread safety; static `bounce_list_lock_` for global queue registry
 - Double-checked locking pattern in `ScanNewPackets()` for fast-path (no-op when no new packets)
 
-**Status:** Patch written and verified to apply cleanly. PKGBUILD bumped to 7.2.0-3. Needs build and test.
+**Status:** Patch written and verified to apply cleanly. PKGBUILD bumped to 7.2.0-4. **Blocked on Phase 3c** — bounce buffer polls `read_dispatch_id` which doesn't advance yet.
 
 ## Decisions Log
 
@@ -345,6 +408,11 @@ Binary analysis of Polaris 12 MEC firmware (`polaris12_mec_2.bin`, v0x2da, 65642
 | 2026-03-07 | Community prior art: xuhuisheng/rocm-gfx803 | Built custom hsa-rocr starting at ROCm 5.3.0; confirms runtime patching needed. NULL0xFF/rocm-gfx803 uses ROCm 6.1.5 on EPYC (has PCIe atomics). |
 | 2026-03-07 | **KFD AQL queue ring buffer size mismatch** (see Debugging Notes below) | `kfd_queue.c:250` halves `expected_queue_size` for AQL on GFX7/8, but ROCR allocates full-size ring buffer BO. `kfd_queue_buffer_get` requires exact BO size match → EINVAL on any queue > 2KB. Utility queue passes by accident (2048-byte expected → 0 pages → size check skipped). Fix: remove the halving — it's a CP register encoding detail, not a BO allocation convention. Only affects GFX7/8 code path. |
 | 2026-03-08 | **Queue creation confirmed fixed** | After kernel 6.18.16-2, both CREATE_QUEUE ioctls return 0. Pure HSA test creates queue and destroys it successfully. HIP test hangs in runtime static init after all ioctls succeed — GPU dispatch execution issue, not queue creation. |
+| 2026-03-11 | **WPTR polling broken on no-atomics gfx8** | SLOT_BASED_WPTR=2 polls CPU VA via GPUVM — unreachable without UTCL2. Conditional: use direct doorbell (=0) without atomics, proven by DRM gfx8 compute queues. |
+| 2026-03-11 | **Remove kernel patch 0007** | WPTR polling register writes unnecessary: direct doorbell mode doesn't poll, memory polling mode handled by upstream. Replace with conditional 0008. |
+| 2026-03-11 | **Move no_atomics_ to ROCR patch 0003** | Doorbell WPTR encoding (0003) is the first consumer of no_atomics_; patch 0004 (bounce buffer) depends on it. Keeps patches independently testable. |
+| 2026-03-11 | **CP packet processing VERIFIED** | HQD registers show RPTR=WPTR=0x10 — CP consumed the barrier packet. Direct doorbell WPTR fix confirmed working. |
+| 2026-03-11 | **read_dispatch_id broken by NO_UPDATE_RPTR** | `rptr_report_addr` is CPU heap VA, unreachable via GPUVM (same root cause as WPTR poll). DRM gfx8 uses VRAM writeback buffer instead. Bounce buffer blocked until resolved. |
 
 ## Debugging Notes
 
