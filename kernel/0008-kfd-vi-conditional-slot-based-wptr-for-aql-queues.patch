@@ -1,0 +1,62 @@
+# Conditional SLOT_BASED_WPTR for gfx8 AQL queues
+#
+# SLOT_BASED_WPTR=2 makes the CP poll WPTR from a memory address
+# (cp_hqd_pq_wptr_poll_addr).  That address is a CPU heap VA.  With
+# PQ_ATC=0 and no UTCL2 (gfx8), the CP cannot translate it via GPUVM.
+# Result: CP_HQD_PQ_WPTR stays at 0, no packets fetched.
+#
+# On platforms with PCIe atomics, UTCL2-like behavior may work, so we
+# preserve SLOT_BASED_WPTR=2 for those.  Without atomics, use direct
+# doorbell mode (=0) where the doorbell value IS the WPTR — the proven
+# DRM gfx8 compute queue mechanism (gfx_v8_0_ring_set_wptr_compute).
+#
+# Module parameter gfx8_wptr_poll:
+#   0 = auto (default): direct doorbell without atomics, poll with
+#  -1 = force direct doorbell regardless of atomics
+#   1 = force memory polling regardless of atomics
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -33,6 +33,20 @@
+ #include "gca/gfx_8_0_enum.h"
+ #include "oss/oss_3_0_sh_mask.h"
+
++#include <linux/moduleparam.h>
++
++/**
++ * gfx8_wptr_poll - control WPTR delivery for gfx8 AQL queues.
++ *  0 = auto: direct doorbell when platform lacks PCIe atomics,
++ *            memory polling when atomics are available (default)
++ * -1 = force direct doorbell (SLOT_BASED_WPTR=0)
++ *  1 = force memory polling (SLOT_BASED_WPTR=2)
++ */
++static int gfx8_wptr_poll;
++module_param(gfx8_wptr_poll, int, 0444);
++MODULE_PARM_DESC(gfx8_wptr_poll,
++	"GFX8 AQL WPTR mode: 0=auto(default), -1=force doorbell, 1=force poll");
++
+ #define CP_MQD_CONTROL__PRIV_STATE__SHIFT 0x8
+
+ static inline struct vi_mqd *get_mqd(void *mqd)
+@@ -225,7 +239,17 @@
+
+ 	if (q->format == KFD_QUEUE_FORMAT_AQL) {
+-		m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK |
+-				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
++		m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK;
++		/*
++		 * SLOT_BASED_WPTR=2: CP polls WPTR from memory
++		 * (wptr_poll_addr), a CPU VA unreachable via GPUVM on gfx8
++		 * without UTCL2.  Without PCIe atomics, fall back to direct
++		 * doorbell mode (=0) where the doorbell value IS the WPTR.
++		 */
++		if (gfx8_wptr_poll > 0 ||
++		    (gfx8_wptr_poll == 0 &&
++		     mm->dev->kfd->pci_atomic_requested))
++			m->cp_hqd_pq_control |=
++				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
+ 	}
+
+ 	if (mm->dev->kfd->cwsr_enabled && q->ctx_save_restore_area_address)
