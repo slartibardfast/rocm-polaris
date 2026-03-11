@@ -1,0 +1,61 @@
+# Flush CPU cache after GPU writes to system memory on non-coherent platforms
+#
+# On gfx8 without ATC/IOMMU (e.g. Polaris on Westmere Xeon), GPU writes
+# to system memory bypass CPU cache via PCIe posted writes.  The CPU's
+# Write-Back cached mapping sees stale data after a GPU-to-system copy.
+#
+# After any DmaCopy that writes to system memory on a non-coherent
+# platform, flush the destination's CPU cache lines so subsequent CPU
+# reads see the GPU-written data.  Uses the existing FlushCpuCache()
+# utility (x86 clflush per cache line).
+#
+# Also handles the GPU-GPU staging path: flush the intermediate system
+# buffer between the two DmaCopy calls so the second GPU doesn't read
+# stale cache lines via PCIe snoop.
+
+--- a/runtime/hsa-runtime/core/runtime/runtime.cpp
++++ b/runtime/hsa-runtime/core/runtime/runtime.cpp
+@@ -74,6 +74,7 @@
+ #include "core/inc/amd_cpu_agent.h"
+ #include "core/inc/amd_gpu_agent.h"
+ #include "core/inc/amd_memory_region.h"
++#include "core/util/utils.h"
+ #include "core/inc/amd_topology.h"
+ #include "core/inc/exceptions.h"
+ #include "core/inc/host_queue.h"
+@@ -571,7 +572,18 @@
+   if (src_lock) locked_copy(source, dst_agent);
+   if (dst_lock) locked_copy(dst, src_agent);
+   if (is_src_system) return dst_agent->DmaCopy(dst, source, size);
+-  if (is_dst_system) return src_agent->DmaCopy(dst, source, size);
++  if (is_dst_system) {
++    hsa_status_t status = src_agent->DmaCopy(dst, source, size);
++    // On non-coherent platforms (gfx8 without ATC/IOMMU), GPU writes to
++    // system memory bypass CPU cache.  Flush destination cache lines so
++    // subsequent CPU reads see the GPU-written data.
++    if (status == HSA_STATUS_SUCCESS &&
++        src_agent->device_type() == core::Agent::DeviceType::kAmdGpuDevice &&
++        static_cast<AMD::GpuAgent*>(src_agent)->NoPlatformAtomics()) {
++      rocr::FlushCpuCache(dst, 0, size);
++    }
++    return status;
++  }
+
+   /*
+   GPU-GPU - functional support, not a performance path.
+@@ -584,7 +596,14 @@
+   void* temp = system_allocator_(size, 0, core::MemoryRegion::AllocateNoFlags, 0);
+   MAKE_SCOPE_GUARD([&]() { system_deallocator_(temp); });
+   hsa_status_t err = src_agent->DmaCopy(temp, source, size);
+-  if (err == HSA_STATUS_SUCCESS) err = dst_agent->DmaCopy(dst, temp, size);
++  if (err == HSA_STATUS_SUCCESS) {
++    // Flush temp so the second GPU reads data from DRAM, not stale CPU cache.
++    if (src_agent->device_type() == core::Agent::DeviceType::kAmdGpuDevice &&
++        static_cast<AMD::GpuAgent*>(src_agent)->NoPlatformAtomics()) {
++      rocr::FlushCpuCache(temp, 0, size);
++    }
++    err = dst_agent->DmaCopy(dst, temp, size);
++  }
+   return err;
+ }
+
