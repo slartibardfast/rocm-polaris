@@ -1,0 +1,21 @@
+# Re-enable gfx803 in rocBLAS CMake target list
+#
+# AMD dropped gfx803 from the default GPU target list at ROCm 6.0.
+# The runtime code (handle.hpp Processor enum, handle.cpp detection,
+# Tensile lazy loading, and R9 Nano YAML logic files) is all still
+# present — only the CMake target list was changed.
+#
+# This patch adds gfx803 back to TARGET_LIST_ROCM_7.1, which is
+# the list selected for ROCm >= 7.1 (including 7.2.0).
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -85,7 +85,7 @@
+   set( TARGET_LIST_ROCM_6.0 "gfx900;gfx906:xnack-;gfx908:xnack-;gfx90a:xnack+;gfx90a:xnack-;gfx942;gfx1010;gfx1012;gfx1030;gfx1100;gfx1101;gfx1102")
+   set( TARGET_LIST_ROCM_6.3 "gfx900;gfx906:xnack-;gfx908:xnack-;gfx90a;gfx942;gfx1010;gfx1012;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201")
+   set( TARGET_LIST_ROCM_7.0 "gfx900;gfx906:xnack-;gfx908:xnack-;gfx90a;gfx942;gfx950;gfx1010;gfx1012;gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201")
+-  set( TARGET_LIST_ROCM_7.1 "gfx900;gfx906:xnack-;gfx908:xnack-;gfx90a;gfx942;gfx950;gfx1010;gfx1012;gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1200;gfx1201")
++  set( TARGET_LIST_ROCM_7.1 "gfx803;gfx900;gfx906:xnack-;gfx908:xnack-;gfx90a;gfx942;gfx950;gfx1010;gfx1012;gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1200;gfx1201")
+ else()
+   set( TARGET_LIST_ROCM_5.6 "gfx908:xnack+;gfx90a:xnack+")
+   set( TARGET_LIST_ROCM_5.7 "gfx908:xnack+;gfx90a:xnack+;gfx942:xnack+")
