@@ -137,7 +137,7 @@
    FreeQueueMemory();
  
    if (core::g_use_interrupt_wait) {
-@@ -406,13 +430,35 @@
+@@ -406,13 +430,38 @@
  }
  
  uint64_t AqlQueue::LoadReadIndexAcquire() {
@@ -152,6 +152,9 @@
  
 +void AqlQueue::UpdateReadDispatchId() {
 +  if (!rptr_gpu_buf_) return;
++  // CP writes RPTR via PCIe posted writes which bypass CPU cache.
++  // Flush the cache line so we see the GPU's update.
++  rocr::FlushCpuCache(rptr_gpu_buf_, 0, sizeof(*rptr_gpu_buf_));
 +  // CP writes RPTR as dword offset that wraps at ring_size * 16.
 +  // Convert to monotonic AQL dispatch index (each packet = 16 dwords).
 +  uint32_t cur_dw = static_cast<uint32_t>(
@@ -173,7 +176,7 @@
  uint64_t AqlQueue::LoadWriteIndexAcquire() {
    return atomic::Load(&amd_queue_.write_dispatch_id, std::memory_order_acquire);
  }
-@@ -475,7 +521,22 @@
+@@ -475,7 +524,22 @@
    } else {
      // Hardware doorbell supports AQL semantics.
      _mm_sfence();

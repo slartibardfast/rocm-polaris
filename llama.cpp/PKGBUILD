@@ -17,6 +17,7 @@ depends=(
   'gcc-libs'
   'glibc'
   'hip-runtime-amd'
+  'hipblas'
   'hsa-rocr-polaris'
   'rocblas-gfx803'
 )
