@@ -704,45 +704,96 @@ while (write_index + num_packet - queue_->LoadReadIndexRelaxed() > queue_->publi
 
 **Result:** Threshold moved from 16MB → testing in progress. 64MB H2D confirmed working.
 
-### Remaining issues to investigate
+### Codepath audit: patch 0005 overfitted to sync path
 
-1. **D2H data mismatch at 64MB** — 64MB hipMemcpy D2H round-trip shows data corruption.
-   - Patch 0005 flushes after `DmaCopy()`, which waits for completion signal.
-   - Signal completion depends on bounce buffer `ProcessCompletions()`.
-   - Theory: flush targets correct address/size, but cache flush may be incomplete for large buffers, or there's a timing window.
-   - **Next step:** Re-test with pkgrel 7 (may have been tested against pkgrel 6).
+**Discovery:** Patch 0005 only covers the sync 3-arg `CopyMemory(dst, src, size)` in `runtime.cpp`. The primary HIP hipMemcpy path uses the async 7-arg `CopyMemory()` → `hsa_amd_memory_async_copy()`, which is completely unpatched.
 
-2. **H2D hang at 128MB** — hipMalloc(128MB) succeeds but hipMemcpy hangs.
-   - May be a second queue-fill boundary (blit queue is small: 64 packets).
-   - With 64-byte AQL packets, 64 slots, and multi-packet copies, ~128MB may exceed what can be queued before needing RPTR advance.
-   - OR: VRAM pressure (2GB GPU, 128MB alloc + runtime overhead).
-   - **Next step:** Test intermediate sizes (80-120MB) to determine if it's a hard limit or another queue-full issue.
+#### What patch 0005 covers (PROTECTED)
 
-3. **llama.cpp GPU offload (ngl≥1) hangs during model load** — model tensor upload involves many large hipMemcpy calls.
-   - This is the same issue as #1/#2 — model tensors are typically 1-50MB each.
-   - Also sees 4 EPERM from `KFD_IOC_ALLOC_MEMORY_OF_GPU` (userptr of file-backed mmap pages, non-fatal).
-   - **Next step:** After fixing #1/#2, retry llama.cpp with ngl=1.
+| Path | Location | Notes |
+|------|----------|-------|
+| Sync `hsa_memory_copy` | `runtime.cpp:574-585` | Flushes dst after DmaCopy |
+| GPU→GPU via system staging | `runtime.cpp:597-607` | Flushes temp buffer between DMAs |
 
-### Investigation plan
+#### What patch 0005 misses (VULNERABLE)
 
-```bash
-# Step 1: Verify pkgrel 7 fixes 64MB D2H mismatch
-hipcc --offload-arch=gfx803 -o /tmp/hip_verify /tmp/hip_100mb_test.cpp
-timeout 60 /tmp/hip_verify
+| Path | Location | Impact |
+|------|----------|--------|
+| Async `hsa_amd_memory_async_copy` | `runtime.cpp:637` | **All CLR/HIP copies** |
+| `CopyMemoryOnEngine` | `runtime.cpp:655` | Engine-specific async copies |
+| CLR D2H staging buffer | `rocblit.cpp:736-754` | hipMemcpy D2H ≤ staging size |
+| CLR D2H pinned path | `rocblit.cpp:742-748` | hipMemcpy D2H > staging size |
+| BlitKernel sync 3-arg | `amd_blit_kernel.cpp:633` | After signal wait, before data read |
 
-# Step 2: Binary search upper limit of working transfer size
-# Test 80, 96, 112, 128 MB
+#### Two-layer root cause
 
-# Step 3: If 128MB still hangs, check if queue is filling again
-# (may need larger queue or multi-pass approach)
+**Layer 1 — GPU L2 not flushed (staging buffer path, 91.8% zeros):**
+The staging buffer is allocated from `coarse_grain_pool` (CLR `rocvirtual.cpp:1854`, segment `kNoAtomics` → `rocdevice.cpp:1979`). Coarse-grain memory uses MTYPE=NC in GPU page tables. On gfx8, `FENCE_SCOPE_SYSTEM` release may not properly flush GPU L2 for NC system memory. Blit kernel writes stay in GPU L2; DRAM retains initialization zeros. CPU memcpy from staging reads zeros.
 
-# Step 4: Once large transfers work, retry llama.cpp
-timeout 60 llama-cli -m /home/llm/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf -ngl 1 -n 16 -p "hello"
+**Layer 2 — CPU cache stale (pinned path, 1.1% 0xBB stale):**
+For transfers > `pinnedMinXferSize_` (1MB default), CLR pins the user's malloc'd buffer and DMA goes directly to it. Data mostly reaches DRAM (GPU L2 flushes for pinned/CC memory), but ~1% of CPU cache lines still hold stale values from the pre-copy `memset(0xBB)`.
+
+#### Test evidence
+
+| Size | Path | Result | Root Cause |
+|------|------|--------|------------|
+| 1MB (staging) | `hsaCopyStagedOrPinned` → staging | 91.8% zeros | GPU L2 not flushed to DRAM |
+| 1MB (forced pin via `GPU_PINNED_MIN_XFER_SIZE=0`) | `hsaCopyStagedOrPinned` → pinned | 1.1% 0xBB stale | CPU cache stale |
+| 64MB (default=pinned) | `hsaCopyStagedOrPinned` → pinned | 100% correct | Works (timing?) |
+| H2D verified by kernel | `check_vram<<<1,1>>>` | 100% correct | H2D data reaches VRAM |
+
+#### Key CLR code path (the gap)
+
 ```
+hipMemcpy(D2H)
+  → ihipMemcpy → ReadMemoryCommand → submitReadMemory
+  → blitMgr().readBuffer()                    [rocblit.cpp:53-77]
+  → hsaCopyStagedOrPinned()                   [rocblit.cpp:691-776]
+    → rocrCopyBuffer()                        [rocblit.cpp:740] — async DMA via hsa_amd_memory_async_copy
+    → gpu().Barriers().WaitCurrent()          [rocblit.cpp:744] — wait for signal
+    → memcpy(hostDst, stagingBuffer, size)    [rocblit.cpp:747] — ← READS STALE DATA
+```
+
+Between WaitCurrent() and memcpy(), there is NO FlushCpuCache on the staging buffer. The async CopyMemory at runtime.cpp:637 can't flush because the DMA hasn't completed yet.
+
+#### Performance analysis of fix options
+
+The staging buffer (GPU L2) issue **cannot** be fixed with CPU-side `clflush` alone — data stuck in GPU L2 never reaches DRAM, so flushing CPU cache just reads zeros faster. Must fix at the GPU memory type level.
+
+| Approach | GPU Write Cost | CPU Read Cost | Fixes Staging? | Fixes Pinned? |
+|----------|---------------|---------------|----------------|---------------|
+| **Fine-grain staging** (MTYPE NC→CC) | ~0% (L2 cached, release fence already present) | ~0% (DMA snoops CPU cache) | **Yes** | No |
+| **UC staging** (bypass GPU L2) | **Bad** — every write = PCIe txn | ~0% | Yes | No |
+| **clflush on staging after wait** | 0% | ~10%/chunk | **No** — data not in DRAM | Yes |
+| **clflush on pinned after wait** | 0% | proportional to size | N/A | Yes |
+| **Force pinning (no staging)** | 0% | varies | Bypasses issue | Partial (1.1% stale at 1MB) |
+
+**Key insight:** Fine-grain memory on gfx8 without PCIe atomics still works for non-atomic DMA. The `FENCE_SCOPE_SYSTEM` release in the blit kernel dispatch packet already flushes GPU L2 — but only for CC (coherent) MTYPE pages, not NC (non-coherent). Changing the staging buffer from coarse-grain (NC) to fine-grain (CC) makes the existing release fence effective. Zero additional per-transfer overhead.
+
+#### Chosen approach: Fine-grain staging + clflush defense-in-depth
+
+**CLR patch (single patch, two changes):**
+
+1. **Change staging buffer segment** `kNoAtomics` → `kAtomics` in `rocvirtual.cpp:1854`
+   - Makes staging buffer use fine-grain pool (CC MTYPE)
+   - GPU blit kernel writes are L2-cached with coherency
+   - Release fence flushes L2 → data reaches DRAM → DMA snoops CPU cache
+   - **Zero additional overhead** — same write pattern, fence already exists
+
+2. **Add `clflush` on staging/pinned buffer after DMA wait** in `rocblit.cpp:744-747`
+   - Defense-in-depth for CPU cache stale lines (handles pinned path's 1.1% issue)
+   - Conditional on device lacking platform atomic support (no overhead on coherent platforms)
+   - ~0.5ms per 1MB staging chunk (staging is max 1MB, so bounded)
+   - For pinned path: proportional to chunk size (32MB default), but these are already large DMA-bound transfers where clflush is <10% overhead
+
+**Total estimated overhead:** <1% for fine-grain staging (dominant path). <10% additional for pinned path clflush on large transfers (defense only, may not be necessary).
+
+**Keep:** ROCR patch 0005 for `hsa_memory_copy` sync path (already deployed, covers different API).
 
 ### Next steps
 
-- Verify large transfer fix with pkgrel 7
-- Fix remaining D2H data corruption if still present
-- Get llama.cpp GPU inference working
-- Write smoke-test.sh for end-to-end validation
+1. Create `hip-runtime-amd-polaris` PKGBUILD based on Arch's `hip-runtime-amd`
+2. Write CLR patch: fine-grain staging + clflush defense-in-depth
+3. Build and install `hip-runtime-amd-polaris`
+4. Verify with size sweep: 1MB, 4MB, 16MB, 32MB, 64MB all pass D2H
+5. Retry llama.cpp GPU inference (ngl=1)
