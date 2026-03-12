@@ -568,56 +568,70 @@ On gfx8 without ATC/IOMMU (Polaris on Westmere Xeon), GPU PCIe writes to system 
 - HIP `hipMemcpy` D2H (ROCclr staging buffer path)
 - Any GPU→system DMA where CPU reads the result
 
-### Root Cause Analysis
+### Root Cause
 
-Three parallel code traces identified:
+On x86 without IOMMU/ATC, GPU PCIe writes to system memory bypass CPU cache (PCIe is not a cache-coherent participant for writes on these platforms). CPU reads after GPU writes return stale cached data.
 
-1. **ROCR `CopyMemory`** (runtime.cpp): `DmaCopy` writes to system memory, but CPU cache still holds stale data. **Fixed by patch 0005** — adds `FlushCpuCache()` after GPU→system DmaCopy on no-atomics platforms.
+### Key Discovery: HIP D2H Path Goes Through ROCR
 
-2. **ROCclr D2H path**: `hipMemcpy(D2H)` → staging buffer → GPU shader copies VRAM→staging → `addSystemScope()` (GPU cache flush) → `Barriers.WaitCurrent()` → CPU `memcpy(host, staging)`. No CPU cache flush between GPU write and CPU read. Staging buffer allocated from GPU-accessible system memory.
+Initial assumption was that ROCclr's `hipMemcpy(D2H)` used its own blit shader dispatch path, separate from ROCR. **This was wrong.** Code trace reveals:
 
-3. **Kernel TTM bug** (`amdgpu_ttm.c:1134-1137`): ROCR sets `AMDGPU_GEM_CREATE_UNCACHED` on kernarg pool allocations, but `amdgpu_ttm_tt_new()` only checks `AMDGPU_GEM_CREATE_CPU_GTT_USWC`. UNCACHED buffers get `ttm_cached` — CPU maps them write-back cached despite the uncached request.
+```
+hipMemcpy(D2H)
+  → ihipMemcpyCommand() [hip_memory.cpp:576]
+    → VirtualGPU::submitReadMemory() [rocvirtual.cpp:2161]
+      → DmaBlitManager::readBuffer() [rocblit.cpp:53]
+        → hsaCopyStagedOrPinned() [rocblit.cpp:691]
+          → rocrCopyBuffer() [rocblit.cpp:740]
+            → hsa_amd_memory_async_copy() [hsa_ext_amd.cpp:253]
+              → Runtime::CopyMemory() [runtime.cpp:591]  ← OUR PATCH 0005 IS HERE
+                → GpuAgent::DmaCopy()  (GPU SDMA engine)
+```
 
-### Fix Strategy
+ROCclr allocates a staging buffer, then calls **ROCR's `hsa_amd_memory_async_copy()`** for the actual GPU→staging DMA. This goes through `CopyMemory()` where our patch 0005 adds `FlushCpuCache()`. After the flush, ROCclr does `memcpy(host, staging, size)` which now sees clean data.
 
-**Kernel patch 0009** (`0009-drm-amdgpu-honor-uncached-flag-in-ttm-caching-mode.patch`): Check `AMDGPU_GEM_CREATE_UNCACHED` before `CPU_GTT_USWC` in `amdgpu_ttm_tt_new()`, use `ttm_uncached` caching mode. This makes ALL kernarg/staging memory CPU-uncached, fixing coherency globally for both ROCR and ROCclr without separate patches in each userspace component.
+**ROCR patch 0005 alone fixes both ROCR and HIP paths.** No separate ROCclr patch needed.
 
-**ROCR patch 0005** (`0005-flush-cpu-cache-after-gpu-writes-to-system-memory.patch`): Belt-and-suspenders `FlushCpuCache()` after GPU→system DmaCopy. Works even if kernel patch isn't applied (e.g., on older kernels). Minimal overhead (one clflush per cache line for the copy destination).
+### Patches
 
-### Why kernel fix over userspace-only
+**ROCR patch 0005** (`0005-flush-cpu-cache-after-gpu-writes-to-system-memory.patch`): `FlushCpuCache()` after GPU→system DmaCopy in `CopyMemory()`, conditioned on `NoPlatformAtomics()`. This is the **primary fix** — one clflush per cache line for the copy destination. Fixes both `hsa_memory_copy` and `hipMemcpy` D2H.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| Kernel 0009 (UNCACHED→ttm_uncached) | Fixes ALL paths globally, one patch | Requires kernel rebuild + reboot |
-| ROCR 0005 (FlushCpuCache in CopyMemory) | Works on any kernel | Only fixes ROCR's DmaCopy path |
-| ROCclr patch (flush in readBuffer) | Fixes HIP path | Another component to patch/maintain |
+**Kernel patch 0009** (`0009-drm-amdgpu-honor-uncached-flag-in-ttm-caching-mode.patch`): Check `AMDGPU_GEM_CREATE_UNCACHED` before `CPU_GTT_USWC` in `amdgpu_ttm_tt_new()`, use `ttm_uncached`. Defense-in-depth — makes kernarg pool memory truly uncached on CPU, so cache flushes become unnecessary. Flag propagation chain verified:
 
-Kernel 0009 is the comprehensive fix. ROCR 0005 provides defense-in-depth for the ROCR path regardless of kernel version. If kernel 0009 makes memory truly uncached, the ROCR flush becomes a no-op (flushing uncached lines is harmless).
+```
+ROCR: mem_flag_.ui32.Uncached = 1  (amd_memory_region.cpp:109, kernarg regions)
+  → thunk: KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED  (fmm.c:1822)
+    → kernel KFD: flags passed through  (kfd_chardev.c:1141)
+      → amdgpu_amdkfd_gpuvm.c:1755: alloc_flags |= AMDGPU_GEM_CREATE_UNCACHED
+        → amdgpu_object.c:685: bo->flags = bp->flags
+          → amdgpu_ttm.c:1134: OUR PATCH checks abo->flags → ttm_uncached
+```
 
-### Verification Plan
+**Open question:** `hsa_cache_timing` test still shows 1.0x ratio (WB-cached behavior) after kernel 6.18.16-9 with patch 0009. Flag propagation is verified correct in source. Possible causes: KFD mmap path may bypass TTM pgprot, or test allocates via a path that doesn't trigger `amdgpu_ttm_tt_new()`. Not blocking — ROCR 0005 is the working fix. Worth investigating later for correctness.
 
-```bash
-# 1. Rebuild kernel
-cd kernel && rm -rf src pkg && makepkg -Csf
-sudo pacman -U linux-lts-rocm-polaris-6.18.16-9*.pkg.tar.zst --overwrite='*'
-# kexec to new kernel
+### Verification Results (2026-03-12)
 
-# 2. Verify kernarg pool is now uncached
-./tests/hsa_cache_timing  # expect ratio >> 1.0x vs WB baseline
+```
+Kernel: 6.18.16-9-lts-rocm-polaris (patch 0009 applied)
+ROCR:   hsa-rocr-polaris 7.2.0-6 (patches 0001-0005)
+HIP:    stock Arch extra/ hipcc + libamdhip64 7.2.0
 
-# 3. Test ROCR path (already passes with 0005)
-HSA_ENABLE_INTERRUPT=0 ./tests/hsa_memcopy_test2
-
-# 4. Test HIP path (THE key test)
-timeout 30 /opt/rocm/bin/hipcc --offload-arch=gfx803 -o /tmp/hip_smoke tests/hip_smoke.cpp
-HSA_ENABLE_INTERRUPT=0 timeout 10 /tmp/hip_smoke
-# Expected: step 5d (memcpy D2H) now returns correct data
+hsa_dispatch_test:   PASS  (barrier dispatch + signal completion)
+hsa_memcopy_test2:   PASS  (VRAM→system round-trip via ROCR path)
+hip_smoke 5a (init):     PASS
+hip_smoke 5b (props):    PASS  (AMD Radeon Pro WX 2100, gfx803)
+hip_smoke 5c (malloc):   PASS
+hip_smoke 5d (memcpy):   PASS  ← PREVIOUSLY FAILING, NOW FIXED
+hip_smoke 5e (memset):   PASS
+hip_smoke 5f (kernel):   PASS  (simple addition kernel returns 42)
+hsa_cache_timing:    1.0x (kernarg pool still appears WB-cached — see open question)
 ```
 
 ### Status
 
-- [x] ROCR patch 0005: cache flush in CopyMemory (hsa-rocr-polaris 7.2.0-6 INSTALLED)
-- [x] Kernel patch 0009: honor UNCACHED in TTM (PKGBUILD ready, pkgrel=9)
-- [ ] Kernel 6.18.16-9 build and install
-- [ ] HIP hipMemcpy verification
-- [ ] `hsa_memcopy_test` fill path segfault investigation
+- [x] ROCR patch 0005: FlushCpuCache in CopyMemory — **THE FIX** (hsa-rocr-polaris 7.2.0-6)
+- [x] Kernel patch 0009: honor UNCACHED in TTM (defense-in-depth, 6.18.16-9)
+- [x] HIP hipMemcpy D2H: **VERIFIED WORKING**
+- [x] HIP kernel launch: **VERIFIED WORKING**
+- [ ] Investigate why cache_timing still shows WB despite kernel 0009 (non-blocking)
+- [ ] `hsa_memcopy_test` fill path segfault (non-blocking)
