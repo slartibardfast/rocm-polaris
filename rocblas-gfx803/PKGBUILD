@@ -87,9 +87,10 @@ build() {
     -D Tensile_COMPILER=hipcc
     -D BUILD_WITH_PIP=OFF
     -D BUILD_WITH_HIPBLASLT=OFF
+    -D AMDGPU_TARGETS=gfx803
   )
   cmake "${cmake_args[@]}"
-  cmake --build build
+  cmake --build build -j$(nproc)
 }
 
 package() {
