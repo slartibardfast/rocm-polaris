@@ -6,7 +6,7 @@
 #   make hsa-rocr-install  # install (requires sudo)
 #   make clean             # remove all build artifacts
 
-PKGDIRS := hsa-rocr
+PKGDIRS := hsa-rocr rocblas-gfx803
 
 # Generic pattern rules for any package directory
 %-clean:
