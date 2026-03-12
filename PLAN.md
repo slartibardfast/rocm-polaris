@@ -123,9 +123,18 @@ Build custom `-polaris` packages for every component with a gfx8 gate:
 - Compute shader blits (the path gfx8 uses) don't require HDP flush
 - **Eliminated as a concern during Phase 3 deep review**
 
-### Phase 2d: rocBLAS (PKGBUILD READY)
-- Apply existing `0001-re-enable-gfx803-target.patch`
-- Build with `makepkg -s`
+### Phase 2d: rocBLAS (VERIFIED)
+- Applied `0001-re-enable-gfx803-target.patch` (adds gfx803 to `TARGET_LIST_ROCM_7.1`)
+- Built with `AMDGPU_TARGETS=gfx803` for smoke test (gfx803-only, ~1hr vs ~17hrs for all arches)
+- 72 Tensile kernel files installed, `librocblas.so.5.2` (189MB)
+- **SGEMM 64×64×64 verified on hardware** — correct results
+
+#### rocBLAS atomics caveat
+rocBLAS queries HSA platform atomics support and defaults to `atomics_not_allowed` on platforms without PCIe atomics (our Westmere Xeon). With atomics disabled, Tensile kernels silently produce zeros — the kernel dispatches but uses a no-op code path.
+
+**Fix:** Applications must call `rocblas_set_atomics_mode(handle, rocblas_atomics_allowed)` after `rocblas_create_handle()`. The atomics rocBLAS cares about are GPU global memory atomics (for parallel reduction), not PCIe atomics — they work fine on gfx803. This is a false positive from `platform_atomic_support_` in ROCR being repurposed by rocBLAS.
+
+Downstream consumers (llama.cpp, PyTorch) will need this unless we patch rocBLAS to not gate on platform atomics. Deferring that decision until we test actual inference workloads.
 
 ### Phase 3: GPU dispatch hang debugging (CURRENT)
 
@@ -640,3 +649,40 @@ hsa_cache_timing:        1.0x (kernarg pool still appears WB-cached — see open
 - [x] HIP kernel launch: **VERIFIED WORKING**
 - [x] hsa_memcopy_test: **ALL PASS** (was segfault from inline asm, now fixed)
 - [ ] Investigate why cache_timing still shows WB despite kernel 0009 (non-blocking)
+
+## Phase 5: HIP Runtime Smoke Test (COMPLETE)
+
+All 6 steps pass with stock Arch `hip-runtime-amd` — no custom CLR package needed.
+See Phase 4 verification results for full test output.
+
+## Phase 6: rocBLAS (COMPLETE)
+
+**Built and installed:** `rocblas-gfx803` 7.2.0-1 (gfx803-only, 55MB package)
+
+**SGEMM verified on hardware:**
+```
+rocBLAS SGEMM 64x64x64: PASS
+```
+Requires `rocblas_set_atomics_mode(handle, rocblas_atomics_allowed)` — see Phase 2d caveat.
+
+### Package inventory (all installed and verified)
+
+| Package | Version | Patches | Status |
+|---------|---------|---------|--------|
+| `linux-lts-rocm-polaris` | 6.18.16-9 | 0004-0006, 0008-0009 | INSTALLED |
+| `hsa-rocr-polaris` | 7.2.0-6 | 0001-0005 | INSTALLED |
+| `rocblas-gfx803` | 7.2.0-1 | 0001 (CMake target) | INSTALLED |
+| `hip-runtime-amd` | 7.2.0 (stock Arch) | none needed | INSTALLED |
+
+### What works end-to-end
+
+- HSA: init, device enumeration, queue creation, barrier dispatch, signal completion
+- HSA: memory copy (sys→sys, sys→vram→sys, memory_fill readback)
+- HIP: init, device props, malloc/free, memcpy (H2D + D2H), memset, kernel launch
+- rocBLAS: SGEMM on Tensile kernels (with atomics mode override)
+
+### Next steps
+
+- Test inference workload (llama.cpp or similar) to validate real-world use
+- Determine if rocBLAS atomics caveat needs a library-level patch or can be handled per-application
+- Consider building for additional arches if distributing packages
