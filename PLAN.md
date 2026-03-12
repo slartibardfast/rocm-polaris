@@ -616,16 +616,21 @@ Kernel: 6.18.16-9-lts-rocm-polaris (patch 0009 applied)
 ROCR:   hsa-rocr-polaris 7.2.0-6 (patches 0001-0005)
 HIP:    stock Arch extra/ hipcc + libamdhip64 7.2.0
 
-hsa_dispatch_test:   PASS  (barrier dispatch + signal completion)
-hsa_memcopy_test2:   PASS  (VRAM→system round-trip via ROCR path)
+hsa_dispatch_test:       PASS  (barrier dispatch + signal completion)
+hsa_memcopy_test:        PASS  (sys→sys, sys→vram→sys round-trip, memory_fill readback)
+hsa_memcopy_test2:       PASS  (VRAM→system round-trip via ROCR path)
 hip_smoke 5a (init):     PASS
 hip_smoke 5b (props):    PASS  (AMD Radeon Pro WX 2100, gfx803)
 hip_smoke 5c (malloc):   PASS
 hip_smoke 5d (memcpy):   PASS  ← PREVIOUSLY FAILING, NOW FIXED
 hip_smoke 5e (memset):   PASS
 hip_smoke 5f (kernel):   PASS  (simple addition kernel returns 42)
-hsa_cache_timing:    1.0x (kernarg pool still appears WB-cached — see open question)
+hsa_cache_timing:        1.0x (kernarg pool still appears WB-cached — see open question)
 ```
+
+### Pitfall: inline x86 assembly crashes ROCR
+
+`hsa_memcopy_test` previously segfaulted during `hsa_init()` at GPU VRAM addresses (`SEGV_ACCERR` at `0x4000xxxxxx`). Root cause: inline `asm volatile("clflush (%0)")` in the binary. ROCR maps the process `.text` section into GPU-accessible address space during initialization; the inline assembly changes binary layout enough to cause a GPU VA mapping failure. Fix: removed the clflush diagnostic (no longer needed after patch 0005). All tests pass without it.
 
 ### Status
 
@@ -633,5 +638,5 @@ hsa_cache_timing:    1.0x (kernarg pool still appears WB-cached — see open que
 - [x] Kernel patch 0009: honor UNCACHED in TTM (defense-in-depth, 6.18.16-9)
 - [x] HIP hipMemcpy D2H: **VERIFIED WORKING**
 - [x] HIP kernel launch: **VERIFIED WORKING**
+- [x] hsa_memcopy_test: **ALL PASS** (was segfault from inline asm, now fixed)
 - [ ] Investigate why cache_timing still shows WB despite kernel 0009 (non-blocking)
-- [ ] `hsa_memcopy_test` fill path segfault (non-blocking)
