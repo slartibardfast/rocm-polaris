@@ -1,0 +1,24 @@
+# Default to atomics_allowed for gfx803 platforms
+#
+# rocBLAS defaults to atomics_not_allowed, which causes Tensile kernels
+# to use deterministic (non-atomic) code paths.  On platforms where
+# platform_atomic_support_ is false (no PCIe atomics), this results in
+# Tensile silently producing zeros — the GPU global memory atomics that
+# Tensile actually uses work fine on gfx803, but rocBLAS conflates them
+# with PCIe atomics.
+#
+# Change default to atomics_allowed.  Users who need deterministic
+# (bitwise-reproducible) results can still set:
+#   ROCBLAS_DEFAULT_ATOMICS_MODE=0
+# or call rocblas_set_atomics_mode(handle, rocblas_atomics_not_allowed).
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+--- a/library/src/include/handle.hpp
++++ b/library/src/include/handle.hpp
+@@ -402,5 +402,5 @@
+     // default atomics mode does not allows atomic operations
+-    rocblas_atomics_mode atomics_mode = rocblas_atomics_not_allowed;
++    rocblas_atomics_mode atomics_mode = rocblas_atomics_allowed;
+
+     // Selects the benchmark library to be used for solution selection

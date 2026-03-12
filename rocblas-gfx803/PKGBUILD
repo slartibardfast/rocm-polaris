@@ -9,7 +9,7 @@
 pkgname=rocblas-gfx803
 _upstream_pkgname=rocblas
 pkgver=7.2.0
-pkgrel=1
+pkgrel=2
 pkgdesc='rocBLAS with GCN 1.2 (gfx803) support restored'
 arch=('x86_64')
 url='https://github.com/slartibardfast/rocm-polaris'
@@ -45,9 +45,11 @@ conflicts=('rocblas')
 source=(
   "rocm-libraries-$pkgver.tar.gz::https://github.com/ROCm/rocm-libraries/archive/refs/tags/rocm-$pkgver.tar.gz"
   '0001-re-enable-gfx803-target.patch'
+  '0002-default-atomics-allowed.patch'
 )
 sha256sums=(
   '8ad5f4a11f1ed8a7b927f2e65f24083ca6ce902a42021a66a815190a91ccb654'
+  'SKIP'
   'SKIP'
 )
 options=(!strip)
@@ -57,6 +59,7 @@ _tensile_dir="rocm-libraries-rocm-$pkgver/shared/tensile"
 prepare() {
   cd "$_dirname"
   patch -p1 -i "$srcdir/0001-re-enable-gfx803-target.patch"
+  patch -p1 -i "$srcdir/0002-default-atomics-allowed.patch"
 }
 
 build() {
