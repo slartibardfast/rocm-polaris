@@ -670,19 +670,79 @@ Requires `rocblas_set_atomics_mode(handle, rocblas_atomics_allowed)` — see Pha
 | Package | Version | Patches | Status |
 |---------|---------|---------|--------|
 | `linux-lts-rocm-polaris` | 6.18.16-9 | 0004-0006, 0008-0009 | INSTALLED |
-| `hsa-rocr-polaris` | 7.2.0-6 | 0001-0005 | INSTALLED |
-| `rocblas-gfx803` | 7.2.0-1 | 0001 (CMake target) | INSTALLED |
+| `hsa-rocr-polaris` | 7.2.0-7 | 0001-0005 | INSTALLED |
+| `rocblas-gfx803` | 7.2.0-2 | 0001-0002 | INSTALLED |
+| `llama-cpp-rocm-polaris` | b7376-1 | none | INSTALLED (GPU inference blocked) |
 | `hip-runtime-amd` | 7.2.0 (stock Arch) | none needed | INSTALLED |
 
 ### What works end-to-end
 
 - HSA: init, device enumeration, queue creation, barrier dispatch, signal completion
 - HSA: memory copy (sys→sys, sys→vram→sys, memory_fill readback)
-- HIP: init, device props, malloc/free, memcpy (H2D + D2H), memset, kernel launch
-- rocBLAS: SGEMM on Tensile kernels (with atomics mode override)
+- HIP: init, device props, malloc/free, memcpy (H2D + D2H ≤8MB), memset, kernel launch
+- HIP: 300 consecutive 4KB memcpy round-trips (queue wraparound verified)
+- rocBLAS: SGEMM on Tensile kernels (atomics_allowed default patched)
+- llama.cpp: CPU-only inference works (Qwen2.5-0.5B at 10.4 t/s)
+
+## Phase 5: Large Transfer & Inference Support (IN PROGRESS)
+
+### Problem: hipMemcpy hangs at 16MB+
+
+**Root cause:** AQL queue fill-up during chunked DMA transfers.
+
+The BlitKernel (used for hipMemcpy on no-SDMA platforms) splits large transfers into chunks, each becoming an AQL packet. When the queue fills, `AcquireWriteIndex()` spins waiting for `read_dispatch_id` to advance:
+
+```cpp
+// amd_blit_kernel.cpp:855
+while (write_index + num_packet - queue_->LoadReadIndexRelaxed() > queue_->public_handle()->size)
+    os::YieldThread();
+```
+
+`LoadReadIndexRelaxed()` calls `UpdateReadDispatchId()` which reads `rptr_gpu_buf_` — a GPU-visible buffer where the CP writes RPTR. But on non-coherent platforms, GPU PCIe writes bypass CPU cache, so the CPU reads stale data.
+
+**Fix applied (pkgrel 7):** Added `FlushCpuCache()` in `UpdateReadDispatchId()` before reading `rptr_gpu_buf_`.
+
+**Result:** Threshold moved from 16MB → testing in progress. 64MB H2D confirmed working.
+
+### Remaining issues to investigate
+
+1. **D2H data mismatch at 64MB** — 64MB hipMemcpy D2H round-trip shows data corruption.
+   - Patch 0005 flushes after `DmaCopy()`, which waits for completion signal.
+   - Signal completion depends on bounce buffer `ProcessCompletions()`.
+   - Theory: flush targets correct address/size, but cache flush may be incomplete for large buffers, or there's a timing window.
+   - **Next step:** Re-test with pkgrel 7 (may have been tested against pkgrel 6).
+
+2. **H2D hang at 128MB** — hipMalloc(128MB) succeeds but hipMemcpy hangs.
+   - May be a second queue-fill boundary (blit queue is small: 64 packets).
+   - With 64-byte AQL packets, 64 slots, and multi-packet copies, ~128MB may exceed what can be queued before needing RPTR advance.
+   - OR: VRAM pressure (2GB GPU, 128MB alloc + runtime overhead).
+   - **Next step:** Test intermediate sizes (80-120MB) to determine if it's a hard limit or another queue-full issue.
+
+3. **llama.cpp GPU offload (ngl≥1) hangs during model load** — model tensor upload involves many large hipMemcpy calls.
+   - This is the same issue as #1/#2 — model tensors are typically 1-50MB each.
+   - Also sees 4 EPERM from `KFD_IOC_ALLOC_MEMORY_OF_GPU` (userptr of file-backed mmap pages, non-fatal).
+   - **Next step:** After fixing #1/#2, retry llama.cpp with ngl=1.
+
+### Investigation plan
+
+```bash
+# Step 1: Verify pkgrel 7 fixes 64MB D2H mismatch
+hipcc --offload-arch=gfx803 -o /tmp/hip_verify /tmp/hip_100mb_test.cpp
+timeout 60 /tmp/hip_verify
+
+# Step 2: Binary search upper limit of working transfer size
+# Test 80, 96, 112, 128 MB
+
+# Step 3: If 128MB still hangs, check if queue is filling again
+# (may need larger queue or multi-pass approach)
+
+# Step 4: Once large transfers work, retry llama.cpp
+timeout 60 llama-cli -m /home/llm/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf -ngl 1 -n 16 -p "hello"
+```
 
 ### Next steps
 
-- Test inference workload (llama.cpp or similar) to validate real-world use
-- Determine if rocBLAS atomics caveat needs a library-level patch or can be handled per-application
-- Consider building for additional arches if distributing packages
+- Verify large transfer fix with pkgrel 7
+- Fix remaining D2H data corruption if still present
+- Get llama.cpp GPU inference working
+- Write smoke-test.sh for end-to-end validation
