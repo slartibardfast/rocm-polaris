@@ -13,7 +13,13 @@
 # When using SLOT_BASED_WPTR=0, also clear NO_UPDATE_RPTR.  With
 # NO_UPDATE_RPTR=1, gfx8 CP does not write RPTR to rptr_report_addr
 # in direct doorbell mode.  With NO_UPDATE_RPTR=0, CP writes RPTR to
-# rptr_report_addr per RPTR_BLOCK_SIZE, matching DRM gfx8 behavior.
+# rptr_report_addr per RPTR_BLOCK_SIZE.
+#
+# Additionally, reduce RPTR_BLOCK_SIZE from 5 (every 32 dwords = 2 AQL
+# packets) to 4 (every 16 dwords = 1 AQL packet) in the no-atomics
+# path.  Our bounce buffer uses RPTR to detect per-packet completion;
+# with block size 5, single-packet dispatches may not trigger an RPTR
+# write before the next doorbell arrives, causing RPTR to stall.
 #
 # Module parameter gfx8_wptr_poll:
 #   0 = auto (default): direct doorbell without atomics, poll with
@@ -45,7 +51,7 @@
  #define CP_MQD_CONTROL__PRIV_STATE__SHIFT 0x8
 
  static inline struct vi_mqd *get_mqd(void *mqd)
-@@ -225,7 +239,22 @@
+@@ -225,7 +239,32 @@
 
  	if (q->format == KFD_QUEUE_FORMAT_AQL) {
 -		m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK |
@@ -66,6 +72,16 @@
 +			m->cp_hqd_pq_control |=
 +				CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK |
 +				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
++		} else {
++			/*
++			 * No-atomics: RPTR is our only completion signal.
++			 * Reduce RPTR_BLOCK_SIZE to 4 (every 16 dwords =
++			 * 1 AQL packet) for per-packet RPTR writes.
++			 */
++			m->cp_hqd_pq_control &=
++				~CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE_MASK;
++			m->cp_hqd_pq_control |=
++				4 << CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT;
 +		}
  	}
 

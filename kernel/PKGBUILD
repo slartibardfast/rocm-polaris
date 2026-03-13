@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=9
+pkgrel=10
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)

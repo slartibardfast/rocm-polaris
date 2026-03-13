@@ -857,8 +857,19 @@ The function performs a read-modify-write on `last_rptr_dwords_` (plain uint32_t
 
 **Why SpinMutex over CAS:** Critical section is ~5 instructions. CAS would require re-reading `rptr_gpu_buf_` (with clflush) on retry — potentially slower. SpinMutex already used in the file (`bounce_lock_`). `ScopedAcquire<SpinMutex>` is valid per `locks.h:222`.
 
+### RPTR_BLOCK_SIZE root cause (2026-03-13)
+
+SpinMutex + mfence fix improved results (12/13 on one run) but hangs persisted (9/13 on next run).
+
+**Actual root cause:** `RPTR_BLOCK_SIZE=5` in `kfd_mqd_manager_vi.c` means CP only writes RPTR to `rptr_report_addr` every 2^5=32 dwords (= 2 AQL packets). When the blit kernel submits a single dispatch packet, RPTR may not be written before the next doorbell arrives. The bounce buffer reads stale RPTR → `read_dispatch_id` doesn't advance → CLR busy-wait spins forever.
+
+This only affects the no-atomics path. With PCIe atomics (`NO_UPDATE_RPTR=1`), CP writes dispatch_id directly (not RPTR), so RPTR_BLOCK_SIZE is irrelevant.
+
+**Fix (kernel patch 0008 update, pkgrel 10):** Add `else` clause for no-atomics path that reduces RPTR_BLOCK_SIZE from 5→4 (every 16 dwords = 1 AQL packet). This ensures RPTR is written after every packet retirement. Combined with the ROCR SpinMutex + mfence fix in patch 0003 (pkgrel 8), this should eliminate both the race and the stale-RPTR issues.
+
 ### Next steps
 
-1. Build and install hsa-rocr-polaris 7.2.0-8
-2. Run D2H sweep test — expected: 13/13 pass, 0 hang
-3. Retry llama.cpp GPU inference
+1. Build and install linux-lts-rocm-polaris 6.18.16-10 + hsa-rocr-polaris 7.2.0-8
+2. Reboot (kexec) to load new kernel
+3. Run D2H sweep test — expected: 13/13 pass, 0 hang
+4. Retry llama.cpp GPU inference

@@ -62,7 +62,7 @@
    }
 --- a/runtime/hsa-runtime/core/inc/amd_aql_queue.h
 +++ b/runtime/hsa-runtime/core/inc/amd_aql_queue.h
-@@ -296,6 +296,23 @@
+@@ -296,6 +296,26 @@
    // Handle of agent, which queue is attached to
    GpuAgent* agent_;
  
@@ -140,7 +140,7 @@
    FreeQueueMemory();
  
    if (core::g_use_interrupt_wait) {
-@@ -406,13 +430,38 @@
+@@ -406,13 +430,40 @@
  }
  
  uint64_t AqlQueue::LoadReadIndexAcquire() {
@@ -159,6 +159,9 @@
 +  // CP writes RPTR via PCIe posted writes which bypass CPU cache.
 +  // Flush the cache line so we see the GPU's update.
 +  rocr::FlushCpuCache(rptr_gpu_buf_, 0, sizeof(*rptr_gpu_buf_));
++  // CLFLUSH is not ordered with respect to reads (Intel SDM).
++  // Fence ensures the invalidation completes before the load below.
++  _mm_mfence();
 +  // CP writes RPTR as dword offset that wraps at ring_size * 16.
 +  // Convert to monotonic AQL dispatch index (each packet = 16 dwords).
 +  uint32_t cur_dw = static_cast<uint32_t>(
@@ -178,7 +181,7 @@
  uint64_t AqlQueue::LoadWriteIndexAcquire() {
    return atomic::Load(&amd_queue_.write_dispatch_id, std::memory_order_acquire);
  }
-@@ -475,7 +524,22 @@
+@@ -475,7 +526,22 @@
    } else {
      // Hardware doorbell supports AQL semantics.
      _mm_sfence();
