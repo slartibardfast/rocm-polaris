@@ -1,0 +1,27 @@
+# Guard ImageRuntime::instance() NULL dereference for gfx8
+#
+# When the image extension fails to initialize (e.g. AddrCreate fails
+# for GCN 1.2 GPUs), ImageRuntime::instance() returns NULL. The
+# hsa_amd_image_get_info_max_dim function dereferences this without
+# checking, causing a segfault during HIP device enumeration.
+#
+# Return HSA_STATUS_ERROR_NOT_INITIALIZED when the image runtime
+# is unavailable instead of crashing.
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+diff --git a/runtime/hsa-runtime/image/hsa_ext_image.cpp b/runtime/hsa-runtime/image/hsa_ext_image.cpp
+--- a/runtime/hsa-runtime/image/hsa_ext_image.cpp
++++ b/runtime/hsa-runtime/image/hsa_ext_image.cpp
+@@ -113,7 +113,10 @@
+     return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+   }
+
+-  return ImageRuntime::instance()->GetImageInfoMaxDimension(agent, attribute, value);
++  auto* runtime = ImageRuntime::instance();
++  if (runtime == NULL)
++    return HSA_STATUS_ERROR_NOT_INITIALIZED;
++  return runtime->GetImageInfoMaxDimension(agent, attribute, value);
+   CATCH;
+ }
+

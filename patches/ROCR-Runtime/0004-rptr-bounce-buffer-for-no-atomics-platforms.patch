@@ -118,7 +118,7 @@
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
-@@ -530,6 +553,87 @@
+@@ -530,6 +553,94 @@
    StoreRelaxed(value);
  }
  
@@ -184,6 +184,13 @@
 +    if (read_idx >= entry.complete_idx) {
 +      core::Signal* signal = core::Signal::Convert(entry.signal);
 +      signal->SubRelaxed(1);
++      // Flush the signal value to DRAM so the GPU can see it.
++      // On non-coherent platforms, CPU writes stay in cache; the GPU
++      // reads signal values via PCIe (bypasses CPU cache) when
++      // evaluating barrier packet dependencies.
++      amd_signal_t* ams = reinterpret_cast<amd_signal_t*>(entry.signal.handle);
++      _mm_clflush(const_cast<void*>(static_cast<volatile void*>(&ams->value)));
++      _mm_mfence();
 +      signal->Release();  // matches Retain() in ScanNewPackets
 +      completed++;
 +    } else {
