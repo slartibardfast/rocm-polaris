@@ -1084,10 +1084,32 @@ Pass: Signal survives destroy while retained, freed after release
 Fail: Crash or premature free
 ```
 
+### Signal coherency theory DISPROVEN (2026-03-13)
+
+**Barrier test PASSED.** `barrier_test.cpp` confirms: the GPU CP correctly reads CPU-written signal values through AQL barrier-AND packets. `hsa_signal_store_screlease(dep, 0)` from CPU → CP sees 0 → barrier resolves. Signals ARE coherent.
+
+**GPU L2 caching is NOT the root cause.** Signal memory is allocated from fine-grain system pool which KFD maps with `KFD_IOC_ALLOC_MEM_FLAGS_COHERENT` → MTYPE=CC on GPU.
+
+**CLR WaitCurrent drain CAUSED REGRESSION.** Adding `WaitCurrent()` at the end of `hsaCopyStagedOrPinned` for H2D made uniform 2MB transfers hang at op 4 (down from 93 without it). Reverted.
+
+### Revised root cause analysis — bounce buffer RPTR tracking
+
+The hang is NOT about barrier packet resolution. It's about the bounce buffer's `UpdateReadDispatchId()` losing sync with the CP's actual packet processing. The RPTR-based dispatch ID conversion works for uniform transfers but drifts during mixed-size patterns.
+
+**Current state:** ROCR 7.2.0-9 (Retain/Release + clflush) + CLR 7.2.0-1 (fine-grain staging + D2H clflush):
+- Uniform 2MB x100: hangs at ~93 (was ~100 before, minor regression from Retain/Release overhead)
+- Mixed 512B+2MB: hangs at op ~14 (was ~5 before ROCR fixes, significant improvement)
+- D2H sweep 13/13 x3: all pass
+- Barrier test: PASS
+
+**Hypotheses for RPTR drift:**
+1. The blit kernel submits MULTIPLE packets per transfer (dispatch + optional barrier). The bounce buffer counts all packets but RPTR advancement and `read_dispatch_id` may not match when packet patterns change.
+2. CLR's Barriers system creates internal barrier packets that our ScanNewPackets sees. These barrier packets have `completion_signal=0` → bounce buffer skips them. But they still consume dispatch IDs. If RPTR reports completion but the bounce buffer hasn't processed the corresponding signal, `read_dispatch_id` advances past signaled packets → CLR's queue space check passes prematurely → queue overflows.
+3. The blit kernel for 2MB (2 staging chunks) goes through a different code path in CLR Barriers than 512B (1 chunk). The Barriers state machine may reuse or recycle signals differently, causing the bounce buffer's saved signal handles to become stale.
+
 ### Next steps
 
-1. Verify signal memory MTYPE: check KFD mapping flags for `system_regions_fine_` on our platform
-2. Implement Option A: add `AllocateCoherent` to signal pool allocator (conditional on no-atomics)
-3. Write and run Test 1 (SignalCpuWriteGpuBarrier) to validate the fix
-4. If Test 1 passes, run full stress test (Test 3) and llama.cpp inference
-5. Write remaining tests for upstream submission
+1. Instrument `ScanNewPackets` and `UpdateReadDispatchId` to log packet types, signal handles, RPTR values, and dispatch IDs — find where the drift occurs
+2. Count AQL packets per hipMemcpy call at each size
+3. Verify `pending_completions_` vector state before and after the hang
+4. Consider: is the bounce buffer's FIFO assumption (break on first incomplete) violated by mixed-size patterns?
