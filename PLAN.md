@@ -886,13 +886,91 @@ The two-part fix (RPTR_BLOCK_SIZE 5→4 + SpinMutex/mfence/atomic::Add) eliminat
 4. After enough multi-chunk operations, `hipStreamSynchronize` hangs in `hsa_signal_wait_scacquire` → `ProcessAllBounceBuffers` → `UpdateReadDispatchId`.
 5. A background ROCR `AsyncEventsLoop` thread crashes at `Signal::Convert` accessing freed signal memory (`0x5fff00`), confirming a signal lifetime issue.
 
-**Root cause hypothesis:** The bounce buffer's `ScanNewPackets()` reads the ring buffer at packet-level granularity, tracking `completion_signal` at offset 56. But for multi-chunk staging, CLR submits multiple AQL packets where only the LAST packet has a non-zero `completion_signal`. The intermediate packets have `completion_signal = 0` (no signal). The bounce buffer correctly skips zero-signal packets. However, `read_dispatch_id` must advance past ALL packets (including signalless ones) for the queue space check to work. If `UpdateReadDispatchId()` via RPTR tracking falls behind (due to timing or RPTR grouping), CLR's `AcquireWriteIndex` sees the queue as full and spins forever.
+#### Signal lifetime race — analysis (2026-03-13)
 
-**Alternative hypothesis:** The `AsyncEventsLoop` crash indicates a signal-lifetime race between our bounce buffer and CLR's async event system. Our bounce buffer decrements signals from CPU (mimicking the GPU's atomic decrement). CLR sees the signal complete and frees it, but `AsyncEventsLoop` still has it in its monitoring list. This is a use-after-free that only manifests with enough operations to accumulate stale signals.
+**Core dump evidence (PID 11955):**
+
+| Thread | Location | State |
+|--------|----------|-------|
+| 11955 (main) | `ProcessAllBounceBuffers` → `UpdateReadDispatchId` → `atomic::Load(rptr_gpu_buf_)` | Spinning — RPTR not advancing |
+| 11960 | `AsyncEventsLoop` → `Signal::Convert` → `SharedSignal::IsValid` on `this=0x5fff00` | Accessing freed signal |
+| 11959 | Same as 11960 | Crashed → `std::terminate` → `abort` |
+
+**What `AsyncEventsLoop` monitors:** Queue management signals registered via `hsa_amd_signal_async_handler`:
+- `queue_inactive_signal` — set when queue errors occur (`DynamicQueueEventsHandler`)
+- `exception_signal_` — hardware exception handler
+- `queue_scratch_.queue_retry` — scratch memory reclaim signal
+
+These are **permanent per-queue signals**, created in `AqlQueue()` constructor, destroyed in `~AqlQueue()`. They are NOT copy completion signals.
+
+**Two bugs, possibly related:**
+
+**Bug A — Main thread hang:** `UpdateReadDispatchId()` spins reading `rptr_gpu_buf_`. RPTR doesn't advance. This is the same class of issue as the D2H hang (RPTR stalling), but only triggers with mixed-size H2D transfers. Uniform 2MB x100 works. This suggests CP writes RPTR at packet boundaries but the timing changes when packet submission patterns vary.
+
+**Bug B — AsyncEventsLoop crash:** `SharedSignal::IsValid()` fails on address `0x5fff00`. This means `async_events_.signal_[i]` contains a stale handle pointing to freed/recycled memory. Possible causes:
+
+1. **Queue destruction during hang cleanup:** If the main thread's hang triggers a timeout or error handler that destroys a queue, the queue's signals are freed while AsyncEventsLoop still references them. But the main thread is blocked (not cleaning up), so this is unlikely during normal hang.
+
+2. **Our bounce buffer corrupts memory:** `ProcessCompletions()` casts `entry.signal.handle` to `amd_signal_t*` and writes via `atomic::Sub`. If a stale or wrong signal handle is in `pending_completions_`, this write corrupts arbitrary memory — potentially the signal pool that AsyncEventsLoop reads from.
+
+3. **Signal freed via `DestroySignal`→`Release`→`doDestroySignal`:** Something calls `hsa_signal_destroy` on a signal that's still in the `async_events_` list. The `DestroySignal()` path decrements `refcount_` then calls `Release()`. If `retained_` is 1 (default), `Release()` calls `doDestroySignal()` which deletes the signal. AsyncEventsLoop doesn't hold a Retain() on the signals it monitors.
+
+**Most likely scenario:** Bug A (RPTR stall) causes the main thread to hang. Then, during the extended hang, some internal timer or error mechanism fires that destroys a queue. The queue's signals are freed. AsyncEventsLoop, still iterating, hits the freed signal → crash. **Bug B is a symptom of Bug A.**
+
+Evidence supporting this: the 100x uniform 2MB test works (no Bug A → no Bug B). The mixed-size test triggers Bug A → then Bug B follows.
+
+#### Proposed fixes
+
+**Fix for Bug A (primary — RPTR stall in mixed-size H2D):**
+
+Need to investigate WHY RPTR stalls specifically during mixed-size transfers. Hypotheses:
+- Multi-chunk staging submits multiple AQL packets; RPTR_BLOCK_SIZE=4 writes RPTR every 16 dwords (1 packet), but consecutive packets from the same doorbell ring might batch differently
+- The blit kernel for staging submits both a kernel dispatch packet AND a barrier packet per chunk — doubling the packet count and potentially grouping across RPTR block boundaries
+- `ScanNewPackets` is called in `StoreRelaxed` (doorbell write), but CLR may write multiple packets before ringing the doorbell once, causing ScanNewPackets to process a batch — if the batch includes intermediate signalless packets, the FIFO ordering in ProcessCompletions could stall
+
+**Investigation plan for Bug A:**
+1. Count AQL packets per hipMemcpy call at various sizes using `write_dispatch_id` delta
+2. Verify RPTR advancement matches packet count (add debug logging to `UpdateReadDispatchId`)
+3. Check if CLR submits barrier packets between staging chunks (would affect packet count)
+
+**Fix for Bug B (defense-in-depth — AsyncEventsLoop crash on freed signal):**
+
+**Option 1: Retain/Release in bounce buffer** (preferred if Bug B is independent)
+```cpp
+// ScanNewPackets: retain signal before saving
+if (sig.handle != 0) {
+  core::Signal::Convert(sig)->Retain();
+  pending_completions_.push_back({idx + 1, sig});
+}
+
+// ProcessCompletions: release after decrement
+core::Signal* signal = core::Signal::Convert(entry.signal);
+signal->SubRelaxed(1);  // use Signal API instead of raw atomic::Sub
+signal->Release();
+```
+This prevents signal deallocation while our bounce buffer holds a reference. `Retain()` increments `retained_` (starts at 1); `Release()` decrements it and only calls `doDestroySignal()` when it hits 0. With our extra Retain, the signal survives one `DestroySignal()`→`Release()` cycle.
+
+Risk: `Signal::Convert()` throws if the signal is already freed. Must be called while signal is still valid (before any race window). In `ScanNewPackets`, the signal was just written by CLR to the ring buffer — guaranteed valid at scan time. In `ProcessCompletions`, we hold the Retain, so it's still valid. **Safe.**
+
+**Option 2: Validate before access** (simpler but weaker)
+```cpp
+// ProcessCompletions: check before decrement
+SharedSignal* shared = SharedSignal::Convert(entry.signal);
+if (shared->IsValid()) {
+  amd_signal_t* sig = reinterpret_cast<amd_signal_t*>(entry.signal.handle);
+  atomic::Sub(&sig->value, int64_t(1), std::memory_order_release);
+}
+```
+Prevents crash on freed signals, but TOCTOU race remains — signal could be freed between `IsValid()` and `atomic::Sub`. Also doesn't prevent the freed signal's memory from being reused for a different signal, which we'd then corrupt.
+
+**Option 3: Use SubRelaxed API only** (minimal change)
+Replace raw `atomic::Sub` with `core::Signal::Convert(entry.signal)->SubRelaxed(1)`. This uses the proper Signal API which sets `signal_.kind` appropriately and wakes waiters. Doesn't fix lifetime but integrates better with the signal subsystem.
+
+**Recommendation:** Fix Bug A first (root cause). Then apply Option 1 as defense-in-depth for Bug B.
 
 ### Next steps
 
-1. Investigate multi-chunk staging AQL packet pattern — determine if CLR uses barrier packets between chunks
-2. Check if `ScanNewPackets` double-counts or under-counts packets for multi-chunk operations
-3. Test with `GPU_PINNED_MIN_XFER_SIZE=0` to force staging for all sizes (eliminates pin failure path)
-4. Consider: is the `AsyncEventsLoop` crash a symptom (signal freed due to hang-induced cleanup) or a cause?
+1. Add packet-count instrumentation to `ScanNewPackets` and `UpdateReadDispatchId` to diagnose Bug A
+2. Identify the exact AQL packet pattern for multi-chunk H2D staging (kernel dispatch + barrier? multi-doorbell?)
+3. Once Bug A root cause is found, fix it
+4. Apply Retain/Release (Option 1) to harden bounce buffer against signal lifetime issues
