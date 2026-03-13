@@ -64,17 +64,24 @@
  
 --- a/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
 +++ b/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
-@@ -76,6 +76,9 @@
+@@ -76,6 +76,16 @@
  namespace rocr {
  namespace AMD {
  
 +KernelMutex AqlQueue::bounce_list_lock_;
 +std::vector<AqlQueue*> AqlQueue::bounce_queues_;
 +
++// Debug tracing for bounce buffer — enabled by ROCR_BOUNCE_DEBUG=1
++static bool bounce_debug() {
++  static int v = -1;
++  if (v < 0) { const char* e = getenv("ROCR_BOUNCE_DEBUG"); v = (e && e[0] == '1'); }
++  return v;
++}
++
  #define SCRATCH_ALT_RATIO 4
  
  AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_size_pkts,
-@@ -100,6 +103,7 @@
+@@ -100,6 +110,7 @@
        no_atomics_(agent->NoPlatformAtomics()),
        rptr_gpu_buf_(nullptr),
        last_rptr_dwords_(0),
@@ -82,7 +89,7 @@
        suspended_(false),
        priority_(HSA_QUEUE_PRIORITY_NORMAL),
        exception_signal_(nullptr) {
-@@ -357,9 +361,26 @@
+@@ -357,9 +368,26 @@
    QueueGuard.Dismiss();
    EventGuard.Dismiss();
    SignalGuard.Dismiss();
@@ -109,7 +116,7 @@
    // Remove error handler synchronously.
    // Sequences error handler callbacks with queue destroy.
    dynamicScratchState |= ERROR_HANDLER_TERMINATE;
-@@ -499,6 +520,8 @@
+@@ -499,6 +527,8 @@
  }
  
  void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
@@ -118,7 +125,7 @@
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
-@@ -530,6 +553,94 @@
+@@ -530,6 +560,119 @@
    StoreRelaxed(value);
  }
  
@@ -158,6 +165,23 @@
 +      sig = *sig_ptr;
 +    }
 +
++    if (bounce_debug()) {
++      fprintf(stderr, "[SCAN] idx=%lu slot=%u type=%u sig=0x%lx",
++              idx, slot, pkt_type, sig.handle);
++      if (pkt_type == HSA_PACKET_TYPE_BARRIER_AND ||
++          pkt_type == HSA_PACKET_TYPE_BARRIER_OR) {
++        const hsa_signal_t* dep = reinterpret_cast<const hsa_signal_t*>(
++            ring_base + slot * 64 + 8);  // dep_signal[0] at offset 8
++        hsa_signal_value_t dval = 0;
++        if (dep->handle) {
++          amd_signal_t* ds = reinterpret_cast<amd_signal_t*>(dep->handle);
++          dval = atomic::Load(&ds->value, std::memory_order_relaxed);
++        }
++        fprintf(stderr, " dep0=0x%lx(val=%ld)", dep->handle, dval);
++      }
++      fprintf(stderr, "\n");
++    }
++
 +    if (sig.handle != 0) {
 +      // Retain the signal so it cannot be freed while we hold a reference.
 +      // Matched by Release() in ProcessCompletions or ~AqlQueue.
@@ -165,6 +189,9 @@
 +      pending_completions_.push_back({idx + 1, sig});
 +    }
 +  }
++  if (bounce_debug())
++    fprintf(stderr, "[SCAN] scanned %lu->%lu, pending=%zu\n",
++            last_scanned_idx_, write_idx, pending_completions_.size());
 +  last_scanned_idx_ = write_idx;
 +}
 +
@@ -179,15 +206,17 @@
 +  uint64_t read_idx = atomic::Load(&amd_queue_.read_dispatch_id,
 +                                   std::memory_order_acquire);
 +
++  if (bounce_debug())
++    fprintf(stderr, "[COMP] read_idx=%lu pending=%zu first_complete=%lu\n",
++            read_idx, pending_completions_.size(),
++            pending_completions_.empty() ? 0 : pending_completions_[0].complete_idx);
++
 +  size_t completed = 0;
 +  for (const auto& entry : pending_completions_) {
 +    if (read_idx >= entry.complete_idx) {
 +      core::Signal* signal = core::Signal::Convert(entry.signal);
 +      signal->SubRelaxed(1);
 +      // Flush the signal value to DRAM so the GPU can see it.
-+      // On non-coherent platforms, CPU writes stay in cache; the GPU
-+      // reads signal values via PCIe (bypasses CPU cache) when
-+      // evaluating barrier packet dependencies.
 +      amd_signal_t* ams = reinterpret_cast<amd_signal_t*>(entry.signal.handle);
 +      _mm_clflush(const_cast<void*>(static_cast<volatile void*>(&ams->value)));
 +      _mm_mfence();
@@ -198,6 +227,9 @@
 +    }
 +  }
 +  if (completed > 0) {
++    if (bounce_debug())
++      fprintf(stderr, "[COMP] completed=%zu remaining=%zu\n",
++              completed, pending_completions_.size() - completed);
 +    pending_completions_.erase(pending_completions_.begin(),
 +                               pending_completions_.begin() + completed);
 +  }
