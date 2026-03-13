@@ -1,0 +1,67 @@
+# Maintainer: David Connolly <david@connol.ly>
+# Based on Arch's hip-runtime-amd PKGBUILD by Torsten Keßler
+#
+# Patches CLR to fix D2H copy corruption on non-coherent platforms (gfx8
+# without PCIe atomics).  Uses fine-grain staging buffer and CPU cache
+# flush after DMA completion.
+
+pkgname=hip-runtime-amd-polaris
+_pkgname=hip-runtime-amd
+pkgver=7.2.0
+pkgrel=1
+pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
+arch=('x86_64')
+url='https://github.com/ROCm/clr'
+license=('MIT')
+depends=('rocm-core' 'bash' 'perl' 'glibc' 'gcc-libs' 'numactl'
+         'mesa' 'comgr' 'rocminfo' 'rocm-llvm' 'libelf' 'rocprofiler-register'
+         'hsa-rocr-polaris')
+provides=("hip-runtime-amd=$pkgver" "hip=$pkgver")
+conflicts=('hip-runtime-amd' 'hip')
+replaces=('hip-runtime-amd')
+makedepends=('cmake' 'python' 'python-cppheaderparser')
+source=("rocm-${pkgver}.tar.gz::https://github.com/ROCm/rocm-systems/archive/rocm-$pkgver.tar.gz"
+        '0001-use-fine-grain-staging-and-flush-cpu-cache-for-d2h.patch')
+sha256sums=('728ea7e9bf16e6ed217a0fd1a8c9afaba2dae2e7908fa4e27201e67c803c5638'
+            'SKIP')
+_dirname="rocm-systems-rocm-$pkgver"
+options=(!lto)
+
+prepare() {
+  cd "$_dirname/projects/clr"
+  patch -Np1 -i "$srcdir/0001-use-fine-grain-staging-and-flush-cpu-cache-for-d2h.patch"
+}
+
+build() {
+  # Disable assertions (matches Arch upstream)
+  CXXFLAGS=${CXXFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS/}
+  CXXFLAGS+=" -DNDEBUG"
+  CFLAGS+=" -DNDEBUG"
+
+  local cmake_args=(
+    -Wno-dev
+    -S "$_dirname/projects/clr"
+    -B build
+    -DCMAKE_BUILD_TYPE=None
+    -DCMAKE_INSTALL_PREFIX=/opt/rocm
+    -DHIP_COMMON_DIR="$srcdir/$_dirname/projects/hip"
+    -DHIP_CATCH_TEST=0
+    -DCLR_BUILD_HIP=ON
+    -DCLR_BUILD_OCL=OFF
+  )
+  cmake "${cmake_args[@]}"
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+
+  # Remove Windows scripts
+  rm -f "$pkgdir/opt/rocm/bin/hipcc.bat"
+  rm -f "$pkgdir/opt/rocm/bin/hipconfig.bat"
+
+  install -Dm644 "$_dirname/projects/hip/LICENSE.md" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  echo '/opt/rocm/hip/lib' > "$pkgname.conf"
+  install -Dm644 "$pkgname.conf" "$pkgdir/etc/ld.so.conf.d/$pkgname.conf"
+}
