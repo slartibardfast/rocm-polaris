@@ -867,9 +867,32 @@ This only affects the no-atomics path. With PCIe atomics (`NO_UPDATE_RPTR=1`), C
 
 **Fix (kernel patch 0008 update, pkgrel 10):** Add `else` clause for no-atomics path that reduces RPTR_BLOCK_SIZE from 5→4 (every 16 dwords = 1 AQL packet). This ensures RPTR is written after every packet retirement. Combined with the ROCR SpinMutex + mfence fix in patch 0003 (pkgrel 8), this should eliminate both the race and the stale-RPTR issues.
 
+### D2H sweep verification (2026-03-13)
+
+**Kernel 6.18.16-10 + ROCR 7.2.0-8: D2H sweep 13/13 passed, 3 consecutive runs, zero hangs.**
+
+The two-part fix (RPTR_BLOCK_SIZE 5→4 + SpinMutex/mfence/atomic::Add) eliminates D2H transfer hangs completely.
+
+### H2D multi-chunk hang — new issue (2026-03-13)
+
+**Symptom:** llama.cpp GPU inference crashes during model loading. H2D `hipMemcpyAsync` + `hipStreamSynchronize` hangs after ~50 operations when transfer sizes exceed the CLR staging buffer (1MB default).
+
+**Reproduction:** Alternating 512B and 2MB `hipMemcpy` H2D calls. Hangs on the 5th 2MB transfer (~10th op in sequence). Uniform-size tests pass (100x 2MB works, 100x 512B works). Mixed 512B+551936B alternation works (40 ops). The trigger is **multi-chunk staging** (>1MB transfers that require 2+ staging buffer fills).
+
+**Key observations:**
+1. CLR staging buffer is 1MB. Transfers >1MB are split into chunks, each submitting AQL packets.
+2. CLR tries to pin host memory first for >1MB transfers. On our non-HMM platform, pinning fails (`DmaBlitManager::getBuffer failed to pin a resource!`). Falls back to staging.
+3. The staging fallback for >1MB does multiple 1MB staging chunks → multiple blit kernel AQL packets per `hipMemcpy`.
+4. After enough multi-chunk operations, `hipStreamSynchronize` hangs in `hsa_signal_wait_scacquire` → `ProcessAllBounceBuffers` → `UpdateReadDispatchId`.
+5. A background ROCR `AsyncEventsLoop` thread crashes at `Signal::Convert` accessing freed signal memory (`0x5fff00`), confirming a signal lifetime issue.
+
+**Root cause hypothesis:** The bounce buffer's `ScanNewPackets()` reads the ring buffer at packet-level granularity, tracking `completion_signal` at offset 56. But for multi-chunk staging, CLR submits multiple AQL packets where only the LAST packet has a non-zero `completion_signal`. The intermediate packets have `completion_signal = 0` (no signal). The bounce buffer correctly skips zero-signal packets. However, `read_dispatch_id` must advance past ALL packets (including signalless ones) for the queue space check to work. If `UpdateReadDispatchId()` via RPTR tracking falls behind (due to timing or RPTR grouping), CLR's `AcquireWriteIndex` sees the queue as full and spins forever.
+
+**Alternative hypothesis:** The `AsyncEventsLoop` crash indicates a signal-lifetime race between our bounce buffer and CLR's async event system. Our bounce buffer decrements signals from CPU (mimicking the GPU's atomic decrement). CLR sees the signal complete and frees it, but `AsyncEventsLoop` still has it in its monitoring list. This is a use-after-free that only manifests with enough operations to accumulate stale signals.
+
 ### Next steps
 
-1. Build and install linux-lts-rocm-polaris 6.18.16-10 + hsa-rocr-polaris 7.2.0-8
-2. Reboot (kexec) to load new kernel
-3. Run D2H sweep test — expected: 13/13 pass, 0 hang
-4. Retry llama.cpp GPU inference
+1. Investigate multi-chunk staging AQL packet pattern — determine if CLR uses barrier packets between chunks
+2. Check if `ScanNewPackets` double-counts or under-counts packets for multi-chunk operations
+3. Test with `GPU_PINNED_MIN_XFER_SIZE=0` to force staging for all sizes (eliminates pin failure path)
+4. Consider: is the `AsyncEventsLoop` crash a symptom (signal freed due to hang-induced cleanup) or a cause?
