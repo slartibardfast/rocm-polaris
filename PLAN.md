@@ -790,10 +790,53 @@ The staging buffer (GPU L2) issue **cannot** be fixed with CPU-side `clflush` al
 
 **Keep:** ROCR patch 0005 for `hsa_memory_copy` sync path (already deployed, covers different API).
 
+### CLR patch implementation (DONE)
+
+Created `hip-runtime-amd-polaris` 7.2.0-1 with CLR patch `0001-use-fine-grain-staging-and-flush-cpu-cache-for-d2h.patch`:
+- `rocvirtual.cpp`: staging buffer `kNoAtomics` → `kAtomics` (fine-grain pool)
+- `rocblit.cpp`: `_mm_clflush` + `_mm_mfence` after `WaitCurrent()` for staging and pinned paths, conditional on `!dev().info().pcie_atomics_`
+
+### Verification results (2026-03-13)
+
+**Data corruption: FIXED.** Every transfer that completes returns correct data — no more zeros or stale 0xBB bytes.
+
+**Intermittent hangs: NEW ISSUE.** Fork-based sweep test (30s timeout per size, each size in isolated child process):
+
+```
+  1MB: PASS  (1.0s)
+  2MB: PASS  (1.0s)
+  4MB: PASS  (1.0s)
+  8MB: PASS  (1.0s)
+ 16MB: HANG  (killed after 30s)
+ 24MB: HANG  (killed after 30s)
+ 29MB: PASS  (1.0s)
+ 30MB: HANG  (killed after 30s)
+ 31MB: HANG  (killed after 30s)
+ 32MB: PASS  (1.0s)
+ 33MB: PASS  (1.0s)
+ 48MB: PASS  (1.0s)
+ 64MB: PASS  (1.0s)
+
+9 pass, 0 fail, 4 hang / 13 total
+```
+
+**Key observations:**
+1. **No correlation with transfer size or dispatch count** — 16MB hangs (32 dispatches) but 64MB passes (128 dispatches)
+2. **Non-deterministic** — 32MB hung in earlier runs but passed here; 16MB passed earlier but now hangs
+3. **GPU recovers after SIGKILL** — subsequent tests pass after a killed child
+4. **Queue capacity is not the issue** — queue size is 16384 packets, max dispatches tested is 128
+
+**Root cause hypothesis: Race in RPTR read-back path.** The `UpdateReadDispatchId()` conversion (FlushCpuCache → read `rptr_gpu_buf_` → dword delta → dispatch_id accumulation) occasionally misses a CP write, causing `queue_load_read_index_scacquire` in CLR's `rocvirtual.cpp:1156` to spin forever waiting for queue space. This is the CLR-side consumer of `read_dispatch_id`, separate from the ROCR bounce buffer.
+
+**The hang location:** CLR `rocvirtual.cpp:1156`:
+```cpp
+while ((index - Hsa::queue_load_read_index_scacquire(gpu_queue_)) >= sw_queue_size) {
+    amd::Os::yield();
+}
+```
+This busy-waits for queue space. If `read_dispatch_id` doesn't advance, and enough packets have been submitted (varies by allocation/timing), the loop spins forever.
+
 ### Next steps
 
-1. Create `hip-runtime-amd-polaris` PKGBUILD based on Arch's `hip-runtime-amd`
-2. Write CLR patch: fine-grain staging + clflush defense-in-depth
-3. Build and install `hip-runtime-amd-polaris`
-4. Verify with size sweep: 1MB, 4MB, 16MB, 32MB, 64MB all pass D2H
-5. Retry llama.cpp GPU inference (ngl=1)
+1. Investigate RPTR read-back race — is `FlushCpuCache` in `UpdateReadDispatchId` reliable? Is the dword→dispatch_id conversion losing updates?
+2. Retry llama.cpp GPU inference (ngl=1) — may work if model weight loading doesn't hit the hang window
