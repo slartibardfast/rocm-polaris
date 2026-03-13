@@ -82,7 +82,7 @@
        suspended_(false),
        priority_(HSA_QUEUE_PRIORITY_NORMAL),
        exception_signal_(nullptr) {
-@@ -357,9 +361,20 @@
+@@ -357,9 +361,26 @@
    QueueGuard.Dismiss();
    EventGuard.Dismiss();
    SignalGuard.Dismiss();
@@ -100,10 +100,16 @@
 +    if (it != bounce_queues_.end()) bounce_queues_.erase(it);
 +  }
 +
++  // Release any signals still held by the bounce buffer.
++  for (const auto& entry : pending_completions_) {
++    core::Signal::Convert(entry.signal)->Release();
++  }
++  pending_completions_.clear();
++
    // Remove error handler synchronously.
    // Sequences error handler callbacks with queue destroy.
    dynamicScratchState |= ERROR_HANDLER_TERMINATE;
-@@ -499,6 +514,8 @@
+@@ -499,6 +520,8 @@
  }
  
  void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
@@ -112,7 +118,7 @@
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
-@@ -530,6 +547,83 @@
+@@ -530,6 +553,87 @@
    StoreRelaxed(value);
  }
  
@@ -153,6 +159,9 @@
 +    }
 +
 +    if (sig.handle != 0) {
++      // Retain the signal so it cannot be freed while we hold a reference.
++      // Matched by Release() in ProcessCompletions or ~AqlQueue.
++      core::Signal::Convert(sig)->Retain();
 +      pending_completions_.push_back({idx + 1, sig});
 +    }
 +  }
@@ -173,8 +182,9 @@
 +  size_t completed = 0;
 +  for (const auto& entry : pending_completions_) {
 +    if (read_idx >= entry.complete_idx) {
-+      amd_signal_t* sig = reinterpret_cast<amd_signal_t*>(entry.signal.handle);
-+      atomic::Sub(&sig->value, int64_t(1), std::memory_order_release);
++      core::Signal* signal = core::Signal::Convert(entry.signal);
++      signal->SubRelaxed(1);
++      signal->Release();  // matches Retain() in ScanNewPackets
 +      completed++;
 +    } else {
 +      break;  // FIFO: remaining entries are also incomplete
