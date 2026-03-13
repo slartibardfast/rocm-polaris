@@ -1,16 +1,21 @@
-# Use fine-grain staging buffer, flush CPU cache for D2H, and drain H2D
-# barrier dependencies on non-coherent platforms.
+# Use fine-grain staging buffer and flush CPU cache for D2H on non-coherent platforms
 #
-# On gfx8 without PCIe atomics (e.g. Polaris on Westmere Xeon):
+# On gfx8 without PCIe atomics (e.g. Polaris on Westmere Xeon), the blit
+# kernel writes to system memory through GPU L2 cache.  For coarse-grain
+# (MTYPE=NC) memory, FENCE_SCOPE_SYSTEM does not flush L2 on gfx8, so
+# data stays in GPU L2 and never reaches DRAM.  The CPU then reads stale
+# data (zeros from initialization) via memcpy from the staging buffer.
 #
-# Fix 1: Staging buffer from fine-grain pool (kAtomics) — GPU L2 flushed
-# by FENCE_SCOPE_SYSTEM release barrier.
+# Fix 1: Allocate the staging buffer from the fine-grain pool (kAtomics)
+# instead of coarse-grain (kNoAtomics).  Fine-grain memory uses MTYPE=CC,
+# which is properly flushed by the existing FENCE_SCOPE_SYSTEM release
+# barrier in the blit kernel dispatch packet.  Zero per-transfer overhead.
 #
-# Fix 2: clflush staging/pinned buffers after DMA completion.
-#
-# Fix 3: WaitCurrent() after H2D staging to drain barrier dependencies
-# that the GPU CP cannot resolve (signals decremented by CPU bounce buffer
-# but CP reads them via GPU L2 cache).
+# Fix 2: After waiting for the DMA completion signal, flush the CPU cache
+# lines covering the staging buffer (and pinned host buffer) before the
+# CPU reads.  Defense-in-depth for platforms where DMA writes don't fully
+# snoop the CPU cache hierarchy.  Conditional on !pcie_atomics_ so
+# coherent platforms pay no overhead.
 #
 # Signed-off-by: David Connolly <david@connol.ly>
 
@@ -30,12 +35,12 @@
      LogError("Could not create managed buffer for this queue!");
      return false;
    }
---- a/rocclr/device/rocm/rocblit.cpp	2026-03-13 21:54:05.172555054 +0000
-+++ b/rocclr/device/rocm/rocblit.cpp	2026-03-13 21:55:45.608194826 +0000
+--- a/rocclr/device/rocm/rocblit.cpp
++++ b/rocclr/device/rocm/rocblit.cpp
 @@ -27,6 +27,10 @@
  #include "utils/debug.hpp"
  #include <algorithm>
- 
+
 +#if defined(__x86_64__) || defined(__i386__)
 +#include <x86intrin.h>
 +#endif
@@ -60,12 +65,13 @@
            ClPrint(amd::LOG_DETAIL_DEBUG, amd::LOG_COPY, "memcpy host dst=%p, stg buf=%p, size=%zu",
                    hostDst + copyOffset, stagingBuffer, copysize);
            memcpy(hostDst + copyOffset, stagingBuffer, copysize);
-@@ -766,12 +780,27 @@
+@@ -765,6 +779,16 @@
+   // direct HSA signal check HIP avoids the command completion wait
    if (amd::IS_HIP && (gpu().command() != nullptr) && gpu().command()->IsMemoryPinned()) {
      gpu().Barriers().WaitCurrent();
-     gpu().command()->ReleasePinnedMemory();
 +#if defined(__x86_64__) || defined(__i386__)
 +    // Flush destination host buffer for pinned D2H on non-coherent platforms.
++    // GPU DMA wrote directly to the user's buffer; CPU cache may be stale.
 +    if (!hostToDev && !dev().info().pcie_atomics_) {
 +      for (size_t off = 0; off < size; off += 64) {
 +        _mm_clflush(reinterpret_cast<char*>(hostDst) + off);
@@ -73,18 +79,6 @@
 +      _mm_mfence();
 +    }
 +#endif
+     gpu().command()->ReleasePinnedMemory();
    }
- 
-   if (!status) {
-     return false;
-   }
- 
-+  // On no-atomics platforms, drain the last active H2D signal so the next
-+  // hipMemcpy call does not inherit an unresolvable barrier dependency.
-+  if (hostToDev && !dev().info().pcie_atomics_) {
-+    gpu().Barriers().WaitCurrent();
-+  }
-+
-   return true;
- }
- 
+
