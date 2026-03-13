@@ -1,0 +1,84 @@
+# Use fine-grain staging buffer and flush CPU cache for D2H on non-coherent platforms
+#
+# On gfx8 without PCIe atomics (e.g. Polaris on Westmere Xeon), the blit
+# kernel writes to system memory through GPU L2 cache.  For coarse-grain
+# (MTYPE=NC) memory, FENCE_SCOPE_SYSTEM does not flush L2 on gfx8, so
+# data stays in GPU L2 and never reaches DRAM.  The CPU then reads stale
+# data (zeros from initialization) via memcpy from the staging buffer.
+#
+# Fix 1: Allocate the staging buffer from the fine-grain pool (kAtomics)
+# instead of coarse-grain (kNoAtomics).  Fine-grain memory uses MTYPE=CC,
+# which is properly flushed by the existing FENCE_SCOPE_SYSTEM release
+# barrier in the blit kernel dispatch packet.  Zero per-transfer overhead.
+#
+# Fix 2: After waiting for the DMA completion signal, flush the CPU cache
+# lines covering the staging buffer (and pinned host buffer) before the
+# CPU reads.  Defense-in-depth for platforms where DMA writes don't fully
+# snoop the CPU cache hierarchy.  Conditional on !pcie_atomics_ so
+# coherent platforms pay no overhead.
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+--- a/rocclr/device/rocm/rocvirtual.cpp
++++ b/rocclr/device/rocm/rocvirtual.cpp
+@@ -1850,8 +1850,11 @@
+     LogError("Could not create signal for copy queue!");
+     return false;
+   }
+-  // Create managed buffer for staging copies
+-  if (!managed_buffer_.Create(Device::MemorySegment::kNoAtomics)) {
++  // Create managed buffer for staging copies.
++  // Use fine-grain pool (kAtomics) so GPU L2 is flushed by the blit kernel's
++  // FENCE_SCOPE_SYSTEM release barrier.  Coarse-grain (kNoAtomics) uses MTYPE=NC
++  // which gfx8 does not flush on system-scope release.
++  if (!managed_buffer_.Create(Device::MemorySegment::kAtomics)) {
+     LogError("Could not create managed buffer for this queue!");
+     return false;
+   }
+--- a/rocclr/device/rocm/rocblit.cpp
++++ b/rocclr/device/rocm/rocblit.cpp
+@@ -27,6 +27,10 @@
+ #include "utils/debug.hpp"
+ #include <algorithm>
+
++#if defined(__x86_64__) || defined(__i386__)
++#include <x86intrin.h>
++#endif
++
+ namespace amd::roc {
+ DmaBlitManager::DmaBlitManager(VirtualGPU& gpu, Setup setup)
+     : HostBlitManager(gpu, setup),
+@@ -742,6 +746,16 @@
+         if (outBuffer.pinnedMem_ == nullptr) {
+           // Wait for current signal of previous rocr copy if its not pinned mem
+           gpu().Barriers().WaitCurrent();
++#if defined(__x86_64__) || defined(__i386__)
++          // On non-coherent platforms, GPU writes via PCIe may not snoop CPU
++          // cache.  Flush staging buffer cache lines so memcpy sees GPU data.
++          if (!dev().info().pcie_atomics_) {
++            for (size_t off = 0; off < copysize; off += 64) {
++              _mm_clflush(reinterpret_cast<char*>(stagingBuffer) + off);
++            }
++            _mm_mfence();
++          }
++#endif
+           ClPrint(amd::LOG_DETAIL_DEBUG, amd::LOG_COPY, "memcpy host dst=%p, stg buf=%p, size=%zu",
+                   hostDst + copyOffset, stagingBuffer, copysize);
+           memcpy(hostDst + copyOffset, stagingBuffer, copysize);
+@@ -765,6 +779,16 @@
+   // direct HSA signal check HIP avoids the command completion wait
+   if (amd::IS_HIP && (gpu().command() != nullptr) && gpu().command()->IsMemoryPinned()) {
+     gpu().Barriers().WaitCurrent();
++#if defined(__x86_64__) || defined(__i386__)
++    // Flush destination host buffer for pinned D2H on non-coherent platforms.
++    // GPU DMA wrote directly to the user's buffer; CPU cache may be stale.
++    if (!hostToDev && !dev().info().pcie_atomics_) {
++      for (size_t off = 0; off < size; off += 64) {
++        _mm_clflush(reinterpret_cast<char*>(hostDst) + off);
++      }
++      _mm_mfence();
++    }
++#endif
+     gpu().command()->ReleasePinnedMemory();
+   }
+
