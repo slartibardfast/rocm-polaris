@@ -80,6 +80,9 @@
 +  // Last seen dword offset from rptr_gpu_buf_ (for wrap-around tracking).
 +  uint32_t last_rptr_dwords_;
 +
++  // Serializes UpdateReadDispatchId() across concurrent callers.
++  SpinMutex rptr_lock_;
++
 +  /// @brief Convert dword RPTR from GPU buffer to amd_queue_.read_dispatch_id.
 +  void UpdateReadDispatchId();
 +
@@ -152,6 +155,7 @@
  
 +void AqlQueue::UpdateReadDispatchId() {
 +  if (!rptr_gpu_buf_) return;
++  ScopedAcquire<SpinMutex> lock(&rptr_lock_);
 +  // CP writes RPTR via PCIe posted writes which bypass CPU cache.
 +  // Flush the cache line so we see the GPU's update.
 +  rocr::FlushCpuCache(rptr_gpu_buf_, 0, sizeof(*rptr_gpu_buf_));
@@ -166,10 +170,8 @@
 +                         ? (cur_dw - prev_dw)
 +                         : (ring_dwords - prev_dw + cur_dw);
 +    last_rptr_dwords_ = cur_dw;
-+    uint64_t id = atomic::Load(&amd_queue_.read_dispatch_id,
-+                               std::memory_order_relaxed);
-+    atomic::Store(&amd_queue_.read_dispatch_id, id + delta / 16,
-+                  std::memory_order_release);
++    atomic::Add(&amd_queue_.read_dispatch_id, uint64_t(delta / 16),
++                std::memory_order_release);
 +  }
 +}
 +

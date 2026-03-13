@@ -836,7 +836,29 @@ while ((index - Hsa::queue_load_read_index_scacquire(gpu_queue_)) >= sw_queue_si
 ```
 This busy-waits for queue space. If `read_dispatch_id` doesn't advance, and enough packets have been submitted (varies by allocation/timing), the loop spins forever.
 
+### Race condition in UpdateReadDispatchId — analysis and fix (2026-03-13)
+
+**Root cause confirmed:** `UpdateReadDispatchId()` is called concurrently from multiple threads without synchronization:
+- CLR dispatch threads (via `queue_load_read_index_scacquire` at `rocvirtual.cpp:1156`)
+- Signal wait/polling threads (via `ProcessCompletions()` at `amd_aql_queue.cpp:616`)
+- Scratch reclaim (via `LoadReadIndexRelaxed()` at `amd_aql_queue.cpp:958`)
+
+The function performs a read-modify-write on `last_rptr_dwords_` (plain uint32_t) and a non-atomic load+store on `read_dispatch_id`. When two threads race:
+1. Both read the same `last_rptr_dwords_` value
+2. Both compute the same delta
+3. One overwrites `last_rptr_dwords_`, the other re-reads and sees cur_dw == prev_dw → no-op
+4. Or: both store to `read_dispatch_id` — the second store uses a stale base, advancing by less than it should
+5. `read_dispatch_id` stalls → CLR busy-wait at `rocvirtual.cpp:1156` spins forever
+
+**Fix (patch 0003, pkgrel 8):**
+1. Add `SpinMutex rptr_lock_` to `AqlQueue` — serializes `UpdateReadDispatchId()` across callers
+2. Replace `atomic::Load` + `atomic::Store` on `read_dispatch_id` with `atomic::Add` — safe for consumers reading outside the lock
+3. Early return for `!rptr_gpu_buf_` stays outside the lock (zero overhead on gfx9+)
+
+**Why SpinMutex over CAS:** Critical section is ~5 instructions. CAS would require re-reading `rptr_gpu_buf_` (with clflush) on retry — potentially slower. SpinMutex already used in the file (`bounce_lock_`). `ScopedAcquire<SpinMutex>` is valid per `locks.h:222`.
+
 ### Next steps
 
-1. Investigate RPTR read-back race — is `FlushCpuCache` in `UpdateReadDispatchId` reliable? Is the dword→dispatch_id conversion losing updates?
-2. Retry llama.cpp GPU inference (ngl=1) — may work if model weight loading doesn't hit the hang window
+1. Build and install hsa-rocr-polaris 7.2.0-8
+2. Run D2H sweep test — expected: 13/13 pass, 0 hang
+3. Retry llama.cpp GPU inference
