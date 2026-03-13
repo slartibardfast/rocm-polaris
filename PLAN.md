@@ -968,9 +968,126 @@ Replace raw `atomic::Sub` with `core::Signal::Convert(entry.signal)->SubRelaxed(
 
 **Recommendation:** Fix Bug A first (root cause). Then apply Option 1 as defense-in-depth for Bug B.
 
+### Bug A root cause confirmed — GPU L2 caches signal reads (2026-03-13)
+
+**Root cause:** CLR's `rocrCopyBuffer` creates AQL barrier-AND packets whose `dep_signal` fields point to previous operations' completion signals. The GPU CP hardware evaluates these barriers by reading signal values from memory. On gfx8 without ATC, even though signals are allocated from the fine-grain system pool (`system_regions_fine_`), the GPU page table MTYPE for system memory may be NC (non-coherent). GPU L2 caches the signal read at value=1 (pre-decrement). Our bounce buffer decrements from CPU (SubRelaxed + clflush → DRAM), but GPU L2 never re-reads — the CP sees a stale value=1 forever and the barrier never resolves.
+
+**Evidence:**
+- Uniform 2MB x100 works (no inter-call barriers — each hipMemcpy is synchronous, bounced buffer drains signal between calls)
+- Mixed 512B+2MB alternation hangs at 5th→7th operation (barrier accumulates from inter-call deps)
+- WaitCurrent() drain at end of hsaCopyStagedOrPinned extends hang-free window (drains some barriers from CPU) but doesn't fully fix (other code paths create barrier deps too)
+- The issue ONLY affects AQL barrier evaluation by the CP hardware — CPU polling (our bounce buffer) works fine
+
+**Bug B (signal use-after-free): FIXED** with Retain/Release in patch 0004 (pkgrel 9).
+
+### Proposed fix — allocate signals from GPU-visible coherent memory
+
+**Approach:** Change signal pool allocation to use memory that is coherent from the GPU's perspective. Two sub-options:
+
+**Option A: Use `AllocateCoherent` flag for signal pool** (preferred)
+
+Change the `system_allocator_` in `runtime.cpp:215` to use `MemoryRegion::AllocateCoherent` flag instead of (or in addition to) `AllocateNonPaged`. This tells the thunk to set `KFD_IOC_ALLOC_MEM_FLAGS_COHERENT`, which makes KFD map the memory with MTYPE=CC in GPU page tables. GPU L2 always re-reads from DRAM for CC pages.
+
+Scope: ~5 lines in `runtime.cpp`. Conditional on `NoPlatformAtomics()` to avoid affecting coherent platforms.
+
+Risk: Signals become uncacheable in GPU L2. This is fine — signals are small (64 bytes each) and infrequently read by the GPU. On coherent platforms with ATC, signals are already effectively uncacheable (CPU cache snooped). On no-atomics platforms, this trades GPU L2 hit rate for correctness.
+
+**Option B: Allocate a separate signal pool from kernarg memory**
+
+Kernarg memory is already mapped as UC/CC for GPU access (verified working — our `rptr_gpu_buf_` is in kernarg pool and GPU reads it correctly). Allocate signals from kernarg pool instead of regular system memory.
+
+Scope: Larger change — need a separate allocator for no-atomics platforms.
+
+**Recommendation: Option A** — minimal change, leverages existing KFD coherency infrastructure.
+
+### Test plan — upstream-idiomatic rocrtst tests
+
+Tests follow the `rocrtst` framework pattern: `TestBase` subclass with `SetUp()`/`Run()`/`Close()`, registered via `TEST()` macros in `main.cc`.
+
+#### Test 1: `SignalCpuWriteGpuBarrier`
+
+Verifies that GPU CP correctly evaluates a barrier-AND packet whose dep_signal was decremented from CPU (mimicking bounce buffer behavior).
+
+```
+Setup:
+  - hsa_init, find GPU agent, create queue
+  - Create signal A (value=1)
+  - Create signal B (value=1)
+
+Run:
+  - Submit barrier-AND packet: dep_signal[0] = A, completion_signal = B
+  - Ring doorbell
+  - From CPU: hsa_signal_store_screlease(A, 0)  // decrement A
+  - Wait on B with 3-second timeout
+
+Pass: B reaches 0 (barrier resolved after CPU write to A)
+Fail: Timeout (GPU CP didn't see CPU write → MTYPE issue)
+```
+
+**Acceptance criteria:** Test passes on all platforms. On no-atomics gfx8, this specifically validates that the signal pool coherency fix makes CPU writes visible to the CP's barrier evaluation.
+
+#### Test 2: `BounceBufferBarrierChain`
+
+Verifies that a chain of barrier-dependent dispatches works when signals are decremented by the bounce buffer (not GPU hardware).
+
+```
+Setup:
+  - hsa_init, find GPU agent, create queue with bounce buffer enabled
+  - Allocate ring buffer, kernarg, code object for nop kernel
+
+Run (10 iterations):
+  - Submit dispatch packet with signal S[i]
+  - Submit barrier-AND packet: dep_signal[0] = S[i], completion_signal = S[i+1]
+  - Ring doorbell
+  - Wait on S[i+1] with 3-second timeout
+
+Pass: All 10 barriers resolve within timeout
+Fail: Any timeout (bounce buffer + barrier chain broken)
+```
+
+#### Test 3: `MixedSizeH2DStress`
+
+End-to-end HIP test: alternating small (512B) and large (2MB) hipMemcpy H2D transfers.
+
+```
+Setup:
+  - hipMalloc 4MB device buffer
+  - malloc 3MB host buffer, fill with pattern
+
+Run:
+  - 20 iterations of: hipMemcpy(512B, H2D) + hipMemcpy(2MB, H2D)
+  - Verify data integrity after each transfer via D2H readback
+
+Pass: All 40 transfers complete without hang, data correct
+Fail: Hang (timeout) or data corruption
+```
+
+**Acceptance criteria:** Must complete within 30 seconds on gfx8 no-atomics hardware.
+
+#### Test 4: `SignalRetainRelease`
+
+Unit test for the bounce buffer's Retain/Release lifecycle.
+
+```
+Setup:
+  - Create signal S (value=1)
+  - Signal::Convert(S)->Retain()  // bounce buffer holds reference
+
+Run:
+  - hsa_signal_destroy(S)  // normal destruction
+  - Verify SharedSignal::IsValid() still returns true (Retain prevents free)
+  - Signal::Convert(S)->SubRelaxed(1)  // bounce buffer decrements
+  - Signal::Convert(S)->Release()  // bounce buffer releases
+  - Verify signal is now freed (IsValid returns false)
+
+Pass: Signal survives destroy while retained, freed after release
+Fail: Crash or premature free
+```
+
 ### Next steps
 
-1. Add packet-count instrumentation to `ScanNewPackets` and `UpdateReadDispatchId` to diagnose Bug A
-2. Identify the exact AQL packet pattern for multi-chunk H2D staging (kernel dispatch + barrier? multi-doorbell?)
-3. Once Bug A root cause is found, fix it
-4. Apply Retain/Release (Option 1) to harden bounce buffer against signal lifetime issues
+1. Verify signal memory MTYPE: check KFD mapping flags for `system_regions_fine_` on our platform
+2. Implement Option A: add `AllocateCoherent` to signal pool allocator (conditional on no-atomics)
+3. Write and run Test 1 (SignalCpuWriteGpuBarrier) to validate the fix
+4. If Test 1 passes, run full stress test (Test 3) and llama.cpp inference
+5. Write remaining tests for upstream submission
