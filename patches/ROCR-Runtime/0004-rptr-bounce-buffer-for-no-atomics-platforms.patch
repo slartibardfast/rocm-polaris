@@ -129,7 +129,7 @@
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
-@@ -530,6 +564,165 @@
+@@ -530,6 +564,167 @@
    StoreRelaxed(value);
  }
  
@@ -267,10 +267,16 @@
 +      q->kick_count_ = 0;
 +      continue;
 +    }
-+    if (q->kick_count_ >= 2) continue;  // limit 2 kicks per stall
++    if (q->kick_count_ >= 10) continue;  // limit 2 kicks per stall
 +    q->kick_count_++;
-+    if (bounce_debug()) fprintf(stderr, "[KICK] q=%p wid=%lu rid=%lu rptr=%u\n", q, wid, rid, q->last_rptr_dwords_);
-+    // Submit NOP barrier at slot wid, advance write_dispatch_id to wid+1
++    // CAS to atomically claim slot wid.  If CLR already incremented
++    // write_dispatch_id (another thread submitted), CAS fails and we
++    // skip the kick — CLR's doorbell will wake the CP instead.
++    // CAS(ptr, new_val, expected) — returns old value. Success if old == expected.
++    uint64_t old = atomic::Cas(&q->amd_queue_.write_dispatch_id,
++                               wid + 1, wid, std::memory_order_acq_rel);
++    if (old != wid) continue;  // CLR already incremented — skip kick
++    // We now own slot wid.  Write NOP barrier.
 +    uint32_t slot = static_cast<uint32_t>(wid & (q->amd_queue_.hsa_queue.size - 1));
 +    hsa_barrier_and_packet_t* nop = reinterpret_cast<hsa_barrier_and_packet_t*>(
 +        static_cast<char*>(q->amd_queue_.hsa_queue.base_address) + slot * 64);
@@ -278,10 +284,6 @@
 +    __atomic_store_n(reinterpret_cast<uint16_t*>(nop),
 +                     uint16_t(HSA_PACKET_TYPE_BARRIER_AND << HSA_PACKET_HEADER_TYPE),
 +                     __ATOMIC_RELEASE);
-+    atomic::Store(&q->amd_queue_.write_dispatch_id, wid + 1,
-+                  std::memory_order_release);
-+    // Advance scan index past the NOP so ScanNewPackets doesn't
-+    // try to read its (empty) completion_signal on the next call.
 +    q->last_scanned_idx_ = wid + 1;
 +    _mm_sfence();
 +    uint32_t wptr_mask = (q->amd_queue_.hsa_queue.size * 16) - 1;
