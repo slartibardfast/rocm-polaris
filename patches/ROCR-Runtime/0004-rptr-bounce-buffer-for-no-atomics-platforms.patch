@@ -44,7 +44,7 @@
   protected:
    bool _IsA(Queue::rtti_t id) const override { return id == &rtti_id(); }
  
-@@ -310,6 +321,17 @@
+@@ -310,6 +321,19 @@
    /// @brief Copy RPTR from GPU buffer to amd_queue_.read_dispatch_id.
    void UpdateReadDispatchId();
  
@@ -54,6 +54,8 @@
 +  };
 +  std::vector<PendingCompletion> pending_completions_;
 +  uint64_t last_scanned_idx_;
++  uint32_t kick_rptr_;   // RPTR value at last doorbell kick check
++  uint32_t kick_count_;  // stall iteration counter for doorbell kick throttling
 +  KernelMutex bounce_lock_;
 +
 +  static KernelMutex bounce_list_lock_;
@@ -81,15 +83,17 @@
  #define SCRATCH_ALT_RATIO 4
  
  AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_size_pkts,
-@@ -100,6 +110,7 @@
+@@ -100,6 +112,9 @@
        no_atomics_(agent->NoPlatformAtomics()),
        rptr_gpu_buf_(nullptr),
        last_rptr_dwords_(0),
 +      last_scanned_idx_(0),
++      kick_rptr_(UINT32_MAX),
++      kick_count_(0),
        suspended_(false),
        priority_(HSA_QUEUE_PRIORITY_NORMAL),
        exception_signal_(nullptr) {
-@@ -357,9 +368,26 @@
+@@ -357,9 +372,26 @@
    QueueGuard.Dismiss();
    EventGuard.Dismiss();
    SignalGuard.Dismiss();
@@ -116,7 +120,7 @@
    // Remove error handler synchronously.
    // Sequences error handler callbacks with queue destroy.
    dynamicScratchState |= ERROR_HANDLER_TERMINATE;
-@@ -499,6 +527,8 @@
+@@ -499,6 +531,8 @@
  }
  
  void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
@@ -125,7 +129,7 @@
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
-@@ -530,6 +560,124 @@
+@@ -530,6 +564,146 @@
    StoreRelaxed(value);
  }
  
@@ -240,11 +244,33 @@
 +  for (AqlQueue* q : bounce_queues_) {
 +    q->ProcessCompletions();
 +  }
-+  // Yield to give the CP time to re-evaluate stalled barriers.
-+  // After we decrement a signal that another queue's barrier depends on,
-+  // the CP needs time to poll the dep_signal value and advance RPTR.
-+  // Without yielding, the tight BusyWaitSignal loop starves the CP.
-+  os::YieldThread();
++  // Wake stalled queues with a doorbell kick.
++  // With SLOT_BASED_WPTR=0, the CP goes idle after a barrier dep check
++  // fails.  We write WPTR+16 to force DOORBELL_HIT, waking the CP to
++  // re-evaluate.  Only kick when: (1) pending completions exist,
++  // (2) RPTR is stalled at the same position since last kick.
++  for (AqlQueue* q : bounce_queues_) {
++    if (q->pending_completions_.empty()) continue;
++    uint64_t wid = atomic::Load(&q->amd_queue_.write_dispatch_id,
++                                std::memory_order_relaxed);
++    uint64_t rid = atomic::Load(&q->amd_queue_.read_dispatch_id,
++                                std::memory_order_relaxed);
++    if (wid <= rid) continue;
++    // Stall detection: only kick after RPTR has been frozen for many
++    // iterations.  This avoids kicking actively-processing queues.
++    if (q->last_rptr_dwords_ != q->kick_rptr_) {
++      q->kick_rptr_ = q->last_rptr_dwords_;
++      q->kick_count_ = 0;
++      continue;  // RPTR changed — CP is progressing
++    }
++    // RPTR unchanged — increment stall counter, kick after threshold
++    if (++q->kick_count_ < 500) continue;
++    q->kick_count_ = 0;  // reset to kick again in 500 iterations
++    _mm_sfence();
++    uint32_t wptr_mask = (q->amd_queue_.hsa_queue.size * 16) - 1;
++    uint32_t wptr_dw = static_cast<uint32_t>(wid * 16) & wptr_mask;
++    *(volatile uint32_t*)(q->signal_.hardware_doorbell_ptr) = wptr_dw;
++  }
 +}
 +
  hsa_status_t AqlQueue::GetInfo(hsa_queue_info_attribute_t attribute, void* value) {
