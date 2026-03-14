@@ -51,7 +51,7 @@
  #define CP_MQD_CONTROL__PRIV_STATE__SHIFT 0x8
 
  static inline struct vi_mqd *get_mqd(void *mqd)
-@@ -225,7 +239,32 @@
+@@ -225,7 +239,37 @@
 
  	if (q->format == KFD_QUEUE_FORMAT_AQL) {
 -		m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK |
@@ -74,10 +74,15 @@
 +				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
 +		} else {
 +			/*
-+			 * No-atomics: RPTR is our only completion signal.
-+			 * Reduce RPTR_BLOCK_SIZE to 4 (every 16 dwords =
-+			 * 1 AQL packet) for per-packet RPTR writes.
++			 * No-atomics: use SLOT_BASED_WPTR=2 (memory polling)
++			 * so the CP polls a GPU-visible WPTR address.  ROCR
++			 * provides this via Queue_write_ptr_aql from kernarg
++			 * pool.  Also clear NO_UPDATE_RPTR so CP writes RPTR
++			 * to rptr_report_addr, and reduce RPTR_BLOCK_SIZE
++			 * to 4 for per-packet RPTR writes.
 +			 */
++			m->cp_hqd_pq_control |=
++				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
 +			m->cp_hqd_pq_control &=
 +				~CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE_MASK;
 +			m->cp_hqd_pq_control |=
