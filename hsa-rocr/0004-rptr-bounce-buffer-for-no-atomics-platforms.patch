@@ -129,7 +129,7 @@
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
-@@ -530,6 +564,119 @@
+@@ -530,6 +564,165 @@
    StoreRelaxed(value);
  }
  
@@ -240,9 +240,55 @@
 +}
 +
 +void AqlQueue::ProcessAllBounceBuffers() {
++  bool any_completed = false;
 +  ScopedAcquire<KernelMutex> lock(&bounce_list_lock_);
 +  for (AqlQueue* q : bounce_queues_) {
++    size_t before = q->pending_completions_.size();
 +    q->ProcessCompletions();
++    if (q->pending_completions_.size() < before) any_completed = true;
++  }
++  // When a signal was decremented, kick stalled queues with a NOP barrier.
++  // With SLOT_BASED_WPTR=0, the CP goes idle after an unsatisfied barrier
++  // dep.  Writing a NOP barrier at the next slot and ringing the doorbell
++  // with a HIGHER WPTR value forces DOORBELL_HIT, waking the CP.  The CP
++  // re-evaluates its stalled barrier (dep is now 0) and proceeds.
++  for (AqlQueue* q : bounce_queues_) {
++    if (q->pending_completions_.empty()) continue;
++    uint64_t wid = atomic::Load(&q->amd_queue_.write_dispatch_id,
++                                std::memory_order_relaxed);
++    uint64_t rid = atomic::Load(&q->amd_queue_.read_dispatch_id,
++                                std::memory_order_relaxed);
++    if (wid <= rid) continue;  // fully drained
++    // Only kick once per stall.  When RPTR changes, reset the flag.
++    // When RPTR is frozen AND we haven't kicked yet, kick once.
++    if (q->last_rptr_dwords_ != q->kick_rptr_) {
++      // RPTR changed — CP is alive, update baseline, clear kicked flag
++      q->kick_rptr_ = q->last_rptr_dwords_;
++      q->kick_count_ = 0;
++      continue;
++    }
++    if (q->kick_count_ >= 2) continue;  // limit 2 kicks per stall
++    q->kick_count_++;
++    if (bounce_debug()) fprintf(stderr, "[KICK] q=%p wid=%lu rid=%lu rptr=%u\n", q, wid, rid, q->last_rptr_dwords_);
++    // Submit NOP barrier at slot wid, advance write_dispatch_id to wid+1
++    uint32_t slot = static_cast<uint32_t>(wid & (q->amd_queue_.hsa_queue.size - 1));
++    hsa_barrier_and_packet_t* nop = reinterpret_cast<hsa_barrier_and_packet_t*>(
++        static_cast<char*>(q->amd_queue_.hsa_queue.base_address) + slot * 64);
++    memset(nop, 0, sizeof(*nop));
++    __atomic_store_n(reinterpret_cast<uint16_t*>(nop),
++                     uint16_t(HSA_PACKET_TYPE_BARRIER_AND << HSA_PACKET_HEADER_TYPE),
++                     __ATOMIC_RELEASE);
++    atomic::Store(&q->amd_queue_.write_dispatch_id, wid + 1,
++                  std::memory_order_release);
++    // Advance scan index past the NOP so ScanNewPackets doesn't
++    // try to read its (empty) completion_signal on the next call.
++    q->last_scanned_idx_ = wid + 1;
++    _mm_sfence();
++    uint32_t wptr_mask = (q->amd_queue_.hsa_queue.size * 16) - 1;
++    uint32_t wptr_dw = static_cast<uint32_t>((wid + 1) * 16) & wptr_mask;
++    if (q->legacy_doorbell_) {
++      *(volatile uint32_t*)(q->signal_.hardware_doorbell_ptr) = wptr_dw;
++    }
 +  }
 +}
 +
