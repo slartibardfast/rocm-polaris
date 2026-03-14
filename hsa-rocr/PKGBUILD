@@ -41,25 +41,37 @@ prepare() {
   patch -Np1 -i "$srcdir/0004-rptr-bounce-buffer-for-no-atomics-platforms.patch"
   patch -Np1 -i "$srcdir/0005-flush-cpu-cache-after-gpu-writes-to-system-memory.patch"
 
-  # Debug: inject RPTR logging into UpdateReadDispatchId
+  # Debug: inject RPTR stall logging — uses sed with /r to insert code blocks
   local _aql=runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
-  python3 -c "
-import re, sys
-f=open('$_aql','r'); t=f.read(); f.close()
-# Insert debug block after 'last_rptr_dwords_ = cur_dw;'
-old='last_rptr_dwords_ = cur_dw;'
-new=old+'''
+
+  # Inject stall counter after "uint32_t prev_dw = last_rptr_dwords_;"
+  # Uses 0x31 == '1' to avoid shell quoting issues
+  cat > /tmp/_stall_inject.c << 'INJECT'
+  { static int _bd2=-1,_sc=0;
+    if(_bd2<0){const char*e=getenv("ROCR_BOUNCE_DEBUG");_bd2=e&&e[0]==0x31;}
+    if(_bd2 && cur_dw==prev_dw && !pending_completions_.empty()) {
+      if(++_sc%500000==1)
+        fprintf(stderr,"[STALL] q=%p rptr=%u rid=%lu wid=%lu pend=%zu fc=%lu (x%d)\n",
+          this,cur_dw,
+          atomic::Load(&amd_queue_.read_dispatch_id,std::memory_order_relaxed),
+          atomic::Load(&amd_queue_.write_dispatch_id,std::memory_order_relaxed),
+          pending_completions_.size(), pending_completions_[0].complete_idx, _sc);
+    } else { _sc=0; }
+  }
+INJECT
+  sed -i '/uint32_t prev_dw = last_rptr_dwords_;/r /tmp/_stall_inject.c' "$_aql"
+
+  # Inject RPTR advance log after "last_rptr_dwords_ = cur_dw;"
+  cat > /tmp/_rptr_inject.c << 'INJECT'
     { static int _bd=-1;
-      if(_bd<0){const char*e=getenv(\"ROCR_BOUNCE_DEBUG\");_bd=e&&e[0]=='1';}
-      if(_bd)fprintf(stderr,\"[RPTR] q=%p cur=%u prev=%u pkts=%u rid=%lu wid=%lu\\\\n\",
+      if(_bd<0){const char*e=getenv("ROCR_BOUNCE_DEBUG");_bd=e&&e[0]==0x31;}
+      if(_bd)fprintf(stderr,"[RPTR] q=%p cur=%u prev=%u pkts=%u rid=%lu wid=%lu\n",
         this,cur_dw,prev_dw,delta/16,
         atomic::Load(&amd_queue_.read_dispatch_id,std::memory_order_relaxed),
         atomic::Load(&amd_queue_.write_dispatch_id,std::memory_order_relaxed));
-    }'''
-t=t.replace(old,new,1)
-f=open('$_aql','w'); f.write(t); f.close()
-print('Injected RPTR debug into',sys.argv[0] if len(sys.argv)>0 else '_aql')
-"
+    }
+INJECT
+  sed -i '/last_rptr_dwords_ = cur_dw;/r /tmp/_rptr_inject.c' "$_aql"
 }
 
 build() {
