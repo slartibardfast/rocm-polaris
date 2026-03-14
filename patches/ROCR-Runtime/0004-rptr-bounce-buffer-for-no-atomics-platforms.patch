@@ -125,7 +125,7 @@
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
-@@ -530,6 +560,119 @@
+@@ -530,6 +560,124 @@
    StoreRelaxed(value);
  }
  
@@ -240,6 +240,11 @@
 +  for (AqlQueue* q : bounce_queues_) {
 +    q->ProcessCompletions();
 +  }
++  // Yield to give the CP time to re-evaluate stalled barriers.
++  // After we decrement a signal that another queue's barrier depends on,
++  // the CP needs time to poll the dep_signal value and advance RPTR.
++  // Without yielding, the tight BusyWaitSignal loop starves the CP.
++  os::YieldThread();
 +}
 +
  hsa_status_t AqlQueue::GetInfo(hsa_queue_info_attribute_t attribute, void* value) {
