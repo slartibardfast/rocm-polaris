@@ -40,6 +40,26 @@ prepare() {
   patch -Np1 -i "$srcdir/0003-use-32bit-doorbell-write-for-gfx8.patch"
   patch -Np1 -i "$srcdir/0004-rptr-bounce-buffer-for-no-atomics-platforms.patch"
   patch -Np1 -i "$srcdir/0005-flush-cpu-cache-after-gpu-writes-to-system-memory.patch"
+
+  # Debug: inject RPTR logging into UpdateReadDispatchId
+  local _aql=runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+  python3 -c "
+import re, sys
+f=open('$_aql','r'); t=f.read(); f.close()
+# Insert debug block after 'last_rptr_dwords_ = cur_dw;'
+old='last_rptr_dwords_ = cur_dw;'
+new=old+'''
+    { static int _bd=-1;
+      if(_bd<0){const char*e=getenv(\"ROCR_BOUNCE_DEBUG\");_bd=e&&e[0]=='1';}
+      if(_bd)fprintf(stderr,\"[RPTR] q=%p cur=%u prev=%u pkts=%u rid=%lu wid=%lu\\\\n\",
+        this,cur_dw,prev_dw,delta/16,
+        atomic::Load(&amd_queue_.read_dispatch_id,std::memory_order_relaxed),
+        atomic::Load(&amd_queue_.write_dispatch_id,std::memory_order_relaxed));
+    }'''
+t=t.replace(old,new,1)
+f=open('$_aql','w'); f.write(t); f.close()
+print('Injected RPTR debug into',sys.argv[0] if len(sys.argv)>0 else '_aql')
+"
 }
 
 build() {
