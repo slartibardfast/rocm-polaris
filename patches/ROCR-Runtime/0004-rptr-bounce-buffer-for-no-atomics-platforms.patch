@@ -129,7 +129,7 @@
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
-@@ -530,6 +564,146 @@
+@@ -530,6 +564,119 @@
    StoreRelaxed(value);
  }
  
@@ -243,33 +243,6 @@
 +  ScopedAcquire<KernelMutex> lock(&bounce_list_lock_);
 +  for (AqlQueue* q : bounce_queues_) {
 +    q->ProcessCompletions();
-+  }
-+  // Wake stalled queues with a doorbell kick.
-+  // With SLOT_BASED_WPTR=0, the CP goes idle after a barrier dep check
-+  // fails.  We write WPTR+16 to force DOORBELL_HIT, waking the CP to
-+  // re-evaluate.  Only kick when: (1) pending completions exist,
-+  // (2) RPTR is stalled at the same position since last kick.
-+  for (AqlQueue* q : bounce_queues_) {
-+    if (q->pending_completions_.empty()) continue;
-+    uint64_t wid = atomic::Load(&q->amd_queue_.write_dispatch_id,
-+                                std::memory_order_relaxed);
-+    uint64_t rid = atomic::Load(&q->amd_queue_.read_dispatch_id,
-+                                std::memory_order_relaxed);
-+    if (wid <= rid) continue;
-+    // Stall detection: only kick after RPTR has been frozen for many
-+    // iterations.  This avoids kicking actively-processing queues.
-+    if (q->last_rptr_dwords_ != q->kick_rptr_) {
-+      q->kick_rptr_ = q->last_rptr_dwords_;
-+      q->kick_count_ = 0;
-+      continue;  // RPTR changed — CP is progressing
-+    }
-+    // RPTR unchanged — increment stall counter, kick after threshold
-+    if (++q->kick_count_ < 500) continue;
-+    q->kick_count_ = 0;  // reset to kick again in 500 iterations
-+    _mm_sfence();
-+    uint32_t wptr_mask = (q->amd_queue_.hsa_queue.size * 16) - 1;
-+    uint32_t wptr_dw = static_cast<uint32_t>(wid * 16) & wptr_mask;
-+    *(volatile uint32_t*)(q->signal_.hardware_doorbell_ptr) = wptr_dw;
 +  }
 +}
 +
