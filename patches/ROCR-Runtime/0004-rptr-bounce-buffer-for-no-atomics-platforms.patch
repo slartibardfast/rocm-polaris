@@ -44,7 +44,7 @@
   protected:
    bool _IsA(Queue::rtti_t id) const override { return id == &rtti_id(); }
  
-@@ -310,6 +321,19 @@
+@@ -310,6 +321,17 @@
    /// @brief Copy RPTR from GPU buffer to amd_queue_.read_dispatch_id.
    void UpdateReadDispatchId();
  
@@ -54,8 +54,6 @@
 +  };
 +  std::vector<PendingCompletion> pending_completions_;
 +  uint64_t last_scanned_idx_;
-+  uint32_t kick_rptr_;   // RPTR value at last doorbell kick check
-+  uint32_t kick_count_;  // stall iteration counter for doorbell kick throttling
 +  KernelMutex bounce_lock_;
 +
 +  static KernelMutex bounce_list_lock_;
@@ -66,34 +64,25 @@
  
 --- a/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
 +++ b/runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
-@@ -76,6 +76,16 @@
+@@ -76,6 +76,9 @@
  namespace rocr {
  namespace AMD {
  
 +KernelMutex AqlQueue::bounce_list_lock_;
 +std::vector<AqlQueue*> AqlQueue::bounce_queues_;
 +
-+// Debug tracing for bounce buffer — enabled by ROCR_BOUNCE_DEBUG=1
-+static bool bounce_debug() {
-+  static int v = -1;
-+  if (v < 0) { const char* e = getenv("ROCR_BOUNCE_DEBUG"); v = (e && e[0] == '1'); }
-+  return v;
-+}
-+
  #define SCRATCH_ALT_RATIO 4
  
  AqlQueue::AqlQueue(core::SharedQueue* shared_queue, GpuAgent* agent, size_t req_size_pkts,
-@@ -100,6 +112,9 @@
+@@ -100,6 +103,7 @@
        no_atomics_(agent->NoPlatformAtomics()),
        rptr_gpu_buf_(nullptr),
        last_rptr_dwords_(0),
 +      last_scanned_idx_(0),
-+      kick_rptr_(UINT32_MAX),
-+      kick_count_(0),
        suspended_(false),
        priority_(HSA_QUEUE_PRIORITY_NORMAL),
        exception_signal_(nullptr) {
-@@ -357,9 +372,26 @@
+@@ -357,9 +361,26 @@
    QueueGuard.Dismiss();
    EventGuard.Dismiss();
    SignalGuard.Dismiss();
@@ -120,7 +109,7 @@
    // Remove error handler synchronously.
    // Sequences error handler callbacks with queue destroy.
    dynamicScratchState |= ERROR_HANDLER_TERMINATE;
-@@ -499,6 +531,8 @@
+@@ -499,6 +520,8 @@
  }
  
  void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
@@ -129,7 +118,7 @@
    if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
          core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
      HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_));
-@@ -530,6 +564,167 @@
+@@ -530,6 +553,87 @@
    StoreRelaxed(value);
  }
  
@@ -169,23 +158,6 @@
 +      sig = *sig_ptr;
 +    }
 +
-+    if (bounce_debug()) {
-+      fprintf(stderr, "[SCAN] idx=%lu slot=%u type=%u sig=0x%lx",
-+              idx, slot, pkt_type, sig.handle);
-+      if (pkt_type == HSA_PACKET_TYPE_BARRIER_AND ||
-+          pkt_type == HSA_PACKET_TYPE_BARRIER_OR) {
-+        const hsa_signal_t* dep = reinterpret_cast<const hsa_signal_t*>(
-+            ring_base + slot * 64 + 8);  // dep_signal[0] at offset 8
-+        hsa_signal_value_t dval = 0;
-+        if (dep->handle) {
-+          amd_signal_t* ds = reinterpret_cast<amd_signal_t*>(dep->handle);
-+          dval = atomic::Load(&ds->value, std::memory_order_relaxed);
-+        }
-+        fprintf(stderr, " dep0=0x%lx(val=%ld)", dep->handle, dval);
-+      }
-+      fprintf(stderr, "\n");
-+    }
-+
 +    if (sig.handle != 0) {
 +      // Retain the signal so it cannot be freed while we hold a reference.
 +      // Matched by Release() in ProcessCompletions or ~AqlQueue.
@@ -193,9 +165,6 @@
 +      pending_completions_.push_back({idx + 1, sig});
 +    }
 +  }
-+  if (bounce_debug())
-+    fprintf(stderr, "[SCAN] scanned %lu->%lu, pending=%zu\n",
-+            last_scanned_idx_, write_idx, pending_completions_.size());
 +  last_scanned_idx_ = write_idx;
 +}
 +
@@ -210,20 +179,11 @@
 +  uint64_t read_idx = atomic::Load(&amd_queue_.read_dispatch_id,
 +                                   std::memory_order_acquire);
 +
-+  if (bounce_debug())
-+    fprintf(stderr, "[COMP] read_idx=%lu pending=%zu first_complete=%lu\n",
-+            read_idx, pending_completions_.size(),
-+            pending_completions_.empty() ? 0 : pending_completions_[0].complete_idx);
-+
 +  size_t completed = 0;
 +  for (const auto& entry : pending_completions_) {
 +    if (read_idx >= entry.complete_idx) {
 +      core::Signal* signal = core::Signal::Convert(entry.signal);
 +      signal->SubRelaxed(1);
-+      // Flush the signal value to DRAM so the GPU can see it.
-+      amd_signal_t* ams = reinterpret_cast<amd_signal_t*>(entry.signal.handle);
-+      _mm_clflush(const_cast<void*>(static_cast<volatile void*>(&ams->value)));
-+      _mm_mfence();
 +      signal->Release();  // matches Retain() in ScanNewPackets
 +      completed++;
 +    } else {
@@ -231,66 +191,15 @@
 +    }
 +  }
 +  if (completed > 0) {
-+    if (bounce_debug())
-+      fprintf(stderr, "[COMP] completed=%zu remaining=%zu\n",
-+              completed, pending_completions_.size() - completed);
 +    pending_completions_.erase(pending_completions_.begin(),
 +                               pending_completions_.begin() + completed);
 +  }
 +}
 +
 +void AqlQueue::ProcessAllBounceBuffers() {
-+  bool any_completed = false;
 +  ScopedAcquire<KernelMutex> lock(&bounce_list_lock_);
 +  for (AqlQueue* q : bounce_queues_) {
-+    size_t before = q->pending_completions_.size();
 +    q->ProcessCompletions();
-+    if (q->pending_completions_.size() < before) any_completed = true;
-+  }
-+  // When a signal was decremented, kick stalled queues with a NOP barrier.
-+  // With SLOT_BASED_WPTR=0, the CP goes idle after an unsatisfied barrier
-+  // dep.  Writing a NOP barrier at the next slot and ringing the doorbell
-+  // with a HIGHER WPTR value forces DOORBELL_HIT, waking the CP.  The CP
-+  // re-evaluates its stalled barrier (dep is now 0) and proceeds.
-+  for (AqlQueue* q : bounce_queues_) {
-+    if (q->pending_completions_.empty()) continue;
-+    uint64_t wid = atomic::Load(&q->amd_queue_.write_dispatch_id,
-+                                std::memory_order_relaxed);
-+    uint64_t rid = atomic::Load(&q->amd_queue_.read_dispatch_id,
-+                                std::memory_order_relaxed);
-+    if (wid <= rid) continue;  // fully drained
-+    // Only kick once per stall.  When RPTR changes, reset the flag.
-+    // When RPTR is frozen AND we haven't kicked yet, kick once.
-+    if (q->last_rptr_dwords_ != q->kick_rptr_) {
-+      // RPTR changed — CP is alive, update baseline, clear kicked flag
-+      q->kick_rptr_ = q->last_rptr_dwords_;
-+      q->kick_count_ = 0;
-+      continue;
-+    }
-+    if (q->kick_count_ >= 10) continue;  // limit 2 kicks per stall
-+    q->kick_count_++;
-+    // CAS to atomically claim slot wid.  If CLR already incremented
-+    // write_dispatch_id (another thread submitted), CAS fails and we
-+    // skip the kick — CLR's doorbell will wake the CP instead.
-+    // CAS(ptr, new_val, expected) — returns old value. Success if old == expected.
-+    uint64_t old = atomic::Cas(&q->amd_queue_.write_dispatch_id,
-+                               wid + 1, wid, std::memory_order_acq_rel);
-+    if (old != wid) continue;  // CLR already incremented — skip kick
-+    // We now own slot wid.  Write NOP barrier.
-+    uint32_t slot = static_cast<uint32_t>(wid & (q->amd_queue_.hsa_queue.size - 1));
-+    hsa_barrier_and_packet_t* nop = reinterpret_cast<hsa_barrier_and_packet_t*>(
-+        static_cast<char*>(q->amd_queue_.hsa_queue.base_address) + slot * 64);
-+    memset(nop, 0, sizeof(*nop));
-+    __atomic_store_n(reinterpret_cast<uint16_t*>(nop),
-+                     uint16_t(HSA_PACKET_TYPE_BARRIER_AND << HSA_PACKET_HEADER_TYPE),
-+                     __ATOMIC_RELEASE);
-+    q->last_scanned_idx_ = wid + 1;
-+    _mm_sfence();
-+    uint32_t wptr_mask = (q->amd_queue_.hsa_queue.size * 16) - 1;
-+    uint32_t wptr_dw = static_cast<uint32_t>((wid + 1) * 16) & wptr_mask;
-+    if (q->legacy_doorbell_) {
-+      *(volatile uint32_t*)(q->signal_.hardware_doorbell_ptr) = wptr_dw;
-+    }
 +  }
 +}
 +

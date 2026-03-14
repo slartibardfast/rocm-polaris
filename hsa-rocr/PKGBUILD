@@ -40,6 +40,60 @@ prepare() {
   patch -Np1 -i "$srcdir/0003-use-32bit-doorbell-write-for-gfx8.patch"
   patch -Np1 -i "$srcdir/0004-rptr-bounce-buffer-for-no-atomics-platforms.patch"
   patch -Np1 -i "$srcdir/0005-flush-cpu-cache-after-gpu-writes-to-system-memory.patch"
+
+  # SLOT_BASED_WPTR=2 support: allocate GPU-visible WPTR poll buffer
+  # and write AQL dispatch count (not dword offset) for CP polling.
+  local _aql=runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+  local _hdr=runtime/hsa-runtime/core/inc/amd_aql_queue.h
+
+  # Add wptr_gpu_buf_ member after rptr_gpu_buf_ in header
+  sed -i '/uint64_t\* rptr_gpu_buf_;/a\
+  uint64_t* wptr_gpu_buf_;  \/\/ GPU-visible WPTR poll buffer for SLOT_BASED_WPTR=2' "$_hdr"
+
+  # Init wptr_gpu_buf_ = nullptr in constructor init list
+  sed -i 's/rptr_gpu_buf_(nullptr),/rptr_gpu_buf_(nullptr),\n      wptr_gpu_buf_(nullptr),/' "$_aql"
+
+  # Allocate wptr_gpu_buf_ after rptr_gpu_buf_ (inside if(no_atomics_) block)
+  cat > /tmp/_wptr_alloc.c << 'INJECT'
+    wptr_gpu_buf_ = static_cast<uint64_t*>(
+        agent_->system_allocator()(0x1000, 0x1000, 0));
+    if (wptr_gpu_buf_ == nullptr)
+      throw AMD::hsa_exception(HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+                               "WPTR GPU buffer allocation failed.\n");
+    *wptr_gpu_buf_ = 0;
+INJECT
+  sed -i '/\*rptr_gpu_buf_ = 0;/r /tmp/_wptr_alloc.c' "$_aql"
+
+  # Route Queue_write_ptr_aql through wptr_gpu_buf_ when available
+  sed -i 's|queue_rsrc.Queue_write_ptr_aql = (uint64_t\*)&amd_queue_.write_dispatch_id;|queue_rsrc.Queue_write_ptr_aql = wptr_gpu_buf_ ? wptr_gpu_buf_ : (uint64_t*)\&amd_queue_.write_dispatch_id;|' "$_aql"
+
+  # In StoreRelaxed no_atomics path: write dispatch count to poll buffer + doorbell
+  # Replace the single doorbell write with: poll buffer write + doorbell notification
+  cat > /tmp/_wptr_store.c << 'INJECT'
+        if (wptr_gpu_buf_) {
+          // SLOT_BASED_WPTR=2: write AQL dispatch count to GPU-visible poll
+          // buffer.  CP firmware applies wptr_shift=4 to convert to dwords.
+          // Doorbell is notification only — any value wakes the CP.
+          atomic::Store(wptr_gpu_buf_, uint64_t(value + 1), std::memory_order_release);
+          *(volatile uint32_t*)(signal_.hardware_doorbell_ptr) = uint32_t(value);
+        } else {
+          // SLOT_BASED_WPTR=0 fallback: doorbell IS the WPTR (dword offset)
+          *(volatile uint32_t*)(signal_.hardware_doorbell_ptr) = wptr_dwords;
+        }
+INJECT
+  sed -i '/\*(volatile uint32_t\*)(signal_.hardware_doorbell_ptr) = wptr_dwords;/{
+    r /tmp/_wptr_store.c
+    d
+  }' "$_aql"
+
+  # Free wptr_gpu_buf_ in destructor (after rptr_gpu_buf_ free)
+  cat > /tmp/_wptr_free.c << 'INJECT'
+    if (wptr_gpu_buf_) {
+      agent_->system_deallocator()(wptr_gpu_buf_);
+      wptr_gpu_buf_ = nullptr;
+    }
+INJECT
+  sed -i '/rptr_gpu_buf_ = nullptr;/r /tmp/_wptr_free.c' "$_aql"
 }
 
 build() {
