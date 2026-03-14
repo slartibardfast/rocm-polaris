@@ -968,9 +968,13 @@ Replace raw `atomic::Sub` with `core::Signal::Convert(entry.signal)->SubRelaxed(
 
 **Recommendation:** Fix Bug A first (root cause). Then apply Option 1 as defense-in-depth for Bug B.
 
-### Bug A root cause confirmed — GPU L2 caches signal reads (2026-03-13)
+### Bug A root cause confirmed — CP idle stall with SLOT_BASED_WPTR=0 (2026-03-14)
 
-**Root cause:** CLR's `rocrCopyBuffer` creates AQL barrier-AND packets whose `dep_signal` fields point to previous operations' completion signals. The GPU CP hardware evaluates these barriers by reading signal values from memory. On gfx8 without ATC, even though signals are allocated from the fine-grain system pool (`system_regions_fine_`), the GPU page table MTYPE for system memory may be NC (non-coherent). GPU L2 caches the signal read at value=1 (pre-decrement). Our bounce buffer decrements from CPU (SubRelaxed + clflush → DRAM), but GPU L2 never re-reads — the CP sees a stale value=1 forever and the barrier never resolves.
+**Root cause (revised):** ~~GPU L2 caching~~ DISPROVEN — signals are coherent (fine-grain pool, `KFD_IOC_ALLOC_MEM_FLAGS_COHERENT`). 14/14 barrier tests pass.
+
+**Actual root cause:** With `SLOT_BASED_WPTR=0` (direct doorbell), the CP goes idle after evaluating an AQL barrier whose dep_signal != 0. The CP only wakes on a doorbell with a HIGHER WPTR value. Same-WPTR re-ring doesn't generate `DOORBELL_HIT`. When the bounce buffer later decrements the dep signal from CPU, the CP never re-evaluates because it's idle.
+
+Doorbell kick with WPTR+1 moved the hang from op 4 to op 10 (proved CP wakeup works) but corrupts queue state (can't inject packets behind CLR's back).
 
 **Evidence:**
 - Uniform 2MB x100 works (no inter-call barriers — each hipMemcpy is synchronous, bounced buffer drains signal between calls)
@@ -980,23 +984,15 @@ Replace raw `atomic::Sub` with `core::Signal::Convert(entry.signal)->SubRelaxed(
 
 **Bug B (signal use-after-free): FIXED** with Retain/Release in patch 0004 (pkgrel 9).
 
-### Proposed fix — allocate signals from GPU-visible coherent memory
+### Fix: SLOT_BASED_WPTR=2 with GPU-visible poll address (2026-03-14)
 
-**Approach:** Change signal pool allocation to use memory that is coherent from the GPU's perspective. Two sub-options:
+Revert to `SLOT_BASED_WPTR=2` (memory polling) for the no-atomics path. The original Phase 3b failure with WPTR polling was because the poll address (`&amd_queue_.write_dispatch_id`) was a CPU heap VA unreachable by the GPU. Fix: allocate `wptr_gpu_buf_` from kernarg pool (system_allocator), same as `rptr_gpu_buf_`. Set `Queue_write_ptr_aql` to it. The CP continuously polls this GPU-visible address, so it naturally re-evaluates stalled barriers.
 
-**Option A: Use `AllocateCoherent` flag for signal pool** (preferred)
+**Changes:**
+- Kernel 0008: add `SLOT_BASED_WPTR=2` to no-atomics else branch (keep `NO_UPDATE_RPTR=0` + `RPTR_BLOCK_SIZE=4`)
+- ROCR PKGBUILD: sed-inject `wptr_gpu_buf_` allocation, Queue_write_ptr_aql routing, and StoreRelaxed write to poll buffer + doorbell notification
 
-Change the `system_allocator_` in `runtime.cpp:215` to use `MemoryRegion::AllocateCoherent` flag instead of (or in addition to) `AllocateNonPaged`. This tells the thunk to set `KFD_IOC_ALLOC_MEM_FLAGS_COHERENT`, which makes KFD map the memory with MTYPE=CC in GPU page tables. GPU L2 always re-reads from DRAM for CC pages.
-
-Scope: ~5 lines in `runtime.cpp`. Conditional on `NoPlatformAtomics()` to avoid affecting coherent platforms.
-
-Risk: Signals become uncacheable in GPU L2. This is fine — signals are small (64 bytes each) and infrequently read by the GPU. On coherent platforms with ATC, signals are already effectively uncacheable (CPU cache snooped). On no-atomics platforms, this trades GPU L2 hit rate for correctness.
-
-**Option B: Allocate a separate signal pool from kernarg memory**
-
-Kernarg memory is already mapped as UC/CC for GPU access (verified working — our `rptr_gpu_buf_` is in kernarg pool and GPU reads it correctly). Allocate signals from kernarg pool instead of regular system memory.
-
-Scope: Larger change — need a separate allocator for no-atomics platforms.
+**Why this fixes the hang:** With WPTR=2, the CP continuously polls the WPTR address (every few hundred cycles). When we write the wptr dword value, the CP sees it and re-reads the ring buffer, re-evaluating any stalled barriers. No doorbell needed for wakeup.
 
 **Recommendation: Option A** — minimal change, leverages existing KFD coherency infrastructure.
 
