@@ -48,7 +48,16 @@
  namespace amd::roc {
  DmaBlitManager::DmaBlitManager(VirtualGPU& gpu, Setup setup)
      : HostBlitManager(gpu, setup),
-@@ -742,6 +746,16 @@
+@@ -735,2 +739,8 @@
+       }
++      // On no-atomics platforms, wait for each H2D staging chunk before the
++      // next iteration.  The CP cannot resolve cross-chunk AQL barrier deps
++      // because it goes idle after an unsatisfied dep with SLOT_BASED_WPTR=0.
++      // Matches the D2H path which already waits per chunk (line 744).
++      if (!dev().info().pcie_atomics_)
++        gpu().Barriers().WaitCurrent();
+     } else {  // D2H Path
+@@ -742,6 +751,16 @@
          if (outBuffer.pinnedMem_ == nullptr) {
            // Wait for current signal of previous rocr copy if its not pinned mem
            gpu().Barriers().WaitCurrent();
@@ -65,7 +74,7 @@
            ClPrint(amd::LOG_DETAIL_DEBUG, amd::LOG_COPY, "memcpy host dst=%p, stg buf=%p, size=%zu",
                    hostDst + copyOffset, stagingBuffer, copysize);
            memcpy(hostDst + copyOffset, stagingBuffer, copysize);
-@@ -765,6 +779,16 @@
+@@ -765,6 +784,16 @@
    // direct HSA signal check HIP avoids the command completion wait
    if (amd::IS_HIP && (gpu().command() != nullptr) && gpu().command()->IsMemoryPinned()) {
      gpu().Barriers().WaitCurrent();
