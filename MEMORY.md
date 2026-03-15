@@ -88,3 +88,11 @@ Append-only. Do not delete or rewrite old entries.
 - PCIe ordering guarantees: MSI delivery means all prior writes visible — signal value is moot if we decrement from CPU after interrupt
 - NEW APPROACH: re-enable interrupts, use interrupt as trigger for bounce buffer signal decrement
 - This eliminates NOP kicks, barrier workarounds, and the entire stacked workaround problem
+
+## 2026-03-15: NOP kick masks GPU page fault — the REAL bug
+- Removing NOP kick from 0004 causes GPU memory access fault (Page not present) at stress op ~12
+- D2H 13/13 works, HSA dispatch works — the fault is in mixed-size H2D staging path
+- The NOP kick was masking TWO bugs: CP idle stall (fixed by interrupts) AND this GPU page fault
+- The page fault is likely a use-after-free: the Retain/Release bounce buffer frees a signal whose memory the GPU still references
+- This is the root cause of the earlier "clean 0004 segfaults" finding — it was a GPU fault, not a CPU crash
+- MUST investigate the signal lifecycle in the bounce buffer before proceeding
