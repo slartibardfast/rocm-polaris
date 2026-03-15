@@ -65,22 +65,11 @@ INJECT
   }' "$_blit"
 
   # Phase 6c: Re-enable interrupt-based signal wait.
-  # The CP's event_mailbox_ptr write + s_sendmsg interrupt are regular
-  # PCIe operations (NOT AtomicOps) that work on Westmere.  Our patch
-  # 0004 incorrectly disabled interrupts.  Re-enable them so the CP's
-  # EOP interrupt wakes hsaKmtWaitOnEvent, then the bounce buffer
-  # decrements the signal value from CPU.
   local _rt=runtime/hsa-runtime/core/runtime/runtime.cpp
   sed -i '/g_use_interrupt_wait = false;/d' "$_rt"
-
-  # Add ProcessAllBounceBuffers() to InterruptSignal::WaitRelaxed.
-  # When the interrupt wakes us from hsaKmtWaitOnEvent, we need to
-  # run the bounce buffer to decrement the signal (the GPU couldn't).
   local _isig=runtime/hsa-runtime/core/runtime/interrupt_signal.cpp
   sed -i '/#include "core\/inc\/interrupt_signal.h"/a\
 #include "core/inc/amd_aql_queue.h"' "$_isig"
-  # Insert bounce buffer call AFTER value read, then RE-READ value.
-  # The bounce buffer may decrement the signal, so we must re-read.
   sed -i 's|int64_t value = atomic::Load(\&signal_.value, std::memory_order_relaxed);|int64_t value = atomic::Load(\&signal_.value, std::memory_order_relaxed);\
     AMD::AqlQueue::ProcessAllBounceBuffers();\
     value = atomic::Load(\&signal_.value, std::memory_order_relaxed);|' "$_isig"
