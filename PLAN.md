@@ -1088,24 +1088,105 @@ Fail: Crash or premature free
 
 **CLR WaitCurrent drain CAUSED REGRESSION.** Adding `WaitCurrent()` at the end of `hsaCopyStagedOrPinned` for H2D made uniform 2MB transfers hang at op 4 (down from 93 without it). Reverted.
 
-### Revised root cause analysis — bounce buffer RPTR tracking
+### Root cause confirmed: CP idle stall with SLOT_BASED_WPTR=0 (2026-03-15)
 
-The hang is NOT about barrier packet resolution. It's about the bounce buffer's `UpdateReadDispatchId()` losing sync with the CP's actual packet processing. The RPTR-based dispatch ID conversion works for uniform transfers but drifts during mixed-size patterns.
+**The CP goes idle after processing AQL packets and evaluating an unsatisfied barrier dep.** With `SLOT_BASED_WPTR=0`, the doorbell value IS the WPTR. Re-ringing with the same WPTR value does NOT generate `DOORBELL_HIT`. The CP never re-evaluates the barrier, even after the bounce buffer decrements the dep signal from CPU.
 
-**Current state:** ROCR 7.2.0-9 (Retain/Release + clflush) + CLR 7.2.0-1 (fine-grain staging + D2H clflush):
-- Uniform 2MB x100: hangs at ~93 (was ~100 before, minor regression from Retain/Release overhead)
-- Mixed 512B+2MB: hangs at op ~14 (was ~5 before ROCR fixes, significant improvement)
-- D2H sweep 13/13 x3: all pass
-- Barrier test: PASS
+**Evidence:**
+- 14/14 barrier tests PASS (same-queue, cross-queue, delays, sub+clflush — hardware is correct)
+- STALL logging: Queue C RPTR frozen at 32 dwords for 3.5M iterations while dep signal is 0
+- Doorbell kick with WPTR+1: moved hang from op 4 → op 10 (proved CP wake mechanism)
+- NOP barrier injection: 100/100 alternating 512B+2MB, but drifts at ~286 ops
 
-**Hypotheses for RPTR drift:**
-1. The blit kernel submits MULTIPLE packets per transfer (dispatch + optional barrier). The bounce buffer counts all packets but RPTR advancement and `read_dispatch_id` may not match when packet patterns change.
-2. CLR's Barriers system creates internal barrier packets that our ScanNewPackets sees. These barrier packets have `completion_signal=0` → bounce buffer skips them. But they still consume dispatch IDs. If RPTR reports completion but the bounce buffer hasn't processed the corresponding signal, `read_dispatch_id` advances past signaled packets → CLR's queue space check passes prematurely → queue overflows.
-3. The blit kernel for 2MB (2 staging chunks) goes through a different code path in CLR Barriers than 512B (1 chunk). The Barriers state machine may reuse or recycle signals differently, causing the bounce buffer's saved signal handles to become stale.
+**SLOT_BASED_WPTR=2 dead:** CP cannot GPUVM-read poll address on gfx8 without ATC/UTCL2. Tested with kernarg pool (GPU-visible) address — CP_HQD_PQ_WPTR stays at 0. RPTR writes work (PCIe posted writes, GPU→system) but WPTR reads fail (require GPUVM VA translation).
 
-### Next steps
+### Current workaround stack (2026-03-15)
 
-1. Instrument `ScanNewPackets` and `UpdateReadDispatchId` to log packet types, signal handles, RPTR values, and dispatch IDs — find where the drift occurs
-2. Count AQL packets per hipMemcpy call at each size
-3. Verify `pending_completions_` vector state before and after the hang
-4. Consider: is the bounce buffer's FIFO assumption (break on first incomplete) violated by mixed-size patterns?
+| Layer | Fix | What it does | Coverage |
+|-------|-----|-------------|----------|
+| Kernel 0008 | RPTR_BLOCK_SIZE=4 | Per-packet RPTR writes | All queues |
+| ROCR 0003 | SpinMutex + mfence + atomic::Add | Thread-safe UpdateReadDispatchId | All queues |
+| ROCR 0004 | Retain/Release on bounce signals | Prevents signal use-after-free | All queues |
+| ROCR 0004 | NOP barrier kick (2 per stall) | Wakes idle CP on stalled queues | ~286 ops before drift |
+| CLR 0001 | Fine-grain staging (kAtomics) | GPU L2 flushed for D2H | D2H path |
+| CLR 0001 | clflush on staging/pinned buffers | CPU cache coherency for D2H | D2H path |
+| CLR 0001 | WaitCurrent between H2D chunks | Eliminates inter-chunk barrier deps | H2D staging |
+| CLR PKGBUILD | cpu_wait_for_signal for no-atomics | CPU-side waits in WaitingSignal() | CLR inter-op deps |
+
+**Test results with full stack:**
+- D2H sweep: 13/13 x3 PASS
+- H2D stress (550 ops): PASS
+- Mixed kernel+memcpy (200 ops): PASS
+- GPU compute (500 sync + 1000 async): PASS
+- llama.cpp model loading: COMPLETES
+- Long stress (llama pattern, 550 ops): 286/550 before NOP drift hang
+- llama.cpp inference: HANGS (needs 500+ ops without drift)
+
+## Future Work
+
+### Phase 6a: Eliminate ROCR-level AQL barriers (NEXT — final blocker)
+
+**Goal:** Remove the last source of AQL barrier packets on no-atomics platforms.
+
+**Problem:** `BlitKernel::SubmitLinearCopyCommand` in ROCR creates AQL barrier-AND packets from `dep_signals` passed by CLR. These barriers stall the CP. CLR's `cpu_wait_for_signal` prevents CLR from creating NEW deps, but the dep_signals ROCR receives from `hsa_amd_memory_async_copy()` still get turned into barriers.
+
+**Approach:** In `SubmitLinearCopyCommand`, when the agent has `NoPlatformAtomics()`, CPU-wait on `dep_signals` before the dispatch instead of creating AQL barrier packets. This makes every blit operation fully serialized from CPU, eliminating all barrier deps.
+
+**Patch location:** `amd_blit_kernel.cpp` lines 647-715 (SubmitLinearCopyCommand)
+
+**Changes:**
+```cpp
+// At the start of SubmitLinearCopyCommand:
+if (queue_->GetAgent()->NoPlatformAtomics()) {
+  // CPU-wait for all dep signals instead of creating barrier packets
+  for (auto* sig : dep_signals) {
+    while (sig->LoadRelaxed() > 0) os::YieldThread();
+  }
+  dep_signals.clear();  // no barrier packets needed
+}
+// ... rest of function creates 0 barrier packets (dep_signals is empty)
+```
+
+**Risk:** Low. This is the same approach CLR's `cpu_wait_for_signal` uses. The dep_signals are completion signals from previous operations — CPU-waiting on them is correct and doesn't change ordering semantics.
+
+**Expected result:** Eliminates ALL NOP kicks (no more barrier stalls = no kicks needed). Infinite operation count. llama.cpp inference should work.
+
+### Phase 6b: Remove NOP kick code
+
+After Phase 6a, the NOP barrier kick in ROCR 0004 becomes unnecessary. Remove it to simplify the code and eliminate the `write_dispatch_id` drift risk.
+
+### Phase 7: llama.cpp GPU inference optimization
+
+Once inference works, measure performance:
+- Token generation rate (t/s) vs CPU-only baseline (13.3 t/s)
+- VRAM usage with different `-ngl` values (2GB limit)
+- Optimal context size for the 2GB card
+- Compare Q4_K_M vs Q5_0 quantizations
+
+### Phase 8: Upstream preparation
+
+- Clean up patches: remove debug logging, consolidate PKGBUILD sed injections into proper patches
+- Write rocrtst-idiomatic tests (SignalCpuWriteGpuBarrier, MixedSizeH2DStress, etc.)
+- Document the no-atomics platform support story for upstream consideration
+- Consider submitting kernel patches to LKML (kfd_mqd_manager_vi.c changes are clean and well-documented)
+
+### Phase 9: Additional ROCm components (stretch)
+
+- rocFFT, hipBLAS, MIOpen — evaluate if needed for micro-LLM inference
+- hipSPARSE — might help with sparse attention patterns
+- ROCm SMI monitoring — temperature/power tracking for the WX 2100
+
+## Decisions Log (continued)
+
+| Date | Decision | Rationale |
+|------|----------|-----------|
+| 2026-03-13 | SpinMutex + mfence in UpdateReadDispatchId | Race condition between concurrent callers; mfence ensures clflush ordering on Intel |
+| 2026-03-13 | RPTR_BLOCK_SIZE 5→4 for no-atomics | Per-packet RPTR writes needed for bounce buffer completion tracking |
+| 2026-03-13 | Retain/Release on bounce buffer signals | Prevents AsyncEventsLoop crash on freed signals (use-after-free) |
+| 2026-03-14 | GPU L2 signal caching theory DISPROVEN | 14/14 barrier tests pass; signals are coherent (fine-grain pool, COHERENT flag) |
+| 2026-03-14 | CP idle stall root cause confirmed | STALL logging: RPTR frozen 3.5M iterations; doorbell kick with WPTR+1 wakes CP |
+| 2026-03-14 | SLOT_BASED_WPTR=2 dead on gfx8 | CP can't GPUVM-read poll address without ATC/UTCL2; tested with kernarg pool |
+| 2026-03-14 | NOP barrier kick as temporary workaround | Wakes idle CP, passes 100/100 mixed H2D, drifts at ~286 ops |
+| 2026-03-15 | WaitCurrent between H2D staging chunks | Eliminates inter-chunk barrier deps; mirrors D2H path behavior |
+| 2026-03-15 | cpu_wait_for_signal for no-atomics in CLR | Force CPU-side waits in WaitingSignal(); eliminates CLR-level barrier deps |
+| 2026-03-15 | Combined NOP + cpu_wait: 286 ops stable | NOP handles CP wake, cpu_wait prevents CLR barriers; drift remains from ROCR barriers |
