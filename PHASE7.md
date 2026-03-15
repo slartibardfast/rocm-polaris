@@ -1,6 +1,6 @@
 # Phase 7: llama.cpp GPU Inference
 
-## Status: NOT STARTED
+## Status: IN PROGRESS — H2 confirmed (inference hangs during exit cleanup)
 
 ## Prerequisite
 
