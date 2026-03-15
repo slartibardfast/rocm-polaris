@@ -96,3 +96,18 @@ Append-only. Do not delete or rewrite old entries.
 - The page fault is likely a use-after-free: the Retain/Release bounce buffer frees a signal whose memory the GPU still references
 - This is the root cause of the earlier "clean 0004 segfaults" finding — it was a GPU fault, not a CPU crash
 - MUST investigate the signal lifecycle in the bounce buffer before proceeding
+
+## 2026-03-15: GPU page fault is from GPU RESET, not signal memory
+- Faulting address 0x4101e38000 is VRAM at offset 30.2MB — the hipMalloc'd device buffer
+- Fault type: Page not present from TC (texture cache) shader reads
+- Root cause: CP idle stall → GPU job timeout → GPU reset → page tables torn down → in-flight shaders fault
+- Signal pool memory is NEVER unmapped — freed signals go to free_list for reuse
+- The Retain/Release hypothesis was WRONG — the page fault has nothing to do with signal lifecycle
+
+## 2026-03-15: CP idle stall happens after EVERY packet, not just barriers
+- With SLOT_BASED_WPTR=0, the CP goes idle when the next packet header is INVALID (not yet written)
+- Doorbell with same WPTR value doesn't generate DOORBELL_HIT to wake the CP
+- This is NOT about barrier deps — it's about the CP sleeping between ANY two consecutive dispatches
+- The NOP kick worked by always providing a higher WPTR value
+- The interrupt path helps for SIGNAL COMPLETION but doesn't prevent the CP idle stall between packets
+- Need to ensure every doorbell uses a MONOTONICALLY INCREASING wptr value
