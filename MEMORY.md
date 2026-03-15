@@ -79,3 +79,12 @@ Append-only. Do not delete or rewrite old entries.
 - User feedback: we've been chasing symptoms, not understanding the system.
 - Must map the full signal lifecycle (creation → AQL packet → CP dispatch → AtomicDec → bounce buffer → Release) before fixing further.
 - The right fix is at ONE layer, not stacked workarounds across 3 layers.
+
+## 2026-03-15: BREAKTHROUGH — Interrupt path works without PCIe atomics
+- The CP writes event_id to event_mailbox_ptr (regular PCIe MWr) and sends s_sendmsg interrupt
+- These are NOT PCIe AtomicOps — they work on Westmere
+- Our patch 0004 set g_use_interrupt_wait=false based on WRONG assumption that mailbox writes fail
+- The SDMA no-atomics path (amd_blit_sdma.cpp:548-579) proves the pattern: fence write + mailbox + trap
+- PCIe ordering guarantees: MSI delivery means all prior writes visible — signal value is moot if we decrement from CPU after interrupt
+- NEW APPROACH: re-enable interrupts, use interrupt as trigger for bounce buffer signal decrement
+- This eliminates NOP kicks, barrier workarounds, and the entire stacked workaround problem
