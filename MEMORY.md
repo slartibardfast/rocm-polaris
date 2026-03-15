@@ -111,3 +111,12 @@ Append-only. Do not delete or rewrite old entries.
 - The NOP kick worked by always providing a higher WPTR value
 - The interrupt path helps for SIGNAL COMPLETION but doesn't prevent the CP idle stall between packets
 - Need to ensure every doorbell uses a MONOTONICALLY INCREASING wptr value
+
+## 2026-03-15: Zero barrier packets but still crashes — GPU state degraded
+- With all Phase 6 injections, ZERO barrier packets (type=3) are created
+- Stress test still crashes at op ~12 with GPU memory fault
+- 65 GPU resets accumulated since boot from earlier crash investigations
+- GPU may be in degraded state — need clean reboot to test properly
+- The doorbell audit confirms values ARE monotonically increasing for consecutive submissions
+- The CP idle stall after barrier deps was the issue, but barriers are now eliminated
+- The current crash may be GPU instability from accumulated resets, not a software bug
