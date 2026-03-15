@@ -30,6 +30,14 @@ options=(!lto)
 prepare() {
   cd "$_dirname/projects/clr"
   patch -Np1 -i "$srcdir/0001-use-fine-grain-staging-and-flush-cpu-cache-for-d2h.patch"
+
+  # Force CPU-side signal waits on no-atomics platforms.
+  # Disables GPU-side AQL barrier deps that stall the CP.
+  sed -i '/if (settings.cpu_wait_for_signal_) {/i\
+      if (!gpu_.dev().info().pcie_atomics_) {\
+        CpuWaitForSignal(external_signals_[i]);\
+        continue;\
+      }' rocclr/device/rocm/rocvirtual.cpp
 }
 
 build() {

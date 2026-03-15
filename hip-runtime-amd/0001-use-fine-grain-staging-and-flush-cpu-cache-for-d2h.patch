@@ -17,6 +17,11 @@
 # snoop the CPU cache hierarchy.  Conditional on !pcie_atomics_ so
 # coherent platforms pay no overhead.
 #
+# Fix 3: Force cpu_wait_for_signal_ on no-atomics platforms. This makes
+# CLR wait from CPU between operations instead of creating AQL barrier
+# packets for inter-op dependencies. The gfx8 CP goes idle after an
+# unsatisfied barrier dep with SLOT_BASED_WPTR=0, causing hangs.
+#
 # Signed-off-by: David Connolly <david@connol.ly>
 
 --- a/rocclr/device/rocm/rocvirtual.cpp
