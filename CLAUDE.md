@@ -59,12 +59,20 @@ rocm-gfx80x/
 - **Test-first when possible.** Write the verification command before writing the fix.
 - When debugging, form a hypothesis, design a test that can disprove it, run the test, then act on the result. Don't skip straight to a fix based on speculation.
 
-### Document Before You Work (MUST)
-Before any decision or body of work that changes design, architecture, or approach:
-1. Update the relevant `PLAN.md` or `PHASE[N].md` to record the decision and rationale
-2. Commit and push those docs before writing code
+### Audited PLAN.md and PHASEx.md (MUST)
+All changes to `PLAN.md` and `PHASEx.md` files MUST be committed immediately.
+- Every edit to `PLAN.md` or any `PHASEx.md` triggers a git commit. Do not batch with code changes.
+- After completing a plan step in code, update the relevant plan file to reflect what was actually implemented, then commit as a separate commit.
+- `PLAN.md` and `PHASEx.md` files live in the top-level repository. Never inside submodules.
+- Before any decision that changes design, architecture, or approach: update the plan FIRST, commit it, THEN write code. The record reflects intent, not reconstruction.
 
-This ensures the record reflects intent, not reconstruction. Skip only for trivial fixes with no design content.
+### Maintain MEMORY.md
+`MEMORY.md` is an append-only persistent scratchpad recording key decisions, discovered constraints, and lessons learned.
+- After completing a significant task, resolving a non-obvious bug, or discovering an unexpected constraint, add a short entry.
+- Update `MEMORY.md` in a separate commit. Do not bundle with code changes.
+- Write entries as you go — don't wait until end of session. If unsure whether to record something, record it.
+- Do not delete or rewrite old entries. If an earlier entry is wrong, add a new entry correcting it.
+- Reading `MEMORY.md` should be enough to avoid repeating past mistakes when starting a new session.
 
 ## Core Technical Rules
 
