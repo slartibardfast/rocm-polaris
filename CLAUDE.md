@@ -34,11 +34,15 @@ rocm-gfx80x/
 - State assumptions explicitly. If uncertain, ask.
 - If multiple interpretations exist, present them — don't pick silently.
 - If a simpler approach exists, say so. Push back when warranted.
+- **Stop when confused.** Don't generate plausible-sounding code to mask uncertainty. Request clarification.
+- When a theory is disproven by evidence, say so immediately and pivot. Don't defend dead hypotheses.
 
 ### Simplicity First
 - No features beyond what was asked. No abstractions for single-use code.
 - No speculative "flexibility" or error handling for impossible scenarios.
 - If 200 lines could be 50, rewrite it.
+- **Three similar lines are better than a premature abstraction.** Don't create helpers for one-time use.
+- Don't design for hypothetical future requirements.
 
 ### Surgical Changes
 - Don't "improve" adjacent code, comments, or formatting.
@@ -46,10 +50,14 @@ rocm-gfx80x/
 - Remove imports/variables that YOUR changes made unused, but don't touch pre-existing dead code.
 - Every changed line should trace directly to the user's request.
 - **When reviewing, only flag issues in OUR code. Never fix, reorder, or restyle pre-existing upstream code — even if it violates conventions. Our patches must be minimal diffs against upstream.**
+- Don't add docstrings, comments, or type annotations to code you didn't change.
+- Don't add backwards-compatibility shims, `// removed` comments, or renamed `_unused` vars. If something is unused, delete it completely.
 
 ### Goal-Driven Execution
 - Transform tasks into verifiable goals with success criteria.
 - For multi-step tasks, state a brief plan with verification steps.
+- **Test-first when possible.** Write the verification command before writing the fix.
+- When debugging, form a hypothesis, design a test that can disprove it, run the test, then act on the result. Don't skip straight to a fix based on speculation.
 
 ### Document Before You Work (MUST)
 Before any decision or body of work that changes design, architecture, or approach:
