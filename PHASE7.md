@@ -27,35 +27,55 @@ llama.cpp with `-ngl 1` (1 GPU layer) loads the model successfully but hangs dur
 
 The ggml-hip library has a static destructor that calls into CLR during process exit. CLR's lazy initialization (via `pthread_once`) tries to perform a GPU operation, which gets stuck in a yield loop.
 
+## Hypotheses
+
+**H1: Inference never starts.** The model loads (blit queue works), but the first compute dispatch triggers CLR lazy init for the compute queue, which gets stuck. The `__cxa_finalize` + `pthread_once` in the backtrace is CLR's lazy init, not process exit.
+
+**H2: Inference runs but hangs.** The model loads, inference starts, but a GPU kernel completion signal doesn't get decremented (bounce buffer issue on the compute queue).
+
+**H3: Inference completes, exit hangs.** Everything works, but ggml-hip's static destructor triggers a stuck CLR operation during cleanup.
+
+**H1 is most likely** because: (a) no tokens appear in output, (b) CPU is at 100% in a yield loop (not 0% as a signal wait would show), (c) `pthread_once` is a one-time init guard.
+
 ## Investigation Plan
 
-### Step 1: Determine if inference actually runs
+### Step 1: Confirm which hypothesis (5 min)
 
-The CPU-only test showed the interactive prompt appeared. With `-ngl 1`, the model loads (spinner completes) but no tokens are generated. Question: does inference START before the hang, or does the hang happen BEFORE inference?
+Run llama.cpp in background, write output to file, sample GDB at 10s and 30s. If the backtrace changes between samples → inference is progressing. If identical → stuck at same point.
 
-**Test:** Use `-v` (verbose) to see timing messages. Use `AMD_LOG_LEVEL=3` for CLR-level tracing. Redirect output to file to avoid pipe blocking.
+Also check: does `hipDeviceSynchronize` work standalone after model load? Write a tiny HIP program that does `hipMalloc + hipMemcpy + kernel + hipDeviceSynchronize` with the same ROCR/CLR stack.
 
-### Step 2: Identify the ggml-hip static destructor
+### Step 2: Decode the CLR yield loop (10 min)
 
-**Test:** `nm -DC /usr/lib/libggml-hip.so.0 | grep -i "destructor\|__cxa_atexit\|fini"` to find what's registered.
+Install `hip-runtime-amd-polaris-debug` package. Re-attach GDB with debug symbols to decode the exact CLR function in the yield loop. Distinguish between:
+- `AcquireWriteIndex` (queue full)
+- `WaitCurrent` / signal wait
+- `releaseGpuMemoryFence` (fence wait)
+- Device init / `pthread_once` (first-use init)
 
-### Step 3: Determine if the yield loop is queue-space or signal-wait
+### Step 3: Apply the simplest fix (15 min)
 
-The `sched_yield` in CLR could be:
-- `AcquireWriteIndex` busy-wait (queue full — `write_dispatch_id - read_dispatch_id >= queue_size`)
-- `WaitCurrent` (waiting for signal completion — bounce buffer issue)
-- `releaseGpuMemoryFence` (waiting for GPU fence during cleanup)
+Based on findings:
 
-**Test:** GDB with CLR debug symbols, or decode the libamdhip64 offsets.
+| If | Then | How |
+|----|------|-----|
+| Queue full (H1) | The NOP kick drifted `write_dispatch_id` | Remove NOP kick, rely purely on interrupts |
+| Signal wait (H2) | Bounce buffer not running for compute queue | Verify `InterruptSignal` used for compute signals |
+| Init stuck (H1) | CLR compute queue creation hangs | Check if blit queue's init state blocks compute queue init |
+| Exit cleanup (H3) | ggml-hip destructor calls GPU ops | Patch ggml-hip to skip cleanup, or use `_exit()` |
 
-### Step 4: Fix options
+### Step 4: Verify with token generation (5 min)
+
+After fix, run `llama-cli -ngl 1 -p "2+2=" -n 8` and verify tokens appear. Measure t/s. Compare to CPU baseline (13.3 t/s).
+
+## Fix Options
 
 | Option | Description | Risk |
 |--------|-------------|------|
-| A: Skip GPU cleanup on no-atomics | ggml-hip destructor checks platform, skips GPU calls | Low — cleanup isn't critical if process is exiting |
-| B: Force CLR init before ggml-hip | Ensure CLR is fully initialized during ggml-hip module load | Medium — load order dependencies |
-| C: Fix CLR lazy init to handle exit | Make CLR's pthread_once aware of process exit state | Medium — CLR code change |
-| D: Rebuild llama-cpp-rocm-polaris with fix | Patch ggml-hip or link order | Low — our package, our control |
+| A: Remove NOP kick entirely | With interrupts working, NOP kick may be unnecessary and harmful | Low — all tests passed without NOP kick before the segfault |
+| B: Patch ggml-hip destructor | Skip GPU cleanup on process exit | Low — OS reclaims everything |
+| C: Fix CLR init ordering | Ensure compute queue init doesn't deadlock with blit queue | Medium |
+| D: Add `ProcessAllBounceBuffers` to CLR yield loops | The yield loop doesn't call the bounce buffer | Medium — broad change |
 
 ## Success Criteria
 
