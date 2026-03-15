@@ -120,3 +120,10 @@ Append-only. Do not delete or rewrite old entries.
 - The doorbell audit confirms values ARE monotonically increasing for consecutive submissions
 - The CP idle stall after barrier deps was the issue, but barriers are now eliminated
 - The current crash may be GPU instability from accumulated resets, not a software bug
+
+## 2026-03-15: Post-reboot crash was TEST BUG, not ROCR bug
+- single_2mb.cpp and minimal_crash.cpp used char h[4096] for 2MB hipMemcpy — read past end of buffer
+- The GPU page fault was from reading unmapped host memory (buffer overrun), not signal/CP issues
+- After fixing host buffer size: 550/550 stress test PASSES on clean boot
+- The pre-reboot "GPU degradation" hypothesis was also wrong — just a test bug
+- LESSON: always allocate host buffers >= transfer size. hipMemcpy reads the FULL size from host.

@@ -68,9 +68,11 @@ static void alarm_handler(int) { fprintf(stderr, "\n*** HANG at op %d ***\n", op
 int main() {
     setbuf(stdout, NULL);
     ::signal(SIGALRM, alarm_handler);
-    void* d; HIP_CHECK(hipMalloc(&d, 4*1024*1024));
-    char* h = (char*)malloc(3*1024*1024); memset(h, 0x42, 3*1024*1024);
     size_t sizes[] = {3584, 551936, 78848, 78848, 551936, 3584, 512, 512, 3584, 2996224, 2451456};
+    size_t max_sz = 0;
+    for (size_t s : sizes) if (s > max_sz) max_sz = s;
+    void* d; HIP_CHECK(hipMalloc(&d, max_sz));
+    char* h = (char*)malloc(max_sz); memset(h, 0x42, max_sz);
     int nsizes = sizeof(sizes)/sizeof(sizes[0]);
     for (int round = 0; round < 50; round++) {
         for (int i = 0; i < nsizes; i++) {
