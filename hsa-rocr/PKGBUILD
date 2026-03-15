@@ -40,6 +40,29 @@ prepare() {
   patch -Np1 -i "$srcdir/0003-use-32bit-doorbell-write-for-gfx8.patch"
   patch -Np1 -i "$srcdir/0004-rptr-bounce-buffer-for-no-atomics-platforms.patch"
   patch -Np1 -i "$srcdir/0005-flush-cpu-cache-after-gpu-writes-to-system-memory.patch"
+
+  # Phase 6a: CPU-wait dep_signals in BlitKernel instead of AQL barriers.
+  # On no-atomics platforms, the CP goes idle after an unsatisfied barrier
+  # dep and cannot be woken (SLOT_BASED_WPTR=0, no DOORBELL_HIT for same
+  # WPTR).  CPU-waiting eliminates ALL barrier packets from blit copies.
+  local _blit=runtime/hsa-runtime/core/runtime/amd_blit_kernel.cpp
+  cat > /tmp/_blit_cpuwait.c << 'INJECT'
+  // No-atomics: CPU-wait for dep signals instead of AQL barrier packets.
+  // The CP goes idle after unsatisfied barrier deps with SLOT_BASED_WPTR=0.
+  if (agent_->device_type() == core::Agent::kAmdGpuDevice &&
+      static_cast<const AMD::GpuAgent*>(agent_)->NoPlatformAtomics() &&
+      !dep_signals.empty()) {
+    for (auto* sig : dep_signals) {
+      while (sig->LoadRelaxed() > 0) { os::YieldThread(); }
+    }
+    dep_signals.clear();
+  }
+INJECT
+  sed -i '/const uint32_t num_barrier_packet/i\
+' "$_blit"
+  sed -i '/const uint32_t num_barrier_packet/{
+    r /tmp/_blit_cpuwait.c
+  }' "$_blit"
 }
 
 build() {
