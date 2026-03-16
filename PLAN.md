@@ -1124,7 +1124,7 @@ Fail: Crash or premature free
 
 ## Future Work
 
-### Phase 7: Fix CP Idle Stall for llama.cpp GPU Inference (CURRENT)
+### Phase 7a: Fix CP Idle Stall — SLOT_BASED_WPTR=0 (DONE)
 
 **Problem:** llama.cpp `-ngl 1` hangs during prompt eval (~100 rapid GPU dispatches).
 
@@ -1137,7 +1137,66 @@ Fail: Crash or premature free
 - Keep RPTR_BLOCK_SIZE=4 and NO_UPDATE_RPTR=0 (unchanged)
 - Bump kernel pkgrel 11→12
 
-**Verification:** HIP torture test (6 tests: rapid serial, multi-stream, interleaved compute+memcpy, rapid fire, events, stress duration), then llama.cpp `-ngl 1`.
+**Results:** 1000 rapid serial dispatches PASS, 4-stream multi-dispatch PASS, 500/500 interleaved compute+memcpy PASS (standalone). CP idle stall is fixed. However, llama.cpp model loading still hangs — see Phase 7b.
+
+### Phase 7b: CPU Cache Coherency for Non-Coherent Platforms (CURRENT)
+
+**Problem:** On Westmere (no PCIe atomics = no hardware cache snooping), GPU writes to shared memory via PCIe are not visible to the CPU without explicit cache line invalidation. This causes three distinct failures:
+
+| Symptom | Where | Mechanism |
+|---------|-------|-----------|
+| D2H memcpy returns stale/zero data | CLR staging buffer | CPU reads cached staging data before GPU's PCIe write |
+| Completion signal never fires | ROCR bounce buffer | `rptr_report_addr` not flushed, `UpdateReadDispatchId` sees old RPTR |
+| `hipHostFree`/`SyncAllStreams` hangs | CLR → ROCR | Waits on completion signal that depends on RPTR visibility |
+
+**Evidence:**
+- HIP torture test 3 (interleaved compute+memcpy): iter 358 returns `[0]=0 [255]=0` (all stale), iter 379 returns `[0]=380 [255]=0` (partial)
+- llama.cpp model loading: `hipHostFree` → `SyncAllStreams` → `awaitCompletion` spins forever in `sched_yield` at `command.cpp:247`
+- Standalone 500-iteration test passes (lighter load = fewer cache line conflicts)
+
+**Current mitigations (already in patches):**
+- CLR patch 0001: `clflush` + `mfence` on staging buffer after D2H
+- ROCR bounce buffer `UpdateReadDispatchId`: `clflush` + `mfence` on `rptr_report_addr`
+- `ROC_CPU_WAIT_FOR_SIGNAL=1`: CPU-side polling instead of interrupt waits
+
+**Root cause analysis:**
+`clflush` invalidates a single cache line at point-in-time. Between the flush and the subsequent read, a new PCIe write can repopulate the cache line with a stale (in-flight) value. Under heavy GPU dispatch, the window is wide enough to hit intermittently. The fundamental issue: `clflush` is a **point invalidation**, not a **persistent uncacheable mapping**.
+
+**Approach A: Uncached CPU mapping (preferred)**
+Map `rptr_report_addr` and staging buffers as Write-Combining (WC) or Uncacheable (UC) on the CPU side. Eliminates the flush requirement entirely.
+
+- Kernel patch 0009 (`drm-amdgpu-honor-uncached-flag-in-ttm-caching-mode`) already ensures TTM respects uncached flags
+- ROCR: verify `system_allocator()` → kernarg pool uses uncached mapping for bounce buffer allocations
+- CLR: verify staging buffer allocation goes through a pool with uncached CPU access
+- Check PAT entries on Westmere: WC may not be available for all mapping types
+
+**Approach B: clflushopt + retry loop (fallback)**
+Replace `clflush` with `clflushopt` (or `clflush` on pre-Skylake) in a retry loop:
+```c
+for (int i = 0; i < MAX_RETRIES; i++) {
+    _mm_clflush(addr);
+    _mm_mfence();
+    val = *(volatile uint64_t*)addr;
+    if (val != stale_val) break;
+    os::YieldThread();
+}
+```
+This is a band-aid — it reduces the window but doesn't eliminate it.
+
+**Approach C: MMIO-based RPTR read (nuclear option)**
+Read RPTR directly from the GPU register (`mmCP_HQD_PQ_RPTR`) via MMIO instead of relying on `rptr_report_addr`. Guaranteed coherent. Expensive per-read but only done on completion polling.
+
+**Investigation plan:**
+1. Check what caching mode the kernarg pool / staging buffers actually get on this platform
+2. Verify kernel patch 0009 is in effect for the relevant allocations
+3. Test with `pat_enabled=0` kernel param to see if PAT is the issue
+4. If uncached mapping works → make it the default for no-atomics platforms
+5. If not → implement retry loop as interim fix
+
+**Changes (TBD pending investigation):**
+- ROCR: bounce buffer allocation with explicit uncached flag
+- CLR: staging buffer allocation with explicit uncached flag
+- Kernel: verify patch 0009 covers `amdgpu_bo_create` paths used by KFD/HSA
 
 ### Phase 8: llama.cpp GPU inference optimization
 
@@ -1174,3 +1233,5 @@ Once inference works, measure performance:
 | 2026-03-15 | WaitCurrent between H2D staging chunks | Eliminates inter-chunk barrier deps; mirrors D2H path behavior |
 | 2026-03-15 | cpu_wait_for_signal for no-atomics in CLR | Force CPU-side waits in WaitingSignal(); eliminates CLR-level barrier deps |
 | 2026-03-15 | Combined NOP + cpu_wait: 286 ops stable | NOP handles CP wake, cpu_wait prevents CLR barriers; drift remains from ROCR barriers |
+| 2026-03-16 | SLOT_BASED_WPTR=0 fixes CP idle stall | 1000 rapid serial dispatches pass; CP directly reads WPTR from doorbell, no polling needed |
+| 2026-03-16 | D2H coherency: clflush insufficient under load | Iter 297-379 of 500: stale/partial data; llama.cpp hipHostFree hangs on SyncAllStreams |
