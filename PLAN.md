@@ -1139,64 +1139,174 @@ Fail: Crash or premature free
 
 **Results:** 1000 rapid serial dispatches PASS, 4-stream multi-dispatch PASS, 500/500 interleaved compute+memcpy PASS (standalone). CP idle stall is fixed. However, llama.cpp model loading still hangs — see Phase 7b.
 
-### Phase 7b: CPU Cache Coherency for Non-Coherent Platforms (CURRENT)
+### Phase 7b: Uncached Shared Memory for Non-Coherent Platforms (CURRENT)
 
-**Problem:** On Westmere (no PCIe atomics = no hardware cache snooping), GPU writes to shared memory via PCIe are not visible to the CPU without explicit cache line invalidation. This causes three distinct failures:
+#### The Problem
 
-| Symptom | Where | Mechanism |
-|---------|-------|-----------|
-| D2H memcpy returns stale/zero data | CLR staging buffer | CPU reads cached staging data before GPU's PCIe write |
-| Completion signal never fires | ROCR bounce buffer | `rptr_report_addr` not flushed, `UpdateReadDispatchId` sees old RPTR |
-| `hipHostFree`/`SyncAllStreams` hangs | CLR → ROCR | Waits on completion signal that depends on RPTR visibility |
+On coherent platforms, PCIe atomics guarantee that GPU writes to system memory automatically snoop CPU caches — every CPU read sees the GPU's latest write, at zero software cost.
 
-**Evidence:**
-- HIP torture test 3 (interleaved compute+memcpy): iter 358 returns `[0]=0 [255]=0` (all stale), iter 379 returns `[0]=380 [255]=0` (partial)
-- llama.cpp model loading: `hipHostFree` → `SyncAllStreams` → `awaitCompletion` spins forever in `sched_yield` at `command.cpp:247`
-- Standalone 500-iteration test passes (lighter load = fewer cache line conflicts)
+On Westmere (no PCIe atomics), GPU writes via PCIe bypass CPU caches entirely. The CPU sees stale cached copies. Our current mitigation (`clflush` + `mfence`) is a point-in-time invalidation — between the flush and the subsequent read, a new PCIe write can re-populate the cache line with in-flight data. Under sustained GPU dispatch, this race is wide enough to hit intermittently.
 
-**Current mitigations (already in patches):**
-- CLR patch 0001: `clflush` + `mfence` on staging buffer after D2H
-- ROCR bounce buffer `UpdateReadDispatchId`: `clflush` + `mfence` on `rptr_report_addr`
-- `ROC_CPU_WAIT_FOR_SIGNAL=1`: CPU-side polling instead of interrupt waits
+Three shared memory regions are affected:
 
-**Root cause analysis:**
-`clflush` invalidates a single cache line at point-in-time. Between the flush and the subsequent read, a new PCIe write can repopulate the cache line with a stale (in-flight) value. Under heavy GPU dispatch, the window is wide enough to hit intermittently. The fundamental issue: `clflush` is a **point invalidation**, not a **persistent uncacheable mapping**.
+| Region | Size | Allocation | Current caching | Flush? |
+|--------|------|------------|----------------|--------|
+| RPTR bounce buffer | 4 KiB | `system_allocator()(0x1000, 0x1000, 0)` | **WB** (flags=0) | clflush+mfence in `UpdateReadDispatchId` |
+| Signal pool | 4 KiB/block | `allocate_()(block_size, align, AllocateNonPaged, 0)` | **WB** (NonPaged only) | **NONE** — signal polling has no flush |
+| CLR staging buffer | 4 MiB | `hostAlloc(pool_size, 0, kAtomics)` → fine-grain pool | **WB** (no uncached flag) | clflush+mfence in D2H path |
 
-**Approach A: Uncached CPU mapping (preferred)**
-Map `rptr_report_addr` and staging buffers as Write-Combining (WC) or Uncacheable (UC) on the CPU side. Eliminates the flush requirement entirely.
+Symptoms:
+- D2H memcpy returns stale/zero data (iter 297-379 of 500)
+- llama.cpp `hipHostFree` → `SyncAllStreams` → `awaitCompletion` spins forever (`command.cpp:247`)
+- Signal polling loop reads cached signal value that never updates (no flush in hot path)
 
-- Kernel patch 0009 (`drm-amdgpu-honor-uncached-flag-in-ttm-caching-mode`) already ensures TTM respects uncached flags
-- ROCR: verify `system_allocator()` → kernarg pool uses uncached mapping for bounce buffer allocations
-- CLR: verify staging buffer allocation goes through a pool with uncached CPU access
-- Check PAT entries on Westmere: WC may not be available for all mapping types
+#### The Elegant Fix: UC Mapping
 
-**Approach B: clflushopt + retry loop (fallback)**
-Replace `clflush` with `clflushopt` (or `clflush` on pre-Skylake) in a retry loop:
-```c
-for (int i = 0; i < MAX_RETRIES; i++) {
-    _mm_clflush(addr);
-    _mm_mfence();
-    val = *(volatile uint64_t*)addr;
-    if (val != stale_val) break;
-    os::YieldThread();
-}
+Map all GPU→CPU shared memory as **Uncacheable (UC)** on the CPU side. Every CPU read goes directly to DRAM, seeing whatever the GPU last wrote via PCIe. No flushes needed. No race windows. Same semantic guarantee as PCIe atomics, enforced by page table attributes instead of hardware snooping.
+
+The `AllocateUncached` flag is **already plumbed end-to-end** but nobody sets it:
+
 ```
-This is a band-aid — it reduces the window but doesn't eliminate it.
+ROCR AllocateUncached (1 << 11)
+  → KfdDriver: kmt_alloc_flags.ui32.Uncached = 1
+    → KFD ioctl: KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED (1 << 25)
+      → amdgpu_amdkfd_gpuvm.c: AMDGPU_GEM_CREATE_UNCACHED
+        → amdgpu_ttm.c (patch 0009): ttm_uncached
+          → x86 PAT: pgprot_noncached → _PAGE_CACHE_MODE_UC_MINUS
+```
 
-**Approach C: MMIO-based RPTR read (nuclear option)**
-Read RPTR directly from the GPU register (`mmCP_HQD_PQ_RPTR`) via MMIO instead of relying on `rptr_report_addr`. Guaranteed coherent. Expensive per-read but only done on completion polling.
+UC-MINUS is available on all x86 since Pentium Pro. Westmere fully supports it.
 
-**Investigation plan:**
-1. Check what caching mode the kernarg pool / staging buffers actually get on this platform
-2. Verify kernel patch 0009 is in effect for the relevant allocations
-3. Test with `pat_enabled=0` kernel param to see if PAT is the issue
-4. If uncached mapping works → make it the default for no-atomics platforms
-5. If not → implement retry loop as interim fix
+#### Performance Analysis
 
-**Changes (TBD pending investigation):**
-- ROCR: bounce buffer allocation with explicit uncached flag
-- CLR: staging buffer allocation with explicit uncached flag
-- Kernel: verify patch 0009 covers `amdgpu_bo_create` paths used by KFD/HSA
+UC reads are ~100-200ns (DRAM latency) vs ~1-4ns (L1 hit). But:
+
+1. **RPTR**: Changes on every GPU packet completion. Caching provides zero benefit — every read needs the latest value. With WB, we already pay clflush(~100ns) + mfence(~50ns) + load. UC load (~200ns) is comparable and eliminates the race.
+
+2. **Signals**: Change on every GPU operation completion. Same argument — stale cached values are useless. The polling loop currently busy-waits anyway.
+
+3. **Staging buffer**: Written by GPU, read once by CPU `memcpy`, then overwritten. Cache is polluted with data that's never re-read. UC + streaming reads (`movntdqa` via `memcpy` optimization) is ideal.
+
+**Net impact on hot path:** Neutral to positive. Eliminates flush overhead and race window. The data is write-once-read-once with no temporal locality — UC is the correct caching policy.
+
+#### Changes
+
+##### 1. ROCR patch 0005 update: UC bounce buffer allocation
+**File:** `hsa-rocr/src/ROCR-Runtime/.../amd_aql_queue.cpp:145`
+
+```cpp
+// Before:
+rptr_gpu_buf_ = static_cast<uint64_t*>(
+    agent_->system_allocator()(0x1000, 0x1000, 0));
+
+// After:
+rptr_gpu_buf_ = static_cast<uint64_t*>(
+    agent_->system_allocator()(0x1000, 0x1000,
+        core::MemoryRegion::AllocateUncached));
+```
+
+Then remove `FlushCpuCache` + `_mm_mfence()` from `UpdateReadDispatchId` — no longer needed with UC mapping. The `atomic::Load` reads directly from DRAM.
+
+##### 2. ROCR new patch 0006: UC signal pool for no-atomics
+**File:** `runtime.cpp` signal pool allocator setup (~line 213-230)
+
+The signal pool is global (shared across all agents). If ANY GPU agent has `NoPlatformAtomics()`, the signal pool must be UC — signals are written by GPU and polled by CPU.
+
+```cpp
+// In Runtime::RegisterAgent, after detecting a no-atomics GPU:
+// Set signal allocator to use AllocateUncached | AllocateNonPaged
+```
+
+Challenge: the signal pool is initialized once at first CPU agent registration, before GPU agents are registered. Two approaches:
+
+**Option A (preferred):** Lazy reallocation. After first GPU agent with `NoPlatformAtomics()` registers, mark the pool as needing UC. Next allocation creates a new UC block. Existing signals (few at this point) continue with WB — acceptable since they're control signals, not completion signals.
+
+**Option B:** Add a `system_allocator_uncached_` variant to GpuAgent that passes `AllocateUncached`. Wire it into the signal pool's allocate functor. Requires refactoring the pool to accept per-allocation flags.
+
+**Option C (simplest):** At ROCR init, check if any GPU in the topology lacks atomics (query KFD node properties before agent creation). If so, create the signal pool with UC from the start.
+
+##### 3. CLR patch 0001 update: UC staging buffer
+**File:** `rocclr/device/rocm/rocvirtual.cpp:1899`
+
+```cpp
+// Before:
+gpu().dev().hostAlloc(pool_size_, 0, mem_segment)
+
+// After (when !dev().info().pcie_atomics_):
+gpu().dev().hostAlloc(pool_size_, 0, mem_segment, /* uncached = */ true)
+```
+
+Requires plumbing an uncached flag through `hostAlloc` → `hsa_amd_memory_pool_allocate` → KFD. The fine-grain pool already goes through the same KFD path — just needs the `Uncached` bit set.
+
+Then remove `clflush` + `mfence` loops from `hsaCopyStagedOrPinned()` D2H path — no longer needed.
+
+##### 4. CLR patch 0001 update: UC pinned buffer path
+**File:** `rocblit.cpp` lines 789-796
+
+When GPU DMA writes directly to user's pinned host buffer (large transfers), the pinned mapping should also be UC. This goes through `hsa_amd_memory_lock` — check if it inherits the original page's caching mode or can be overridden.
+
+If pinned pages inherit WB from userspace mapping (likely), the clflush path must remain for pinned transfers. Document as known limitation — pinned path is less common than staging path.
+
+##### 5. Remove clflush code paths (cleanup)
+After UC mappings are verified working:
+- Remove `FlushCpuCache` call in `UpdateReadDispatchId`
+- Remove `_mm_mfence` after flush in `UpdateReadDispatchId`
+- Remove `_mm_clflush` loop in `hsaCopyStagedOrPinned` D2H path
+- Remove `_mm_clflush` loop in pinned D2H path (only if pinned also UC)
+- Keep `ROC_CPU_WAIT_FOR_SIGNAL` env var (orthogonal — controls polling vs interrupt)
+
+#### Verification Plan
+
+**Phase B1: RPTR bounce buffer UC**
+```bash
+# After ROCR patch, before CLR changes
+# RPTR is the most critical — if bounce buffer works, signals fire
+timeout 120 ./hip_torture_test   # Test 1 (1000 serial) + Test 6 (10K stress)
+```
+
+**Phase B2: Signal pool UC**
+```bash
+# After signal patch
+# Signals now visible without flush — completion path reliable
+timeout 120 ./hip_torture_test   # All 6 tests
+```
+
+**Phase B3: Staging buffer UC**
+```bash
+# After CLR staging patch
+# D2H data now correct without flush
+for i in $(seq 10); do timeout 60 /tmp/test_interleave2; done   # 10 runs, 500 each
+```
+
+**Phase B4: llama.cpp**
+```bash
+timeout 600 llama-cli -m ~/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+  -ngl 1 -p "2+2=" -n 8 --threads 4 --no-mmap
+```
+
+**Phase B5: Verify UC via /proc**
+```bash
+# Confirm pages are UC-MINUS
+grep -c 'uncached\|write-combining' /proc/$(pgrep hip_torture)/smaps
+# Or check PAT bits in page table entries via pagemap
+```
+
+#### Success Criteria
+- HIP torture test: 6/6 PASS, zero data corruption across 10 consecutive runs
+- llama.cpp `-ngl 1`: produces tokens, clean exit
+- No `clflush` in hot path (grep patched source)
+- `dmesg`: zero GPU resets
+
+#### Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|------------|
+| UC flag not reaching TTM | Low | High | Patch 0009 verified; trace with `pr_info` in `amdgpu_ttm_tt_new` |
+| UC breaks GPU writes to same pages | None | N/A | UC only affects CPU caching; GPU writes via PCIe are unaffected |
+| Signal pool UC causes regression on coherent platforms | None | N/A | Flag only set when `NoPlatformAtomics()` detected |
+| Pinned path still WB | Medium | Low | Pinned path is fallback for >16KB; staging path handles most copies |
+| Performance regression from UC reads | Low | Low | Data has no temporal locality; UC is correct policy |
+| ROCR `system_allocator` doesn't forward flags | Medium | High | Verify `AllocateUncached` propagates through allocator lambda |
 
 ### Phase 8: llama.cpp GPU inference optimization
 
