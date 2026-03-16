@@ -155,3 +155,12 @@ Append-only. Do not delete or rewrite old entries.
 - The NOP kick MUST be eliminated for sustained GPU inference
 - The interrupt path (Phase 6c) handles signal completion but NOP kick still runs
 - Need to either: (a) remove NOP kick entirely, or (b) make it not inject packets
+
+## 2026-03-16: Removing NOP kick confirms CP idle stall is the ROOT problem
+- Without NOP kick: HSA dispatch PASS, HIP kernel PASS, but llama.cpp eval hangs
+- 3 more GPU resets (11 total) — GPU job timeout from CP idle stall
+- The NOP kick was the ONLY mechanism waking the idle CP
+- The interrupt path handles signal completion but doesn't prevent CP going idle
+- The CP goes idle after processing packets — even without barriers
+- This is the FUNDAMENTAL issue: SLOT_BASED_WPTR=0 CP idle behavior
+- MUST find a way to keep the CP active or wake it without injecting packets
