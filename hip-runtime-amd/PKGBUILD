@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=2
+pkgrel=3
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -38,6 +38,15 @@ prepare() {
         CpuWaitForSignal(external_signals_[i]);\
         continue;\
       }' rocclr/device/rocm/rocvirtual.cpp
+
+  # Phase 7b: UC staging buffer for non-coherent platforms.
+  # GPU writes to staging buffer bypass CPU cache; map as UC so CPU reads
+  # go straight to DRAM.  Target only kAtomics segment (staging buffers),
+  # not kKernArg (CPU->GPU, doesn't need UC).
+  sed -i '/uint32_t memFlags = 0;/a\
+  if (mem_seg != kKernArg && !info().pcie_atomics_) {\
+    memFlags |= HSA_AMD_MEMORY_POOL_UNCACHED_FLAG;\
+  }' rocclr/device/rocm/rocdevice.cpp
 }
 
 build() {
