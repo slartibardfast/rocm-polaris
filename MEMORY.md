@@ -135,3 +135,13 @@ Append-only. Do not delete or rewrite old entries.
 - This is NOT blit vs compute — it's about which HW queue slot KFD assigns
 - Need to dump HQD registers on clean boot to compare working vs non-working slots
 - May be a kernel MQD configuration issue for certain pipe/queue combinations
+
+## 2026-03-16: CLEAN BOOT — ALL 8 queue slots work, kernel launch PASSES
+- Queue probe: 8/8 PASS (all read_idx=3, all MEC pipe/queue slots work)
+- HIP test: hipMemset OK, hipMemcpy H2D OK, kernel launch OK, D2H OK, result=42
+- GPU compute confirmed working on clean boot with current stack
+- GPU resets: 2→3 (1 from investigation, not from our code)
+- The earlier "compute queue hangs" was from accumulated GPU resets degrading MEC state
+- LESSON: ALWAYS test on clean boot. GPU resets corrupt MEC state permanently until cold reboot.
+- All queue slots assigned to Pipe 0-3, Queue 2-4 (HWS scheduler distributes across pipes)
+- HQD dump shows consistent PQ_CONTROL across all active slots

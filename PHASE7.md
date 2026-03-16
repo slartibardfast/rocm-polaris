@@ -1,6 +1,6 @@
 # Phase 7: llama.cpp GPU Inference
 
-## Status: IN PROGRESS — H2 confirmed (inference hangs during exit cleanup)
+## Status: IN PROGRESS — compute queue WORKS on clean boot, llama.cpp next
 
 ## Prerequisite
 
