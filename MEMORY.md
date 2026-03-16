@@ -145,3 +145,13 @@ Append-only. Do not delete or rewrite old entries.
 - LESSON: ALWAYS test on clean boot. GPU resets corrupt MEC state permanently until cold reboot.
 - All queue slots assigned to Pipe 0-3, Queue 2-4 (HWS scheduler distributes across pipes)
 - HQD dump shows consistent PQ_CONTROL across all active slots
+
+## 2026-03-16: llama.cpp ngl=1 — warmup passes, prompt eval hangs
+- Model loads (44MB on GPU), warmup completes (GPU dispatch works at least once)
+- Prompt eval (18 tokens) hangs — this requires many GPU dispatches in the compute graph
+- 5 GPU resets from the llama.cpp runs (8 total vs 3 before)
+- The NOP kick drift causes the hang after ~200-300 ops (warmup uses fewer)
+- LESSON: ggml-hip graph eval dispatches hundreds of GPU ops per token
+- The NOP kick MUST be eliminated for sustained GPU inference
+- The interrupt path (Phase 6c) handles signal completion but NOP kick still runs
+- Need to either: (a) remove NOP kick entirely, or (b) make it not inject packets
