@@ -37,3 +37,4 @@ tests/*.o
 # OS
 .DS_Store
 Thumbs.db
+llama.cpp/llama.cpp-b7376/
