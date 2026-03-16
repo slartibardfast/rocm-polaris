@@ -51,7 +51,7 @@
  #define CP_MQD_CONTROL__PRIV_STATE__SHIFT 0x8
 
  static inline struct vi_mqd *get_mqd(void *mqd)
-@@ -225,5 +239,36 @@
+@@ -225,7 +239,34 @@
 
  	if (q->format == KFD_QUEUE_FORMAT_AQL) {
 -		m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK |
@@ -74,16 +74,12 @@
 +				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
 +		} else {
 +			/*
-+			 * No-atomics: SLOT_BASED_WPTR=2 with GPU-visible
-+			 * poll address (ROCR allocates from kernarg pool).
-+			 * CP reads AQL dispatch count from poll address and
-+			 * applies wptr_shift=4 to get dword WPTR.  Doorbell
-+			 * is notification only.  Also NO_UPDATE_RPTR=0 so
-+			 * CP writes RPTR to rptr_report_addr, and reduce
++			 * No-atomics: SLOT_BASED_WPTR=0 (direct doorbell).
++			 * Doorbell value IS the WPTR in dwords — the proven
++			 * DRM gfx8 compute queue mechanism.  NO_UPDATE_RPTR=0
++			 * so CP writes RPTR to rptr_report_addr.  Reduce
 +			 * RPTR_BLOCK_SIZE to 4 for per-packet RPTR writes.
 +			 */
-+			m->cp_hqd_pq_control |=
-+				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
 +			m->cp_hqd_pq_control &=
 +				~CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE_MASK;
 +			m->cp_hqd_pq_control |=
