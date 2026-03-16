@@ -127,3 +127,11 @@ Append-only. Do not delete or rewrite old entries.
 - After fixing host buffer size: 550/550 stress test PASSES on clean boot
 - The pre-reboot "GPU degradation" hypothesis was also wrong — just a test bug
 - LESSON: always allocate host buffers >= transfer size. hipMemcpy reads the FULL size from host.
+
+## 2026-03-16: Compute queue CP issue is same as blit — depends on MEC pipe/queue slot
+- On clean boot: first 2-3 queues (blit) work, later queues (compute) hang
+- After GPU resets: even blit queues hang (degraded MEC state)
+- The CP processes packets on SOME queue slots but not others
+- This is NOT blit vs compute — it's about which HW queue slot KFD assigns
+- Need to dump HQD registers on clean boot to compare working vs non-working slots
+- May be a kernel MQD configuration issue for certain pipe/queue combinations
