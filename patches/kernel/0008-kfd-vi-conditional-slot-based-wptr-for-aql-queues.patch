@@ -1,4 +1,4 @@
-# Conditional SLOT_BASED_WPTR for gfx8 AQL queues
+# Conditional SLOT_BASED_WPTR and NO_UPDATE_RPTR for gfx8 AQL queues
 #
 # SLOT_BASED_WPTR=2 makes the CP poll WPTR from a memory address
 # (cp_hqd_pq_wptr_poll_addr).  That address is a CPU heap VA.  With
@@ -9,6 +9,17 @@
 # preserve SLOT_BASED_WPTR=2 for those.  Without atomics, use direct
 # doorbell mode (=0) where the doorbell value IS the WPTR — the proven
 # DRM gfx8 compute queue mechanism (gfx_v8_0_ring_set_wptr_compute).
+#
+# When using SLOT_BASED_WPTR=0, also clear NO_UPDATE_RPTR.  With
+# NO_UPDATE_RPTR=1, gfx8 CP does not write RPTR to rptr_report_addr
+# in direct doorbell mode.  With NO_UPDATE_RPTR=0, CP writes RPTR to
+# rptr_report_addr per RPTR_BLOCK_SIZE.
+#
+# Additionally, reduce RPTR_BLOCK_SIZE from 5 (every 32 dwords = 2 AQL
+# packets) to 4 (every 16 dwords = 1 AQL packet) in the no-atomics
+# path.  Our bounce buffer uses RPTR to detect per-packet completion;
+# with block size 5, single-packet dispatches may not trigger an RPTR
+# write before the next doorbell arrives, causing RPTR to stall.
 #
 # Module parameter gfx8_wptr_poll:
 #   0 = auto (default): direct doorbell without atomics, poll with
@@ -40,23 +51,40 @@
  #define CP_MQD_CONTROL__PRIV_STATE__SHIFT 0x8
 
  static inline struct vi_mqd *get_mqd(void *mqd)
-@@ -225,7 +239,17 @@
+@@ -225,7 +239,34 @@
 
  	if (q->format == KFD_QUEUE_FORMAT_AQL) {
 -		m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK |
 -				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
-+		m->cp_hqd_pq_control |= CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK;
 +		/*
-+		 * SLOT_BASED_WPTR=2: CP polls WPTR from memory
-+		 * (wptr_poll_addr), a CPU VA unreachable via GPUVM on gfx8
-+		 * without UTCL2.  Without PCIe atomics, fall back to direct
-+		 * doorbell mode (=0) where the doorbell value IS the WPTR.
++		 * With PCIe atomics: SLOT_BASED_WPTR=2 (CP polls WPTR from
++		 * memory) + NO_UPDATE_RPTR (CP writes dispatch ID to
++		 * rptr_report_addr).  This is the original KFD AQL behavior.
++		 *
++		 * Without atomics: SLOT_BASED_WPTR=0 (direct doorbell =
++		 * WPTR) + NO_UPDATE_RPTR cleared (CP writes RPTR in dword
++		 * offsets to rptr_report_addr per RPTR_BLOCK_SIZE).  This
++		 * matches DRM gfx8 compute queue behavior.
 +		 */
 +		if (gfx8_wptr_poll > 0 ||
 +		    (gfx8_wptr_poll == 0 &&
-+		     mm->dev->kfd->pci_atomic_requested))
++		     mm->dev->kfd->pci_atomic_requested)) {
 +			m->cp_hqd_pq_control |=
++				CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK |
 +				2 << CP_HQD_PQ_CONTROL__SLOT_BASED_WPTR__SHIFT;
++		} else {
++			/*
++			 * No-atomics: SLOT_BASED_WPTR=0 (direct doorbell).
++			 * Doorbell value IS the WPTR in dwords — the proven
++			 * DRM gfx8 compute queue mechanism.  NO_UPDATE_RPTR=0
++			 * so CP writes RPTR to rptr_report_addr.  Reduce
++			 * RPTR_BLOCK_SIZE to 4 for per-packet RPTR writes.
++			 */
++			m->cp_hqd_pq_control &=
++				~CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE_MASK;
++			m->cp_hqd_pq_control |=
++				4 << CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT;
++		}
  	}
 
  	if (mm->dev->kfd->cwsr_enabled && q->ctx_save_restore_area_address)
