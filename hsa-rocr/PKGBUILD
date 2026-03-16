@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=9
+pkgrel=10
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -73,6 +73,24 @@ INJECT
   sed -i 's|int64_t value = atomic::Load(\&signal_.value, std::memory_order_relaxed);|int64_t value = atomic::Load(\&signal_.value, std::memory_order_relaxed);\
     AMD::AqlQueue::ProcessAllBounceBuffers();\
     value = atomic::Load(\&signal_.value, std::memory_order_relaxed);|' "$_isig"
+
+  # Phase 7b: Uncached shared memory for non-coherent platforms.
+  # On platforms without PCIe atomics, GPU writes bypass CPU cache.
+  # Map GPU->CPU shared memory as UC so CPU reads go straight to DRAM.
+
+  # 7b-1: UC RPTR bounce buffer.  Replace flags=0 with AllocateUncached.
+  local _aq=runtime/hsa-runtime/core/runtime/amd_aql_queue.cpp
+  sed -i 's|agent_->system_allocator()(0x1000, 0x1000, 0)|agent_->system_allocator()(0x1000, 0x1000, core::MemoryRegion::AllocateUncached)|' "$_aq"
+
+  # 7b-2: Remove clflush+mfence from UpdateReadDispatchId (UC makes them unnecessary).
+  sed -i '/FlushCpuCache(rptr_gpu_buf_/d' "$_aq"
+  sed -i '/CLFLUSH is not ordered/d' "$_aq"
+  sed -i '/Fence ensures the invalidation/d' "$_aq"
+  sed -i '/_mm_mfence();/d' "$_aq"
+
+  # 7b-3: UC signal pool.  Add AllocateUncached to signal block allocations.
+  local _sig=runtime/hsa-runtime/core/runtime/signal.cpp
+  sed -i 's|core::MemoryRegion::AllocateNonPaged, 0)|core::MemoryRegion::AllocateNonPaged | core::MemoryRegion::AllocateUncached, 0)|g' "$_sig"
 }
 
 build() {
