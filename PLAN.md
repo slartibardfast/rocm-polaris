@@ -1124,38 +1124,22 @@ Fail: Crash or premature free
 
 ## Future Work
 
-### Phase 6a: Eliminate ROCR-level AQL barriers (NEXT — final blocker)
+### Phase 7: Fix CP Idle Stall for llama.cpp GPU Inference (CURRENT)
 
-**Goal:** Remove the last source of AQL barrier packets on no-atomics platforms.
+**Problem:** llama.cpp `-ngl 1` hangs during prompt eval (~100 rapid GPU dispatches).
 
-**Problem:** `BlitKernel::SubmitLinearCopyCommand` in ROCR creates AQL barrier-AND packets from `dep_signals` passed by CLR. These barriers stall the CP. CLR's `cpu_wait_for_signal` prevents CLR from creating NEW deps, but the dep_signals ROCR receives from `hsa_amd_memory_async_copy()` still get turned into barriers.
+**Root cause:** Kernel patch 0008's no-atomics else branch set `SLOT_BASED_WPTR=2`, telling CP to poll WPTR from a CPU VA. With `PQ_ATC=0` and no UTCL2 on gfx8, CP cannot translate the address. Multiple doorbells collapse into a single `DOORBELL_HIT` flag. CP wakes, tries to read poll address, fails, goes idle. Serial warmup worked because each op completed before the next doorbell.
 
-**Approach:** In `SubmitLinearCopyCommand`, when the agent has `NoPlatformAtomics()`, CPU-wait on `dep_signals` before the dispatch instead of creating AQL barrier packets. This makes every blit operation fully serialized from CPU, eliminating all barrier deps.
-
-**Patch location:** `amd_blit_kernel.cpp` lines 647-715 (SubmitLinearCopyCommand)
+**Fix:** Remove `SLOT_BASED_WPTR=2` from no-atomics else branch, leaving default 0 (direct doorbell). With SLOT_BASED_WPTR=0, doorbell value IS the WPTR in dwords. ROCR patch 0003's conversion `(dispatch_id * 16) & mask` provides the correct dword WPTR. Each doorbell directly updates `CP_HQD_PQ_WPTR`. No polling needed.
 
 **Changes:**
-```cpp
-// At the start of SubmitLinearCopyCommand:
-if (queue_->GetAgent()->NoPlatformAtomics()) {
-  // CPU-wait for all dep signals instead of creating barrier packets
-  for (auto* sig : dep_signals) {
-    while (sig->LoadRelaxed() > 0) os::YieldThread();
-  }
-  dep_signals.clear();  // no barrier packets needed
-}
-// ... rest of function creates 0 barrier packets (dep_signals is empty)
-```
+- Kernel patch 0008: remove `m->cp_hqd_pq_control |= 2 << SLOT_BASED_WPTR__SHIFT` from else branch
+- Keep RPTR_BLOCK_SIZE=4 and NO_UPDATE_RPTR=0 (unchanged)
+- Bump kernel pkgrel 11→12
 
-**Risk:** Low. This is the same approach CLR's `cpu_wait_for_signal` uses. The dep_signals are completion signals from previous operations — CPU-waiting on them is correct and doesn't change ordering semantics.
+**Verification:** HIP torture test (6 tests: rapid serial, multi-stream, interleaved compute+memcpy, rapid fire, events, stress duration), then llama.cpp `-ngl 1`.
 
-**Expected result:** Eliminates ALL NOP kicks (no more barrier stalls = no kicks needed). Infinite operation count. llama.cpp inference should work.
-
-### Phase 6b: Remove NOP kick code
-
-After Phase 6a, the NOP barrier kick in ROCR 0004 becomes unnecessary. Remove it to simplify the code and eliminate the `write_dispatch_id` drift risk.
-
-### Phase 7: llama.cpp GPU inference optimization
+### Phase 8: llama.cpp GPU inference optimization
 
 Once inference works, measure performance:
 - Token generation rate (t/s) vs CPU-only baseline (13.3 t/s)
@@ -1163,14 +1147,14 @@ Once inference works, measure performance:
 - Optimal context size for the 2GB card
 - Compare Q4_K_M vs Q5_0 quantizations
 
-### Phase 8: Upstream preparation
+### Phase 9: Upstream preparation
 
 - Clean up patches: remove debug logging, consolidate PKGBUILD sed injections into proper patches
 - Write rocrtst-idiomatic tests (SignalCpuWriteGpuBarrier, MixedSizeH2DStress, etc.)
 - Document the no-atomics platform support story for upstream consideration
 - Consider submitting kernel patches to LKML (kfd_mqd_manager_vi.c changes are clean and well-documented)
 
-### Phase 9: Additional ROCm components (stretch)
+### Phase 10: Additional ROCm components (stretch)
 
 - rocFFT, hipBLAS, MIOpen — evaluate if needed for micro-LLM inference
 - hipSPARSE — might help with sparse attention patterns
