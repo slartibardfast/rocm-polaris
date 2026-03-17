@@ -1,0 +1,36 @@
+# Wait for GPU TLB invalidation completion on gmc_v8 (VI/gfx8)
+#
+# gmc_v8_0_flush_gpu_tlb() writes VM_INVALIDATE_REQUEST but never waits
+# for VM_INVALIDATE_RESPONSE, unlike gmc_v9+ which polls the ack register.
+# On gfx8, if a compute dispatch is submitted immediately after a page
+# table update (e.g. after staging buffer map/unmap during H2D blit),
+# the CP may fetch the kernel code object or kernarg through stale TLB
+# entries before the invalidation propagates to all CUs, causing a
+# "Page not present" VM fault.
+#
+# Fix: poll VM_INVALIDATE_RESPONSE for the target VMID after writing
+# VM_INVALIDATE_REQUEST, matching the gmc_v9+ behavior.
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
+@@ -661,7 +661,18 @@
+ static void gmc_v8_0_flush_gpu_tlb(struct amdgpu_device *adev, uint32_t vmid,
+ 					uint32_t vmhub, uint32_t flush_type)
+ {
++	unsigned int i;
++
+ 	/* bits 0-15 are the VM contexts0-15 */
+ 	WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
++
++	/* Wait for invalidation to complete.  Without this, compute
++	 * dispatches immediately after page table updates (e.g. H2D blit
++	 * staging buffer map/unmap) may hit stale TLB entries.
++	 */
++	for (i = 0; i < adev->usec_timeout; i++) {
++		if (RREG32(mmVM_INVALIDATE_RESPONSE) & (1 << vmid))
++			break;
++		udelay(1);
++	}
+ }
