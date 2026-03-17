@@ -90,7 +90,7 @@ INJECT
 
   # 7b-3: UC signal pool.  Add AllocateUncached to signal block allocations.
   local _sig=runtime/hsa-runtime/core/runtime/signal.cpp
-  sed -i 's|core::MemoryRegion::AllocateNonPaged, 0)|core::MemoryRegion::AllocateNonPaged | core::MemoryRegion::AllocateUncached, 0)|g' "$_sig"
+  sed -i 's,core::MemoryRegion::AllocateNonPaged\, 0),core::MemoryRegion::AllocateNonPaged | core::MemoryRegion::AllocateUncached\, 0),g' "$_sig"
 }
 
 build() {
