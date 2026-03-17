@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=4
+pkgrel=5
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -39,13 +39,13 @@ prepare() {
         continue;\
       }' rocclr/device/rocm/rocvirtual.cpp
 
-  # Phase 7b: UC staging buffer for non-coherent platforms.
-  # GPU writes to staging buffer bypass CPU cache; map as UC so CPU reads
-  # go straight to DRAM.  Target only hostAlloc (staging buffers).
+  # Phase 7b+7e: UC all host allocations on non-coherent platforms.
+  # CPU WB-cached writes may not reach DRAM before GPU reads via PCIe.
+  # Applies to staging buffers AND kernarg (user kernel arguments).
   local _dev=rocclr/device/rocm/rocdevice.cpp
   sed -i '/^void\* Device::hostAlloc/,/^}$/{
-    /if (mem_seg == kKernArg)/i\
-  if (mem_seg != kKernArg \&\& !info().pcie_atomics_) {\
+    /uint32_t memFlags = 0;/a\
+  if (!info().pcie_atomics_) {\
     memFlags |= HSA_AMD_MEMORY_POOL_UNCACHED_FLAG;\
   }
   }' "$_dev"
