@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=12
+pkgrel=13
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -113,35 +113,9 @@ INJECT
   # 7e-4: PM4 indirect buffer (icache invalidation commands).
   sed -i 's,pm4_ib_size_b_\, 0x1000\, core::MemoryRegion::AllocateExecutable),pm4_ib_size_b_\, 0x1000\, core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateUncached),' "$_aq"
 
-  # 7f: GPU L2 writeback after blit completion on no-atomics platforms.
-  # VI/gfx8 PTEs have no MTYPE field — GPU L2 caches system memory writes
-  # regardless of CPU UC mapping.  After the blit kernel writes to staging
-  # (D2H) or VRAM (H2D), flush GPU L2 via ACQUIRE_MEM(TC_WB) PM4 packet
-  # so data reaches DRAM before the CPU reads it.
-
-  # 7f-1: Add PM4 header include to blit_kernel.cpp.
-  sed -i '/#include "core\/inc\/amd_gpu_agent.h"/a #include "core/inc/amd_gpu_pm4.h"' "$_bk"
-
-  # 7f-2: Inject L2 writeback after sync blit signal wait.
-  # Target: the line "if(agent_->profiling_enabled())" in the sync SubmitLinearCopyCommand.
-  # Insert before it: submit ACQUIRE_MEM(TC_WB) PM4 to flush GPU L2.
-  sed -i '/if(agent_->profiling_enabled())/{
-    i\
-  /* Phase 7f: Flush GPU L2 after blit completion on gfx8 no-atomics. */\
-  /* VI PTEs have no MTYPE — GPU L2 caches system memory writes even when */\
-  /* CPU mapping is UC.  Submit ACQUIRE_MEM(TC_WB) to writeback L2 to DRAM. */\
-  if (agent_->device_type() == core::Agent::kAmdGpuDevice \&\&\
-      static_cast<const AMD::GpuAgent*>(agent_)->NoPlatformAtomics()) {\
-    uint32_t l2wb[7] = {0};\
-    l2wb[0] = PM4_HDR(PM4_HDR_IT_OPCODE_ACQUIRE_MEM, 7, 8);\
-    l2wb[1] = PM4_ACQUIRE_MEM_DW1_COHER_CNTL(\
-        PM4_ACQUIRE_MEM_COHER_CNTL_TC_WB_ACTION_ENA |\
-        PM4_ACQUIRE_MEM_COHER_CNTL_TC_ACTION_ENA);\
-    l2wb[2] = PM4_ACQUIRE_MEM_DW2_COHER_SIZE(0xFFFFFFFF);\
-    l2wb[3] = PM4_ACQUIRE_MEM_DW3_COHER_SIZE_HI(0xFF);\
-    queue_->ExecutePM4(l2wb, sizeof(l2wb));\
-  }
-  }' "$_bk"
+  # Phase 7f (ACQUIRE_MEM L2 WB hack): REMOVED.
+  # Root cause was SNOOPED=0 in GPU PTE, not missing L2 flush.
+  # Fixed in kernel patch 0009 (ttm_uncached + SNOOPED=1).
 }
 
 build() {
