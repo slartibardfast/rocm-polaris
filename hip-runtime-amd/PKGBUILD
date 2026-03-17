@@ -41,12 +41,14 @@ prepare() {
 
   # Phase 7b: UC staging buffer for non-coherent platforms.
   # GPU writes to staging buffer bypass CPU cache; map as UC so CPU reads
-  # go straight to DRAM.  Target only kAtomics segment (staging buffers),
-  # not kKernArg (CPU->GPU, doesn't need UC).
-  sed -i '/uint32_t memFlags = 0;/a\
-  if (mem_seg != kKernArg && !info().pcie_atomics_) {\
+  # go straight to DRAM.  Target only hostAlloc (staging buffers).
+  local _dev=rocclr/device/rocm/rocdevice.cpp
+  sed -i '/^void\* Device::hostAlloc/,/^}$/{
+    /if (mem_seg == kKernArg)/i\
+  if (mem_seg != kKernArg \&\& !info().pcie_atomics_) {\
     memFlags |= HSA_AMD_MEMORY_POOL_UNCACHED_FLAG;\
-  }' rocclr/device/rocm/rocdevice.cpp
+  }
+  }' "$_dev"
 }
 
 build() {
