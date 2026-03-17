@@ -1413,26 +1413,60 @@ llama.cpp with any `-ngl` value crashes during inference:
 
 **`-ngl 99` crash:** `ggml_cuda_op_rope_impl` → ROCR allocation path → `std::terminate`. CP queue preemption timeout. Separate from the VM fault — occurs during compute dispatch, not memory access. May be signal/kernarg exhaustion or a gfx803 ISA issue with the RoPE kernel.
 
-#### Two Distinct Blockers
+#### Root Cause: H2D Blit Kernel Silent Data Corruption
 
-| Blocker | Trigger | Symptom | Scope |
-|---------|---------|---------|-------|
-| **Host memory mapping** | `-ngl 1` (zero-copy) | VM fault reading `hipHostMalloc` pages | KFD/amdgpu GPU page table mapping |
-| **Compute dispatch crash** | `-ngl 99` (all VRAM) | ROCR crash in RoPE kernel dispatch | ROCR signal/kernarg or gfx803 ISA |
+**Not a VRAM mapping issue.** Isolated testing shows:
+- `hipMalloc` + `hipMemset` + GPU kernel read: PASS at all sizes up to 512MB
+- `hipHostMalloc` + GPU kernel read (zero-copy): PASS at all offsets up to 454MB
+- `hipMalloc` + `hipMemcpy H2D` + GPU kernel verify: **1MB PASS, 16MB FAIL** (4M bad values)
 
-#### Investigation Plan
+The H2D `hipMemcpy` via CLR's staging/blit path reports `hipSuccess` but **silently fails to write data to VRAM** for transfers >1MB. The GPU then reads uninitialized VRAM (zeros or stale data), which llama.cpp interprets as model weights → garbage → eventual VM fault when a computed pointer lands outside mapped range.
 
-**For host memory mapping (blocker 1):**
-1. Test GPU reads from large `hipHostMalloc` at various offsets to find the mapping boundary
-2. Trace `hipHostMalloc` → `hsa_amd_memory_pool_allocate` → KFD ioctl → `amdgpu_amdkfd_gpuvm.c` mapping path
-3. Check `amdgpu_vm_bo_map` for per-BO or per-process limits on gfx8
-4. Check if GPUVM page table update (TLB flush) is missing after large host allocation
+**Mechanism:** Large H2D copies are chunked through a staging buffer (fine-grain host memory, now UC). Each chunk: CPU fills staging → blit kernel copies staging→VRAM → wait for completion → next chunk. If inter-chunk completion detection fails, the next chunk overwrites the staging buffer before the blit kernel finishes reading it, corrupting the transfer.
 
-**For compute dispatch crash (blocker 2):**
-1. Run with `ROCR_BOUNCE_DEBUG=1` and `AMD_LOG_LEVEL=3` to identify where ROCR crashes
-2. Test `-ngl 99` with a trivial kernel (not RoPE) to isolate ISA vs dispatch issue
-3. Check if signal pool UC allocation is failing (new `AllocateUncached` path)
-4. Try without UC signal patch (bisect)
+**Evidence:** 1MB transfers work (single chunk, fits in staging buffer). 16MB transfers fail (multiple chunks through 4MB staging buffer, ~4 chunks needed). The 4M bad values ≈ 16MB/4 = 4M ints, meaning essentially ALL data is wrong — consistent with staging buffer overwrite before blit completion.
+
+**Connection to earlier phases:**
+- Phase 7b (UC staging): Changed staging from WB→UC. This is correct for CPU→GPU visibility (staging data reaches DRAM). But UC may affect the blit kernel's read pattern — UC memory is not cached in GPU L2, so blit kernel reads go to DRAM every time.
+- Phase 7c (synchronous flush): Forces `flush()` in `submitMarker`, but `hipMemcpy` internally uses `WaitCurrent()` between chunks via `releaseGpuMemoryFence()`. If `WaitCurrent()` returns before the blit kernel truly finishes (bounce buffer RPTR race), the next chunk overwrites staging.
+
+#### Fix Avenues
+
+**Avenue A: Verify WaitCurrent inter-chunk completion (most likely fix)**
+
+The D2H path in `hsaCopyStagedOrPinned()` (rocblit.cpp) calls `gpu().Barriers().WaitCurrent()` between chunks. If `WaitCurrent()` relies on CLR's signal/event mechanism (which uses the async handler that doesn't fire on no-atomics), it may return prematurely.
+
+Check: does `Barriers().WaitCurrent()` go through ROCR signal wait (which has bounce buffer) or CLR event wait (which we fixed only for markers in Phase 7c)?
+
+If CLR's `WaitCurrent()` doesn't drive the bounce buffer, we need to extend the Phase 7c fix to cover all `releaseGpuMemoryFence()` paths, not just `submitMarker`.
+
+**Avenue B: Bisect UC staging**
+
+Test if the H2D corruption exists WITHOUT the UC staging buffer patch (Phase 7b). If H2D worked before UC and fails after, the issue is that the blit kernel reads UC memory differently. GPU L2 caching behavior for fine-grain UC system memory on gfx8 may differ from fine-grain WB.
+
+Quick test: temporarily remove the UC `hostAlloc` injection from CLR PKGBUILD, rebuild, rerun `test_h2d_kernel`.
+
+**Avenue C: Force single-chunk H2D**
+
+Increase the staging buffer size or the per-chunk transfer size so that 16MB fits in a single chunk. This avoids the inter-chunk completion problem entirely. CLR's `StagingXferSize` defaults to ~2MB — increasing it to 64MB would make most model weight transfers single-chunk.
+
+Downside: wastes memory. But for a 2GB card with 454MB model, this is acceptable.
+
+**Avenue D: CPU memcpy fallback for H2D on no-atomics**
+
+Instead of using the blit kernel (GPU-side copy via staging), do a direct CPU `memcpy` to VRAM through the BAR for H2D transfers. This bypasses the staging/blit/completion path entirely.
+
+Problem: BAR is only 256MB (visible VRAM). Allocations in invisible VRAM (>256MB) can't be CPU-written through the BAR. Only works for small models that fit in visible VRAM.
+
+**Avenue E: Per-chunk hipDeviceSynchronize in CLR blit**
+
+Add an explicit `hipDeviceSynchronize` (or equivalent full GPU drain) between staging chunks in the H2D path. This is the nuclear option — guaranteed correct but serializes every chunk with a full GPU sync.
+
+#### Recommended Order
+
+1. **Avenue A first** — check if WaitCurrent drives bounce buffer. If not, extend Phase 7c fix. This is the root cause fix.
+2. **Avenue B** — bisect UC to rule out GPU L2 caching regression. Quick and informative.
+3. **Avenue C** — fallback if A doesn't fully fix: increase staging chunk size to avoid multi-chunk transfers.
 
 ### Phase 8: llama.cpp GPU inference optimization
 
