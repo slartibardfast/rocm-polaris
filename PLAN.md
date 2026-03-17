@@ -1371,18 +1371,18 @@ Bump hip-runtime-amd-polaris pkgrel 3→4.
 
 ```bash
 # Test 1: hipHostFree no longer hangs
-HSA_OVERRIDE_GFX_VERSION=8.0.3 ROC_CPU_WAIT_FOR_SIGNAL=1 \
-  timeout 30 ./hip_smoke   # Should exit cleanly (exit 0, not 124)
+ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 30 ./hip_smoke   # exit 0, not 124
 
 # Test 2: Torture test cleanup doesn't hang
-HSA_OVERRIDE_GFX_VERSION=8.0.3 ROC_CPU_WAIT_FOR_SIGNAL=1 \
-  timeout 600 ./hip_torture_test   # All 12 tests, clean exit
+ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 600 ./hip_torture_test   # All 12 tests
 
-# Test 3: llama.cpp
-HSA_OVERRIDE_GFX_VERSION=8.0.3 ROC_CPU_WAIT_FOR_SIGNAL=1 \
-  timeout 600 llama-cli -m ~/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+# Test 3: llama.cpp (blocked by Phase 7d VM fault)
+ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 600 llama-cli \
+  -m ~/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
   -ngl 1 -p "2+2=" -n 8 --threads 4 --no-mmap
 ```
+
+**Note:** `HSA_OVERRIDE_GFX_VERSION=8.0.3` is NOT needed — our packages compile native gfx803. The override can cause NX faults and should not be used.
 
 #### Success Criteria
 - `hip_smoke` exits with code 0 (not 124/timeout)
@@ -1390,56 +1390,49 @@ HSA_OVERRIDE_GFX_VERSION=8.0.3 ROC_CPU_WAIT_FOR_SIGNAL=1 \
 - llama.cpp produces tokens
 - Zero GPU resets in dmesg
 
-### Phase 7d: GPU VM Fault During Model Tensor Access (NEXT)
+### Phase 7d: GPU VM Fault During Model Tensor Access (CURRENT)
 
 #### Problem
 
-llama.cpp `-ngl 1` now loads the model (H2D transfers complete, no hang) but the first GPU kernel faults reading model tensors:
+llama.cpp with any `-ngl` value crashes during inference:
+- `-ngl 1`: VM fault "Page not present" reading `hipHostMalloc`'d host memory (zero-copy)
+- `-ngl 99`: crash in `ggml_cuda_op_rope_impl` → ROCR → `std::terminate`, CP preemption timeout
 
-```
-VM fault (0x0c, vmid 8, pasid 32771) at page 8414, read from 'TC3'
-VM fault (0x0c, vmid 8, pasid 32771) at page 130260, read from 'TC2'
-```
+#### Phase 7d Findings
 
-Multiple faults at pages 8393-8424 (~33MB) and 130260 (~509MB). All are reads from texture cache (shader loads). The Qwen2.5-0.5B-Q4_K_M model is ~400MB. These addresses are within the model weight tensor range.
+**GART size (resolved):** Default 256MB, now 2048MB via `amdgpu.gartsize=2048`. Eliminated the original >256MB mapping failure. Fault persists at ~32MB — within GART range. **Not a GART size issue.**
 
-**Fault code 0x0c:** "Page not present or supervisor privilege" — the GPU page table entry for this address is either missing or marked not-present.
+**Fault location:** GPU reads from **`hipHostMalloc`'d host memory** at offsets ~800KB into 1MB staging buffers. ggml-hip with `-ngl 1` keeps non-offloaded layers in host memory; GPU kernels read weights via zero-copy over PCIe. Some pages within the allocation are not mapped in the GPU's VMID page tables despite being within the 2GB GART aperture.
 
-#### Hypothesis
+**UC patches NOT the cause:** `hipHostMalloc` uses `ihipMalloc`/SVM path, not `Device::hostAlloc`. Our UC injection only affects `hostAlloc`. Verified: UNCACHED flag does not affect GPU page table permissions (NX/execute bits independent of caching mode).
 
-The model is loaded via `hipMemcpy` H2D into `hipMalloc`'d VRAM. On a 2GB card, a ~400MB model fits. But the GPU VM mapping (`amdgpu_vm_bo_map`) may have a size limit or alignment issue on gfx8 that leaves some pages unmapped.
+**`HSA_OVERRIDE_GFX_VERSION` NOT needed and harmful:**
+- All our packages compile native gfx803: `libggml-hip.so` contains `amdgcn-amd-amdhsa--gfx803`, rocBLAS has 72 `.hsaco` files for gfx803
+- The override is unnecessary for our packages and caused an NX fault with TinyLlama ("Execute access to a page marked NX")
+- **Going forward: only `ROC_CPU_WAIT_FOR_SIGNAL=1`, drop `HSA_OVERRIDE_GFX_VERSION`**
 
-Possible causes:
-1. **Large BO mapping failure:** KFD silently fails to map a >256MB or >512MB BO in GPU page tables
-2. **VRAM fragmentation:** After multiple alloc/free during model loading, VRAM is fragmented and some mappings overlap or have holes
-3. **UC allocation side effect:** Our Phase 7b UC flag on host allocations may have changed how GPU-side mappings work for pinned host buffers that model loading uses
-4. **ggml-hip split:** ggml-hip may split the model across multiple small allocations that exceed GPU VA space limits
+**`-ngl 99` crash:** `ggml_cuda_op_rope_impl` → ROCR allocation path → `std::terminate`. CP queue preemption timeout. Separate from the VM fault — occurs during compute dispatch, not memory access. May be signal/kernarg exhaustion or a gfx803 ISA issue with the RoPE kernel.
 
-#### Findings
+#### Two Distinct Blockers
 
-**`-ngl 1` (1 layer GPU):** GPU VM fault reading host memory (zero-copy). ggml-hip puts non-offloaded layers in `hipHostMalloc`'d host memory. GPU kernels read these weights over PCIe. **GART aperture is 256MB** (Polaris 12) but model needs 454MB of host-mapped memory. Pages beyond 256MB are unmapped → VM fault.
+| Blocker | Trigger | Symptom | Scope |
+|---------|---------|---------|-------|
+| **Host memory mapping** | `-ngl 1` (zero-copy) | VM fault reading `hipHostMalloc` pages | KFD/amdgpu GPU page table mapping |
+| **Compute dispatch crash** | `-ngl 99` (all VRAM) | ROCR crash in RoPE kernel dispatch | ROCR signal/kernarg or gfx803 ISA |
 
-**`-ngl 99` (all layers GPU):** Model loads into VRAM (no GART issue). But crashes during `ggml_cuda_op_add` — backtrace shows ROCR allocation failure during compute. Different bug class.
+#### Investigation Plan
 
-**`-ngl 24` (all 24 layers GPU):** Same as -ngl 99 since the model has 24 layers.
+**For host memory mapping (blocker 1):**
+1. Test GPU reads from large `hipHostMalloc` at various offsets to find the mapping boundary
+2. Trace `hipHostMalloc` → `hsa_amd_memory_pool_allocate` → KFD ioctl → `amdgpu_amdkfd_gpuvm.c` mapping path
+3. Check `amdgpu_vm_bo_map` for per-BO or per-process limits on gfx8
+4. Check if GPUVM page table update (TLB flush) is missing after large host allocation
 
-#### Fix Options
-
-For the GART issue (`-ngl 1`):
-1. **Increase GART size** — kernel parameter `amdgpu.gart_size=512` or larger. Polaris supports up to 4GB GART. Requires kernel rebuild or boot param.
-2. **Use `-ngl 99`** to put everything in VRAM — but hits compute-phase crash.
-3. **Use a smaller model** that fits in 256MB GART when partially offloaded.
-
-For the compute crash (`-ngl 99`):
-1. Investigate the ROCR allocation failure in `ggml_cuda_op_add` path.
-2. May be signal/kernarg pool exhaustion under heavy dispatch.
-3. May be related to UC signal pool allocation failure.
-
-#### Next Steps
-
-1. Try `amdgpu.gart_size=1024` boot parameter
-2. Test `-ngl 99` with ROCR debug logging to identify the allocation failure
-3. Test with a very small model (e.g. tiny random) to isolate model size from dispatch pattern
+**For compute dispatch crash (blocker 2):**
+1. Run with `ROCR_BOUNCE_DEBUG=1` and `AMD_LOG_LEVEL=3` to identify where ROCR crashes
+2. Test `-ngl 99` with a trivial kernel (not RoPE) to isolate ISA vs dispatch issue
+3. Check if signal pool UC allocation is failing (new `AllocateUncached` path)
+4. Try without UC signal patch (bisect)
 
 ### Phase 8: llama.cpp GPU inference optimization
 
