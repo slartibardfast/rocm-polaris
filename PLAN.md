@@ -1415,13 +1415,31 @@ Possible causes:
 3. **UC allocation side effect:** Our Phase 7b UC flag on host allocations may have changed how GPU-side mappings work for pinned host buffers that model loading uses
 4. **ggml-hip split:** ggml-hip may split the model across multiple small allocations that exceed GPU VA space limits
 
-#### Investigation Plan
+#### Findings
 
-1. Check ggml-hip allocation pattern: how many `hipMalloc` calls, what sizes?
-2. Reproduce with a smaller model (tiny test) to isolate size vs mapping issue
-3. Check if fault happens without UC patches (bisect)
-4. Inspect `/sys/kernel/debug/dri/0/amdgpu_vm_info` for mapping state
-5. Check `amdgpu_amdkfd_gpuvm.c` for mapping limits on gfx8
+**`-ngl 1` (1 layer GPU):** GPU VM fault reading host memory (zero-copy). ggml-hip puts non-offloaded layers in `hipHostMalloc`'d host memory. GPU kernels read these weights over PCIe. **GART aperture is 256MB** (Polaris 12) but model needs 454MB of host-mapped memory. Pages beyond 256MB are unmapped → VM fault.
+
+**`-ngl 99` (all layers GPU):** Model loads into VRAM (no GART issue). But crashes during `ggml_cuda_op_add` — backtrace shows ROCR allocation failure during compute. Different bug class.
+
+**`-ngl 24` (all 24 layers GPU):** Same as -ngl 99 since the model has 24 layers.
+
+#### Fix Options
+
+For the GART issue (`-ngl 1`):
+1. **Increase GART size** — kernel parameter `amdgpu.gart_size=512` or larger. Polaris supports up to 4GB GART. Requires kernel rebuild or boot param.
+2. **Use `-ngl 99`** to put everything in VRAM — but hits compute-phase crash.
+3. **Use a smaller model** that fits in 256MB GART when partially offloaded.
+
+For the compute crash (`-ngl 99`):
+1. Investigate the ROCR allocation failure in `ggml_cuda_op_add` path.
+2. May be signal/kernarg pool exhaustion under heavy dispatch.
+3. May be related to UC signal pool allocation failure.
+
+#### Next Steps
+
+1. Try `amdgpu.gart_size=1024` boot parameter
+2. Test `-ngl 99` with ROCR debug logging to identify the allocation failure
+3. Test with a very small model (e.g. tiny random) to isolate model size from dispatch pattern
 
 ### Phase 8: llama.cpp GPU inference optimization
 
