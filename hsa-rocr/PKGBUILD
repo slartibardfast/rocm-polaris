@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=10
+pkgrel=11
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -91,6 +91,27 @@ INJECT
   # 7b-3: UC signal pool.  Add AllocateUncached to signal block allocations.
   local _sig=runtime/hsa-runtime/core/runtime/signal.cpp
   sed -i 's,core::MemoryRegion::AllocateNonPaged\, 0),core::MemoryRegion::AllocateNonPaged | core::MemoryRegion::AllocateUncached\, 0),g' "$_sig"
+
+  # 7e: UC all CPU->GPU shared memory in the blit data path.
+  # On no-atomics platforms, CPU WB-cached writes may not reach DRAM
+  # before the GPU reads via PCIe.  Make every region UC.
+  local _bk=runtime/hsa-runtime/core/runtime/amd_blit_kernel.cpp
+  local _ga=runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+
+  # 7e-1: Blit kernarg pool (src/dst/size args read by blit kernel).
+  sed -i 's|16, core::MemoryRegion::AllocateNoFlags)|16, core::MemoryRegion::AllocateUncached)|' "$_bk"
+
+  # 7e-2: AQL ring buffer (packets read by CP).  Target the system_allocator
+  #        path only (line after "} else {"), not the coarsegrain path.
+  sed -i '/ring_buf_ = agent_->system_allocator/,/AllocateExecutable);/{
+    s|core::MemoryRegion::AllocateExecutable);|core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateUncached);|
+  }' "$_aq"
+
+  # 7e-3: Blit kernel code object (instruction fetch by GPU).
+  sed -i 's|core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateExecutableBlitKernelObject|core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateExecutableBlitKernelObject | core::MemoryRegion::AllocateUncached|' "$_ga"
+
+  # 7e-4: PM4 indirect buffer (icache invalidation commands).
+  sed -i 's|pm4_ib_size_b_, 0x1000, core::MemoryRegion::AllocateExecutable)|pm4_ib_size_b_, 0x1000, core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateUncached)|' "$_aq"
 }
 
 build() {
