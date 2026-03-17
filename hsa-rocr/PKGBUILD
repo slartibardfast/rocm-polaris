@@ -104,14 +104,14 @@ INJECT
   # 7e-2: AQL ring buffer (packets read by CP).  Target the system_allocator
   #        path only (line after "} else {"), not the coarsegrain path.
   sed -i '/ring_buf_ = agent_->system_allocator/,/AllocateExecutable);/{
-    s|core::MemoryRegion::AllocateExecutable);|core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateUncached);|
+    s,AllocateExecutable);,AllocateExecutable | core::MemoryRegion::AllocateUncached);,
   }' "$_aq"
 
   # 7e-3: Blit kernel code object (instruction fetch by GPU).
-  sed -i 's|core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateExecutableBlitKernelObject|core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateExecutableBlitKernelObject | core::MemoryRegion::AllocateUncached|' "$_ga"
+  sed -i 's,AllocateExecutableBlitKernelObject),AllocateExecutableBlitKernelObject | core::MemoryRegion::AllocateUncached),' "$_ga"
 
   # 7e-4: PM4 indirect buffer (icache invalidation commands).
-  sed -i 's|pm4_ib_size_b_, 0x1000, core::MemoryRegion::AllocateExecutable)|pm4_ib_size_b_, 0x1000, core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateUncached)|' "$_aq"
+  sed -i 's,pm4_ib_size_b_\, 0x1000\, core::MemoryRegion::AllocateExecutable),pm4_ib_size_b_\, 0x1000\, core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateUncached),' "$_aq"
 }
 
 build() {
