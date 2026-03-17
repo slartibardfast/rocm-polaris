@@ -1308,6 +1308,88 @@ grep -c 'uncached\|write-combining' /proc/$(pgrep hip_torture)/smaps
 | Performance regression from UC reads | Low | Low | Data has no temporal locality; UC is correct policy |
 | ROCR `system_allocator` doesn't forward flags | Medium | High | Verify `AllocateUncached` propagates through allocator lambda |
 
+### Phase 7c: CLR Event Completion for No-Atomics Platforms (NEXT)
+
+#### Problem
+
+`hipHostFree` → `SyncAllStreams` → `HostQueue::finish()` → `Event::awaitCompletion()` spins forever at `command.cpp:247`. This blocks llama.cpp model loading and test cleanup.
+
+#### Root Cause
+
+CLR's event completion uses a two-stage mechanism:
+
+```
+GPU finishes AQL packet
+  → decrements completion signal (via PCIe AtomicOp — FAILS on no-atomics)
+    → ROCR async events loop detects signal change
+      → calls HsaAmdSignalHandler (rocvirtual.cpp:265)
+        → updateCommandsState() (rocvirtual.cpp:2088)
+          → setStatus(CL_COMPLETE) (command.cpp:105)
+            → awaitCompletion() unblocks
+```
+
+On no-atomics platforms, the GPU can't write signals via PCIe AtomicOps. Our ROCR bounce buffer CPU-decrements signals instead (via `SubRelaxed`). But `Event::awaitCompletion` spins on a C++ atomic `status_` field — it does NOT call `ProcessAllBounceBuffers()`. So the bounce buffer never runs during the spin, signals never fire, `HsaAmdSignalHandler` never executes, and `status_` stays at `CL_SUBMITTED` forever.
+
+**Why the smoke test works:** Simple `hipMemcpy` is synchronous — CLR calls `HostQueue::finish()` with `cpu_wait=true`. The command's signal IS waited on via ROCR signal wait paths (which DO call `ProcessAllBounceBuffers`). The marker submitted by `finish()` has no signal of its own — it waits for all previous commands. If previous commands already completed (their signals fired via the ROCR wait path), the marker completes.
+
+**Why llama.cpp hangs:** Model loading submits many H2D copies across multiple streams, then `hipHostFree` calls `SyncAllStreams`. Some streams have commands whose async handler hasn't fired yet (signal was CPU-decremented by bounce buffer, but the async events thread hasn't polled it). The marker in `finish()` waits for these stale commands, and the active-wait loop at `command.cpp:247` doesn't drive the bounce buffer.
+
+#### Fix
+
+Add `ProcessAllBounceBuffers()` to CLR's active-wait loop in `Event::awaitCompletion()`:
+
+```cpp
+// command.cpp:246-248, in the ActiveWait loop:
+while (status() > CL_COMPLETE) {
+    AMD::AqlQueue::ProcessAllBounceBuffers();  // ← ADD THIS
+    amd::Os::yield();
+}
+```
+
+This closes the completion loop: while CLR spins waiting for event status, it drives the bounce buffer, which fires signals, which triggers `HsaAmdSignalHandler`, which sets `CL_COMPLETE`.
+
+**Why this is correct:** On coherent platforms, `ProcessAllBounceBuffers()` is a no-op (no bounce queues registered). On no-atomics platforms, it's the same call already present in `BusyWaitSignal::WaitRelaxed` and `InterruptSignal::WaitRelaxed` — we're just adding it to the CLR-level wait loop that wasn't going through ROCR signal wait.
+
+#### Changes
+
+**CLR patch (hip-runtime-amd PKGBUILD sed injection):**
+```bash
+# In command.cpp, add ProcessAllBounceBuffers to active-wait loop
+sed -i '/amd::Os::yield();/i\
+        AMD::AqlQueue::ProcessAllBounceBuffers();' \
+    rocclr/platform/command.cpp
+
+# Add include for AqlQueue header
+sed -i '/#include "platform\/command.h"/a\
+#include "core/inc/amd_aql_queue.h"' \
+    rocclr/platform/command.cpp
+```
+
+Bump hip-runtime-amd-polaris pkgrel 3→4.
+
+#### Verification
+
+```bash
+# Test 1: hipHostFree no longer hangs
+HSA_OVERRIDE_GFX_VERSION=8.0.3 ROC_CPU_WAIT_FOR_SIGNAL=1 \
+  timeout 30 ./hip_smoke   # Should exit cleanly (exit 0, not 124)
+
+# Test 2: Torture test cleanup doesn't hang
+HSA_OVERRIDE_GFX_VERSION=8.0.3 ROC_CPU_WAIT_FOR_SIGNAL=1 \
+  timeout 600 ./hip_torture_test   # All 12 tests, clean exit
+
+# Test 3: llama.cpp
+HSA_OVERRIDE_GFX_VERSION=8.0.3 ROC_CPU_WAIT_FOR_SIGNAL=1 \
+  timeout 600 llama-cli -m ~/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+  -ngl 1 -p "2+2=" -n 8 --threads 4 --no-mmap
+```
+
+#### Success Criteria
+- `hip_smoke` exits with code 0 (not 124/timeout)
+- Torture test 12/12 PASS with clean exit
+- llama.cpp produces tokens
+- Zero GPU resets in dmesg
+
 ### Phase 8: llama.cpp GPU inference optimization
 
 Once inference works, measure performance:
