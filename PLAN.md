@@ -1390,6 +1390,39 @@ HSA_OVERRIDE_GFX_VERSION=8.0.3 ROC_CPU_WAIT_FOR_SIGNAL=1 \
 - llama.cpp produces tokens
 - Zero GPU resets in dmesg
 
+### Phase 7d: GPU VM Fault During Model Tensor Access (NEXT)
+
+#### Problem
+
+llama.cpp `-ngl 1` now loads the model (H2D transfers complete, no hang) but the first GPU kernel faults reading model tensors:
+
+```
+VM fault (0x0c, vmid 8, pasid 32771) at page 8414, read from 'TC3'
+VM fault (0x0c, vmid 8, pasid 32771) at page 130260, read from 'TC2'
+```
+
+Multiple faults at pages 8393-8424 (~33MB) and 130260 (~509MB). All are reads from texture cache (shader loads). The Qwen2.5-0.5B-Q4_K_M model is ~400MB. These addresses are within the model weight tensor range.
+
+**Fault code 0x0c:** "Page not present or supervisor privilege" — the GPU page table entry for this address is either missing or marked not-present.
+
+#### Hypothesis
+
+The model is loaded via `hipMemcpy` H2D into `hipMalloc`'d VRAM. On a 2GB card, a ~400MB model fits. But the GPU VM mapping (`amdgpu_vm_bo_map`) may have a size limit or alignment issue on gfx8 that leaves some pages unmapped.
+
+Possible causes:
+1. **Large BO mapping failure:** KFD silently fails to map a >256MB or >512MB BO in GPU page tables
+2. **VRAM fragmentation:** After multiple alloc/free during model loading, VRAM is fragmented and some mappings overlap or have holes
+3. **UC allocation side effect:** Our Phase 7b UC flag on host allocations may have changed how GPU-side mappings work for pinned host buffers that model loading uses
+4. **ggml-hip split:** ggml-hip may split the model across multiple small allocations that exceed GPU VA space limits
+
+#### Investigation Plan
+
+1. Check ggml-hip allocation pattern: how many `hipMalloc` calls, what sizes?
+2. Reproduce with a smaller model (tiny test) to isolate size vs mapping issue
+3. Check if fault happens without UC patches (bisect)
+4. Inspect `/sys/kernel/debug/dri/0/amdgpu_vm_info` for mapping state
+5. Check `amdgpu_amdkfd_gpuvm.c` for mapping limits on gfx8
+
 ### Phase 8: llama.cpp GPU inference optimization
 
 Once inference works, measure performance:
