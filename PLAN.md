@@ -1575,6 +1575,32 @@ The CLR `kKernArg` exclusion from UC in Phase 7b should be **removed** — user 
 
 **Expected result:** With all CPU→GPU shared memory UC, the CPU's writes go directly to DRAM. The GPU reads from DRAM via PCIe (MTYPE=UC, bypassing L2). No stale data possible. The H2D blit kernel reads correct kernarg (src/dst/size) and AQL ring buffer (packet headers/dispatches), and the staging buffer data is also correct (already UC).
 
+#### Phase 7e Results (post cold boot)
+
+Test results with Phase 7e UC fixes on a cold-booted GPU:
+
+| Test | 1MB | 4MB | 16MB | 32MB | 48MB | 64MB | 65MB |
+|------|-----|-----|------|------|------|------|------|
+| hipMemset + GPU verify | PASS | PASS | PASS | PASS | - | PASS | - |
+| H2D + D2H (CPU verify) | PASS | PASS | PASS | PASS | - | PASS | - |
+| H2D + GPU kernel verify | PASS | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+
+**16MB H2D + GPU verify: FIXED.** This was the original Phase 7d blocker.
+
+**65MB: New boundary.** At 65MB, the GPU kernel verify shows `gpu_bad=0` (data correct in VRAM) but `cpu_bad=78K-278K` (D2H readback corrupt, nondeterministic count). On a faulted GPU, even Test A (H2D+D2H with no kernel) fails at 65MB. On a clean GPU, `test_h2d_boundary` passes at 512MB with CPU-only D2H verify.
+
+**Remaining hypothesis — D2H MTYPE/L2 issue:**
+
+The D2H blit kernel reads from VRAM (L2-cached, MTYPE=CC) and writes to the staging buffer (system memory). The staging buffer was made UC on the CPU side (via `HSA_AMD_MEMORY_POOL_UNCACHED_FLAG`). But what MTYPE does the **GPU** see for the staging buffer PTE?
+
+- If the GPU PTE for staging has MTYPE=UC: GPU writes bypass L2, go directly to DRAM via PCIe. CPU reads DRAM. Correct.
+- If the GPU PTE for staging has MTYPE=NC: GPU writes go to L2 but are not coherent with DRAM. CPU reads DRAM and sees stale data. **This is the bug.**
+- If the GPU PTE for staging has MTYPE=CC: GPU writes go to L2, and L2 snoops/flushes on system scope release fence. Correct on coherent platforms. On no-atomics platforms, the release fence may be a no-op for CC pages — data stays in L2.
+
+The `HSA_AMD_MEMORY_POOL_UNCACHED_FLAG` sets the CPU mapping to UC via `set_memory_uc()` or equivalent. But the GPU PTE MTYPE is set separately by KFD during `mmap`/`map_memory_to_gpu`. We need to verify that the KFD `kfd_ioctl_map_memory_to_gpu` path respects the uncached flag and sets MTYPE=UC in the GPU page table entry.
+
+**Next step:** Check `amdgpu_amdkfd_gpuvm.c` → `amdgpu_vm_bo_update()` → PTE flags for how MTYPE is determined from allocation flags. If the GPU PTE doesn't get MTYPE=UC even when the CPU side is UC, we need a kernel patch.
+
 ### Phase 8: llama.cpp GPU inference optimization
 
 Once inference works, measure performance:
