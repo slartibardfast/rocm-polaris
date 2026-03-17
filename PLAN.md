@@ -1462,11 +1462,26 @@ Problem: BAR is only 256MB (visible VRAM). Allocations in invisible VRAM (>256MB
 
 Add an explicit `hipDeviceSynchronize` (or equivalent full GPU drain) between staging chunks in the H2D path. This is the nuclear option — guaranteed correct but serializes every chunk with a full GPU sync.
 
-#### Recommended Order
+#### Avenue A Investigation Results
 
-1. **Avenue A first** — check if WaitCurrent drives bounce buffer. If not, extend Phase 7c fix. This is the root cause fix.
-2. **Avenue B** — bisect UC to rule out GPU L2 caching regression. Quick and informative.
-3. **Avenue C** — fallback if A doesn't fully fix: increase staging chunk size to avoid multi-chunk transfers.
+`WaitCurrent()` → `CpuWaitForSignal()` → `WaitForSignal()` → `hsa_signal_wait_scacquire()` → ROCR bounce buffer. **The completion chain IS correct.** The CLR profiling signal is placed as the AQL packet's `completion_signal`. The bounce buffer scans it, fires it, and `WaitCurrent()` returns.
+
+Yet 16MB H2D still fails. Bounce buffer debug shows RPTR advancing across multiple queues (blit uses a separate ROCR queue from compute). The VM fault is at a VRAM address that should have been written by the blit kernel. This suggests the blit kernel ran but **wrote to the wrong destination** — possibly because kernarg was corrupted, or the blit queue's AQL packet had stale data.
+
+**Avenue B removed** — UC is the correct policy, not a regression candidate.
+
+#### Systematic Audit Needed
+
+Tactical patches won't work. We need a complete audit of every function in the no-atomics data path. The remaining corruption could be in any of:
+
+1. **Kernarg allocation for blit kernel** — is the kernarg pool UC? If not, the blit kernel reads stale CPU-cached kernarg (src/dst pointers)
+2. **Blit queue signal pool** — blit uses its own ROCR AqlQueue; does its bounce buffer process correctly?
+3. **Multi-queue interaction** — CLR creates separate queues for compute vs SDMA-emulated copy; signal tracking across queues may have gaps
+4. **FENCE_SCOPE_SYSTEM in blit packet header** — line 889-890 of `amd_blit_kernel.cpp` sets `SCACQUIRE_FENCE_SCOPE=SYSTEM` and `SCRELEASE_FENCE_SCOPE=SYSTEM`. On gfx8 without coherency, system scope fences may not flush GPU L2 to DRAM. The blit kernel may write to GPU L2 but the data never reaches visible memory.
+5. **Staging buffer address in blit kernarg** — if kernarg uses WB-cached host memory, the blit kernel may read a stale staging buffer pointer
+6. **AQL ring buffer for blit queue** — if the ring buffer itself is WB-cached and the CPU writes aren't visible to the GPU, the AQL packet content may be stale
+
+**Each of these requires UC or explicit flush treatment on no-atomics platforms.** The fix must be comprehensive — covering all shared memory between CPU and GPU in the data transfer path, not just the three regions we identified in Phase 7b.
 
 ### Phase 8: llama.cpp GPU inference optimization
 
