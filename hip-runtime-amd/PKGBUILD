@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=3
+pkgrel=4
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -49,6 +49,15 @@ prepare() {
     memFlags |= HSA_AMD_MEMORY_POOL_UNCACHED_FLAG;\
   }
   }' "$_dev"
+
+  # Phase 7c: Force synchronous flush in submitMarker on no-atomics platforms.
+  # CLR's async signal handler (HsaAmdSignalHandler) relies on GPU writing
+  # completion signals — impossible without PCIe atomics.  Force the flush()
+  # path which does: releaseGpuMemoryFence() → WaitCurrent() → updateCommandsState()
+  # → setStatus(CL_COMPLETE).  This makes marker completion CPU-driven,
+  # matching our bounce buffer architecture.
+  sed -i 's/if (vcmd.CpuWaitRequested())/if (vcmd.CpuWaitRequested() || !dev().info().pcie_atomics_)/' \
+    rocclr/device/rocm/rocvirtual.cpp
 }
 
 build() {
