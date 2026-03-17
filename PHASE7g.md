@@ -93,6 +93,24 @@ If a compute dispatch is submitted immediately after the blit completes, the CP 
 4. **Test with explicit hipDeviceSynchronize + sleep** — does a delay between H2D and kernel dispatch help? (would confirm TLB repopulation timing)
 5. **Test with smaller staging chunk size** — does reducing chunks (fewer VM operations) raise the threshold?
 
+## Key Finding: Timing/Fence Issue Confirmed
+
+A 2-second `usleep()` between `hipDeviceSynchronize()` and the verify kernel launch **eliminates the fault** — even on a GPU that has already faulted from prior tests. This proves the VM fault is a **page table / TLB timing issue**, not a permanent mapping error.
+
+### GFX8 TLB Behavior
+
+`amdgpu_vm.c:1133-1135`:
+```c
+/* On GFX8 and older any 8 PTE block with a valid bit set enters the TLB */
+flush_tlb |= amdgpu_ip_version(adev, GC_HWIP, 0) < IP_VERSION(9, 0, 0);
+```
+
+GFX8 forces TLB flush on ALL page table updates. The H2D blit's staging buffer mapping triggers `amdgpu_vm_bo_update()` via SDMA, which writes PTEs and triggers `VM_INVALIDATE_REQUEST` for the process VMID. If the TLB invalidation hasn't fully propagated by the time the CP fetches the next dispatch packet's code object or kernarg, it reads a stale TLB entry → "Page not present."
+
+### Root Cause
+
+The `hsa_amd_memory_async_copy` path maps/unmaps staging buffer pages into the GPU VA space for each chunk. Each map/unmap updates PTEs via SDMA and triggers TLB invalidation (`gmc_v8_0_flush_gpu_tlb` → `WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid)`). The TLB invalidation is asynchronous — the MMIO write returns immediately, but the actual TLB flush takes time to propagate to all CUs. The CP may start fetching the next kernel's code object before the TLB flush completes, hitting stale entries.
+
 ## Fix Options
 
 ### Option A: Pin Internal BOs in Visible VRAM (kernel patch)
@@ -101,10 +119,13 @@ Mark code objects and queue descriptors with `AMDGPU_GEM_CREATE_CPU_ACCESS_REQUI
 ### Option B: Force Kernarg to System Memory (CLR patch)
 Change CLR's `kern_arg_pool` to use system memory (HSA kernarg region) instead of fine-grain VRAM on no-atomics platforms. Already UC from Phase 7e.
 
-### Option C: TLB Flush After H2D Blit (ROCR patch)
-Issue explicit GPUVM TLB invalidation after blit completion, before returning to caller. Ensures page table is consistent before next dispatch.
+### Option C: Wait for TLB Invalidation Completion (kernel or ROCR)
+After SDMA PTE updates, wait for `VM_INVALIDATE_REQUEST` to complete by polling `VM_INVALIDATE_RESPONSE` before allowing the next dispatch. This is the correct fix — the current code writes `VM_INVALIDATE_REQUEST` but may not wait for acknowledgment on gfx8.
 
-### Option D: Reduce VRAM Pressure (CLR patch)
+### Option D: Avoid Staging Buffer Map/Unmap Per Chunk (ROCR)
+Pre-map the staging buffer into GPU VA at init time and keep it mapped. Avoid per-chunk map/unmap that triggers TLB invalidation. This eliminates the PTE update → TLB flush → stale TLB race entirely.
+
+### Option E: Reduce VRAM Pressure (CLR patch)
 Ensure staging buffer uses GTT-only placement (no VRAM fallback). Already partially done in Phase 7e.
 
 ## Test Battery
