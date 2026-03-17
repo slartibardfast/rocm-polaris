@@ -1599,7 +1599,30 @@ The D2H blit kernel reads from VRAM (L2-cached, MTYPE=CC) and writes to the stag
 
 The `HSA_AMD_MEMORY_POOL_UNCACHED_FLAG` sets the CPU mapping to UC via `set_memory_uc()` or equivalent. But the GPU PTE MTYPE is set separately by KFD during `mmap`/`map_memory_to_gpu`. We need to verify that the KFD `kfd_ioctl_map_memory_to_gpu` path respects the uncached flag and sets MTYPE=UC in the GPU page table entry.
 
-**Next step:** Check `amdgpu_amdkfd_gpuvm.c` → `amdgpu_vm_bo_update()` → PTE flags for how MTYPE is determined from allocation flags. If the GPU PTE doesn't get MTYPE=UC even when the CPU side is UC, we need a kernel patch.
+#### Phase 7f: GPU PTE SNOOPED fix (kernel patch)
+
+**Root cause identified.** The D2H corruption and the Phase 7e 65MB boundary failure share the same root cause: our kernel patch 0009 (`AMDGPU_GEM_CREATE_UNCACHED` → `ttm_uncached`) inadvertently set SNOOPED=0 in the GPU PTE, disabling the hardware coherency protocol that GFX8 depends on.
+
+**Evidence chain:**
+
+1. **VI/gfx8 PTEs have NO MTYPE field** (only gfx9+ has MTYPE at bits 57:58). The ONLY per-page coherency control on VI is the SNOOPED bit (PTE bit 2).
+
+2. **GFX8 ISA has NO L2 flush mechanism.** LLVM's `SIGfx7CacheControl::insertRelease()` (`SIMemoryLegalizer.cpp:1291-1298`) implements system-scope release as just `insertWait()` (= `s_waitcnt`). `SIGfx7CacheControl::insertAcquire()` (line 1300-1348) inserts `BUFFER_WBINVL1_VOL` — L1 invalidate only, not L2.
+
+3. **GFX8 assumes hardware coherency for system memory.** Since the ISA provides no L2 flush, the hardware must handle L2→DRAM coherency. The mechanism is the SNOOPED bit: SNOOPED=1 makes GPU L2 participate in the PCIe coherency protocol. Writes through L2 are visible to the CPU via the snooping hardware in the root complex.
+
+4. **Kernel code sets SNOOPED based on TTM caching mode** (`amdgpu_ttm.c:1377-1378`):
+   ```c
+   if (ttm && ttm->caching == ttm_cached)
+       flags |= AMDGPU_PTE_SNOOPED;
+   ```
+   Our patch 0009 changed caching from `ttm_cached` to `ttm_uncached` → SNOOPED=0 → GPU L2 non-coherent → D2H writes to staging stay in GPU L2 → CPU reads stale DRAM.
+
+5. **Precedent: ARM non-coherent platform work.** The [drm/ttm RFC](https://lore.kernel.org/linux-kernel/20240629052247.2653363-1-uwu@icenowy.me/T/) for devices without coherency and the [Raspberry Pi GPU testing](https://github.com/geerlingguy/raspberry-pi-pcie-devices/discussions/756) confirm that GPU drivers assume PCIe snooping works. Non-coherent platforms need special handling.
+
+**Fix:** Set SNOOPED=1 for `ttm_uncached` system memory in `amdgpu_ttm_tt_pde_flags()`. This restores GPU L2 coherency while keeping CPU-side UC (no CPU cache lines to flush). The GPU snoops CPU cache (finds nothing since UC), writes propagate through the coherency protocol to DRAM.
+
+**Phase 7f (ACQUIRE_MEM hack): REMOVED.** The PM4 TC_WB_ACTION_ENA is a hardware operation outside the GFX8 ISA memory model. It caused VM faults when ExecutePM4 was called on the blit queue. The kernel SNOOPED fix is the correct solution.
 
 ### Phase 8: llama.cpp GPU inference optimization
 
