@@ -1483,6 +1483,98 @@ Tactical patches won't work. We need a complete audit of every function in the n
 
 **Each of these requires UC or explicit flush treatment on no-atomics platforms.** The fix must be comprehensive — covering all shared memory between CPU and GPU in the data transfer path, not just the three regions we identified in Phase 7b.
 
+#### Complete Shared Memory Audit
+
+All allocations via `system_allocator()` return kernarg pool memory (fine-grain host, CPU VA = GPU VA). On coherent platforms this is safe. On no-atomics Westmere, CPU writes are WB-cached and GPU reads via PCIe see DRAM — not the CPU cache. Every region where CPU writes and GPU reads must be UC.
+
+**Region 1: Blit kernel kernarg** (`amd_blit_kernel.cpp:566-568`)
+```cpp
+kernarg_async_ = system_allocator()(size, 16, AllocateNoFlags);
+```
+- **Flags:** `AllocateNoFlags` (= 0) → **WB cached**
+- **Contains:** src pointer, dst pointer, copy size, work dimensions
+- **CPU writes:** `args->copy_aligned.*` (lines 758-791), no clflush after
+- **GPU reads:** blit kernel reads these as kernel arguments
+- **Status: BROKEN.** Prime suspect for H2D corruption. GPU reads stale/zero kernarg → copies wrong src to wrong dst.
+- **Fix:** Change to `AllocateUncached`
+
+**Region 2: AQL ring buffer** (`amd_aql_queue.cpp:715-717`)
+```cpp
+ring_buf_ = system_allocator()(ring_buf_alloc_bytes_, 0x1000, AllocateExecutable);
+```
+- **Flags:** `AllocateExecutable` → **WB cached**
+- **Contains:** AQL dispatch/barrier packets (64 bytes each)
+- **CPU writes:** `PopulateQueue` (line 910-912) with acquire/release fences
+- **GPU reads:** CP fetches packets from ring buffer via PCIe
+- **Status: SUSPECT.** CPU writes AQL packet body, then atomically stores header. x86 `std::atomic_thread_fence(release)` ensures ordering within the CPU cache, but doesn't flush to DRAM. CP may read stale packet from ring buffer.
+- **Fix:** Change to `AllocateExecutable | AllocateUncached`
+
+**Region 3: Staging buffer** (CLR `hostAlloc` with `kAtomics` segment)
+- **Status: FIXED** (Phase 7b). UC via `HSA_AMD_MEMORY_POOL_UNCACHED_FLAG`.
+
+**Region 4: RPTR report buffer** (`amd_aql_queue.cpp:144-145`)
+- **Status: FIXED** (Phase 7b). UC via `AllocateUncached`.
+
+**Region 5: Signal pool** (`signal.cpp:82`)
+- **Status: FIXED** (Phase 7b). UC via `AllocateNonPaged | AllocateUncached`.
+
+**Region 6: Blit kernel code object** (`amd_gpu_agent.cpp:381-382`)
+```cpp
+code_buf = system_allocator()(code_buf_size, 0x1000,
+    AllocateExecutable | AllocateExecutableBlitKernelObject);
+```
+- **Flags:** `AllocateExecutable` → **WB cached**
+- **Contains:** compiled shader binary (read-only after load)
+- **CPU writes:** once at initialization
+- **GPU reads:** every blit dispatch (instruction fetch)
+- **Status: PROBABLY OK.** Written once at init, read many times. By the time the first blit dispatch runs, the write has long since flushed from CPU cache to DRAM (time-based eviction). But technically unsafe on a strictly non-coherent platform. Low risk in practice.
+- **Fix (belt and suspenders):** Add `AllocateUncached`
+
+**Region 7: PM4 indirect buffer** (`amd_aql_queue.cpp:349-350`)
+```cpp
+pm4_ib_buf_ = system_allocator()(pm4_ib_size_b_, 0x1000, AllocateExecutable);
+```
+- **Flags:** `AllocateExecutable` → **WB cached**
+- **Contains:** PM4 commands for icache invalidation
+- **Status: PROBABLY OK.** Written once at queue creation, rarely changes. Same time-based reasoning as code object.
+- **Fix (belt and suspenders):** Add `AllocateUncached`
+
+**Region 8: Doorbell queue map** (`amd_gpu_agent.cpp:2310`)
+```cpp
+doorbell_queue_map_ = system_allocator()(size, 0x1000, 0);
+```
+- **Status: CPU-only.** Maps doorbell index to queue pointer. Not read by GPU.
+- **Fix: None needed.**
+
+#### FENCE_SCOPE_SYSTEM on gfx8 (Region 9 — Hardware Behavior)
+
+The blit kernel AQL packet sets `SCRELEASE_FENCE_SCOPE=SYSTEM` (line 889-890 of `amd_blit_kernel.cpp`). Investigation of what this means on gfx8:
+
+**MTYPE for system memory on gfx8:** The MQD sets `MTYPE_UC` (`kfd_mqd_manager_vi.c:128`), meaning GPU L2 does **not** cache system memory accesses. Reads/writes to system memory bypass L2 and go directly to the memory controller → PCIe. This is correct behavior — no GPU L2 coherency issue.
+
+**MTYPE for VRAM on gfx8:** VRAM accesses go through GPU L2 with MTYPE dependent on allocation flags. For standard VRAM allocations, MTYPE defaults to a cached mode. The blit kernel writes to VRAM through GPU L2.
+
+**SCRELEASE_FENCE_SCOPE=SYSTEM effect:** On gfx8, this is an **ordering fence**, not a cache flush. The CP ensures all prior memory operations from this wave are visible before marking the packet complete. With MTYPE=UC for system memory, there's nothing to flush (L2 never cached it). For VRAM writes through L2, the fence ensures the L2 write has completed before the completion signal.
+
+**Bottom line for FENCE_SCOPE_SYSTEM:** Not a problem. The blit kernel's VRAM writes go through GPU L2, and the system-scope release fence ensures they're committed before completion. The blit kernel's reads from system memory (staging buffer, kernarg) bypass L2 (MTYPE=UC for system memory). **The issue is on the CPU side (WB cached writes not reaching DRAM), not the GPU side.**
+
+**One caveat:** The above analysis assumes MTYPE=UC for system memory accessed by the compute queue. If the fine-grain pool's MTYPE is NC (non-coherent) rather than UC, GPU L2 **might** cache stale reads from system memory. This would need verification via `amdgpu_vm_get_pte_flags` in the kernel driver. However, even with MTYPE=NC, the blit kernel's `s_waitcnt vmcnt(0)` and the AQL release fence should drain any L2-cached reads.
+
+#### Comprehensive Fix Plan
+
+**Phase 7e: UC all CPU→GPU shared memory in ROCR**
+
+Three ROCR sed injections needed (all in `amd_aql_queue.cpp` and `amd_blit_kernel.cpp`):
+
+1. **Kernarg pool for blit kernel** — `AllocateNoFlags` → `AllocateUncached`
+2. **AQL ring buffer** — `AllocateExecutable` → `AllocateExecutable | AllocateUncached`
+3. **Code object** (belt and suspenders) — add `AllocateUncached`
+4. **PM4 IB buffer** (belt and suspenders) — add `AllocateUncached`
+
+The CLR `kKernArg` exclusion from UC in Phase 7b should be **removed** — user kernel kernarg has the same CPU→GPU visibility problem. The exclusion was wrong.
+
+**Expected result:** With all CPU→GPU shared memory UC, the CPU's writes go directly to DRAM. The GPU reads from DRAM via PCIe (MTYPE=UC, bypassing L2). No stale data possible. The H2D blit kernel reads correct kernarg (src/dst/size) and AQL ring buffer (packet headers/dispatches), and the staging buffer data is also correct (already UC).
+
 ### Phase 8: llama.cpp GPU inference optimization
 
 Once inference works, measure performance:
