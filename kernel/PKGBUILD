@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=14
+pkgrel=15
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -80,9 +80,9 @@ prepare() {
     patch -Np1 < "../$src"
   done
 
-  # Phase 7g: Wait for TLB invalidation on gmc_v8.
+  # Wait for TLB invalidation completion on gmc_v8.
   # gmc_v8_0_flush_gpu_tlb() writes VM_INVALIDATE_REQUEST but never polls
-  # VM_INVALIDATE_RESPONSE. Inject polling loop after the WREG32 call.
+  # VM_INVALIDATE_RESPONSE, unlike gmc_v9+.  Inject polling loop.
   local _gmc=drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
   sed -i '/WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);$/{
     a\
@@ -97,6 +97,30 @@ prepare() {
 \t\t}\
 \t}
   }' "$_gmc"
+
+  # Flush pending KFD eviction restore before returning from alloc/map
+  # ioctls.  VRAM allocation can trigger process eviction (queues stopped,
+  # BOs unmapped) with restore deferred by PROCESS_RESTORE_TIME_MS (100ms).
+  # Without flushing, the ioctl returns while queues are still stopped,
+  # and the next dispatch VM-faults on unmapped internal structures.
+  local _kfd=drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+  # In kfd_ioctl_alloc_memory_of_gpu: flush before returning handle.
+  # Use python for precise insertion at the right return point.
+  python3 -c "
+import re
+with open('$_kfd') as f: s = f.read()
+# Insert after 'mutex_unlock(&p->mutex);' in alloc_memory_of_gpu only.
+# The function has a unique 'MAKE_HANDLE(args->gpu_id, idr_handle)' line.
+old = 'args->handle = MAKE_HANDLE(args->gpu_id, idr_handle);'
+new = 'flush_delayed_work(\&p->eviction_work);\n\n\targs->handle = MAKE_HANDLE(args->gpu_id, idr_handle);'
+s = s.replace(old, new, 1)  # replace first occurrence only (alloc ioctl)
+# In kfd_ioctl_map_memory_to_gpu: flush before return on success path.
+# The success return is 'kfree(devices_arr);\n\n\treturn err;' (line 1342-1344).
+old2 = 'kfree(devices_arr);\n\n\treturn err;'
+new2 = 'kfree(devices_arr);\n\tflush_delayed_work(\&p->eviction_work);\n\n\treturn err;'
+s = s.replace(old2, new2, 1)  # replace first occurrence only (map ioctl success)
+with open('$_kfd', 'w') as f: f.write(s)
+"
 
   echo "Setting config..."
   cp ../config .config
