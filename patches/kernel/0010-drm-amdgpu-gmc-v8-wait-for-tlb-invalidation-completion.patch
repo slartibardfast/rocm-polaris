@@ -15,12 +15,8 @@
 
 --- a/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
 +++ b/drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
-@@ -661,7 +661,18 @@
- static void gmc_v8_0_flush_gpu_tlb(struct amdgpu_device *adev, uint32_t vmid,
- 					uint32_t vmhub, uint32_t flush_type)
+@@ -663,4 +663,15 @@
  {
-+	unsigned int i;
-+
  	/* bits 0-15 are the VM contexts0-15 */
  	WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
 +
@@ -28,9 +24,12 @@
 +	 * dispatches immediately after page table updates (e.g. H2D blit
 +	 * staging buffer map/unmap) may hit stale TLB entries.
 +	 */
-+	for (i = 0; i < adev->usec_timeout; i++) {
-+		if (RREG32(mmVM_INVALIDATE_RESPONSE) & (1 << vmid))
-+			break;
-+		udelay(1);
++	{
++		unsigned int i;
++		for (i = 0; i < adev->usec_timeout; i++) {
++			if (RREG32(mmVM_INVALIDATE_RESPONSE) & (1 << vmid))
++				break;
++			udelay(1);
++		}
 +	}
  }
