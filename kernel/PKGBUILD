@@ -101,7 +101,7 @@ MODULE_PARM_DESC(gfx8_pte_flush,
 \t\"GFX8 PTE flush after TLB inv (bitmask): 1=CP_COHER, 2=HDP, 4=VM_L2\");
 '''
 s = s.replace('#include \"oss/oss_3_0_sh_mask.h\"',
-              '#include \"oss/oss_3_0_sh_mask.h\"' + param_code, 1)
+              '#include \"oss/oss_3_0_sh_mask.h\"\n#include \"gca/gfx_8_0_d.h\"\n#include \"gca/gfx_8_0_sh_mask.h\"' + param_code, 1)
 
 # Replace the flush_gpu_tlb function body
 old_body = '''\t/* bits 0-15 are the VM contexts0-15 */
@@ -174,22 +174,10 @@ s = s.replace(old2, new2, 1)  # replace first occurrence only (map ioctl success
 with open('$_kfd', 'w') as f: f.write(s)
 "
 
-  # Force CPU page table updates for compute on small BAR systems.
-  # SDMA and GFX engines are not L2 cache coherent on gfx8 — SDMA PTE
-  # writes may not be visible to the GFX page walker (known hw limitation,
-  # Mesa disabled SDMA for Polaris entirely).  CPU writes via the BAR are
-  # coherent with the page walker by construction.
-  # Remove the vram_full_visible guard so small BAR systems also use CPU
-  # mode.  Page table BOs (~4MB for 2GB VRAM) easily fit in 256MB visible.
-  local _vm=drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
-  python3 -c "
-with open('$_vm') as f: s = f.read()
-s = s.replace(
-    'if (amdgpu_gmc_vram_full_visible(&adev->gmc) &&\n\t\t    !amdgpu_sriov_vf_mmio_access_protection(adev))\n\t\t\tadev->vm_manager.vm_update_mode =\n\t\t\t\tAMDGPU_VM_USE_CPU_FOR_COMPUTE;\n\t\telse\n\t\t\tadev->vm_manager.vm_update_mode = 0;',
-    'if (!amdgpu_sriov_vf_mmio_access_protection(adev))\n\t\t\tadev->vm_manager.vm_update_mode =\n\t\t\t\tAMDGPU_VM_USE_CPU_FOR_COMPUTE;\n\t\telse\n\t\t\tadev->vm_manager.vm_update_mode = 0;',
-    1)
-with open('$_vm', 'w') as f: f.write(s)
-"
+  # CPU page table updates for compute: DISABLED.
+  # vm_update_mode=2 deadlocks in amdgpu_bo_sync_wait during SDMA→CPU
+  # mode transition.  Retained as boot param option (amdgpu.vm_update_mode=2)
+  # but not forced in PKGBUILD.
 
   echo "Setting config..."
   cp ../config .config
