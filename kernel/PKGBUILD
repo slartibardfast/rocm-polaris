@@ -112,14 +112,31 @@ with open('$_kfd') as f: s = f.read()
 # Insert after 'mutex_unlock(&p->mutex);' in alloc_memory_of_gpu only.
 # The function has a unique 'MAKE_HANDLE(args->gpu_id, idr_handle)' line.
 old = 'args->handle = MAKE_HANDLE(args->gpu_id, idr_handle);'
-new = 'flush_delayed_work(\&p->eviction_work);\n\n\targs->handle = MAKE_HANDLE(args->gpu_id, idr_handle);'
+new = 'flush_delayed_work(&p->eviction_work);\n\n\targs->handle = MAKE_HANDLE(args->gpu_id, idr_handle);'
 s = s.replace(old, new, 1)  # replace first occurrence only (alloc ioctl)
 # In kfd_ioctl_map_memory_to_gpu: flush before return on success path.
 # The success return is 'kfree(devices_arr);\n\n\treturn err;' (line 1342-1344).
 old2 = 'kfree(devices_arr);\n\n\treturn err;'
-new2 = 'kfree(devices_arr);\n\tflush_delayed_work(\&p->eviction_work);\n\n\treturn err;'
+new2 = 'kfree(devices_arr);\n\tflush_delayed_work(&p->eviction_work);\n\n\treturn err;'
 s = s.replace(old2, new2, 1)  # replace first occurrence only (map ioctl success)
 with open('$_kfd', 'w') as f: f.write(s)
+"
+
+  # Force CPU page table updates for compute on small BAR systems.
+  # SDMA and GFX engines are not L2 cache coherent on gfx8 — SDMA PTE
+  # writes may not be visible to the GFX page walker (known hw limitation,
+  # Mesa disabled SDMA for Polaris entirely).  CPU writes via the BAR are
+  # coherent with the page walker by construction.
+  # Remove the vram_full_visible guard so small BAR systems also use CPU
+  # mode.  Page table BOs (~4MB for 2GB VRAM) easily fit in 256MB visible.
+  local _vm=drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+  python3 -c "
+with open('$_vm') as f: s = f.read()
+s = s.replace(
+    'if (amdgpu_gmc_vram_full_visible(&adev->gmc) &&\n\t\t    !amdgpu_sriov_vf_mmio_access_protection(adev))\n\t\t\tadev->vm_manager.vm_update_mode =\n\t\t\t\tAMDGPU_VM_USE_CPU_FOR_COMPUTE;\n\t\telse\n\t\t\tadev->vm_manager.vm_update_mode = 0;',
+    'if (!amdgpu_sriov_vf_mmio_access_protection(adev))\n\t\t\tadev->vm_manager.vm_update_mode =\n\t\t\t\tAMDGPU_VM_USE_CPU_FOR_COMPUTE;\n\t\telse\n\t\t\tadev->vm_manager.vm_update_mode = 0;',
+    1)
+with open('$_vm', 'w') as f: f.write(s)
 "
 
   echo "Setting config..."
