@@ -1,119 +1,83 @@
-# Phase 7g: SDMA-GFX L2 Incoherence for Page Table Updates
+# Phase 7g: GPU VM Fault After H2D Blit ≥32MB
 
-## Status: FIX UNDER TEST — SNOOPED=1 FOR ALL SYSTEM MEMORY
+## Status: ROOT CAUSE UNKNOWN — SDMA THEORY DISPROVEN
 
-## Root Cause
+## What We Know (Hard Facts)
 
-SDMA and GFX engines are not L2 cache coherent on gfx8 (known hardware limitation — Mesa disabled SDMA for Polaris entirely). The kernel driver uses SDMA to write page table entries (PTEs). The GFX page walker reads stale PTE data, causing VM faults after hipMalloc triggers internal BO remapping.
+### The fault
+- GPU VM fault "Page not present" at ~48-53MB into VRAM address space
+- Fault is in a GTT-mapped region: `0x4102fff000 - 0x4105000000 domain GTT`
+- Fault address varies slightly between runs but always in this range
+- Read from TC (texture cache) — GPU kernel or page walker trying to read
 
-On VI/gfx8, the SNOOPED PTE bit (bit 2) is the only per-page coherency control. It determines whether GPU accesses to system memory participate in the PCIe coherency protocol. Without SNOOPED=1, GPU reads may see stale data from SDMA writes.
+### What triggers it
+- `hipMemcpy H2D` of ≥32MB followed by any GPU kernel dispatch
+- The H2D blit causes internal structures at `0x4102fff000` to be **unmapped from VRAM and remapped to GTT** (kernel debug output confirms)
+- The subsequent GPU kernel dispatch faults reading from the GTT-mapped region
 
-## Current Fix: Unconditional SNOOPED=1 (kernel 6.18.16-16)
+### What does NOT trigger it
+- `hipMemset` 32MB + GPU kernel verify: PASS (no blit, no remapping)
+- `hipMemcpy H2D` 16MB + GPU kernel verify: PASS (no remapping at 16MB)
+- `hipMemcpy H2D` 32MB + `hipMemcpy D2H` 32MB (blit-only, no GPU kernel): PASS at 512MB
+- `hipMemcpy H2D` 32MB + `read_one<<<1,1>>>`: passed on kernel 13, faults on kernel 16
 
-Page table BOs are created with `AMDGPU_GEM_CREATE_CPU_GTT_USWC` → `ttm_write_combined`. Our previous patch 0009 set SNOOPED only for `ttm_cached` and `ttm_uncached`, excluding `ttm_write_combined`. This meant page table BOs that fall back to GTT (system memory) had SNOOPED=0 — SDMA writes to them were invisible to the page walker.
-
-**Fix:** Set `AMDGPU_PTE_SNOOPED` unconditionally for ALL system memory pages in `amdgpu_ttm_tt_pde_flags()`. No caching mode check. On VI where SNOOPED is the only coherency knob, it must always be on.
-
-```c
-// Before (ttm_write_combined excluded):
-if (ttm && ttm->caching != ttm_write_combined)
-    flags |= AMDGPU_PTE_SNOOPED;
-
-// After (unconditional):
-flags |= AMDGPU_PTE_SNOOPED;
+### Kernel debug output (clean boot, during fault)
+```
+Unmap VA 0x4100600000 - 0x4101600000    ← free previous 16MB alloc
+Map VA 0x4100600000 - 0x4102600000 domain VRAM   ← new 32MB alloc
+Map VA 0x4102fff000 - 0x4105000000 domain GTT     ← internal structures remapped to GTT
+... VM fault at 0x41030a0000 (within GTT-mapped region) ...
 ```
 
-## Contingency: If SNOOPED=1 Doesn't Fix 32MB
+## What We Ruled Out
 
-SNOOPED only affects system memory (GTT) pages. If page table BOs remain in VRAM (their preferred domain), SNOOPED has no effect — the SDMA-GFX incoherence is within the GPU's internal fabric. Contingency plans ranked by feasibility:
+| Hypothesis | Test | Result |
+|---|---|---|
+| SDMA-GFX L2 incoherence | `amdgpu.num_sdma=0` (disable SDMA entirely) | **Still faults** |
+| TLB stale entries | Poll VM_INVALIDATE_RESPONSE | Still faults |
+| KFD eviction race | flush_delayed_work in alloc/map ioctls | Still faults |
+| CPU PTE mode (bypass SDMA) | `amdgpu.vm_update_mode=2` | Deadlocks (separate bug) |
+| SNOOPED=0 on page table BOs | `if (ttm)` SNOOPED for all system memory | Still faults |
+| GPU runtime PM | `amdgpu.runpm=0` | Still faults (but prevents BACO hangs) |
 
-### Option A: Force page table BOs to GTT (highest confidence)
+## What We Have NOT Tested
 
-```c
-// amdgpu_vm_pt.c — amdgpu_vm_pt_create()
-// Current:
-if (!adev->gmc.is_app_apu)
-    bp.domain = AMDGPU_GEM_DOMAIN_VRAM;
-// Change for small BAR:
-if (!adev->gmc.is_app_apu && amdgpu_gmc_vram_full_visible(&adev->gmc))
-    bp.domain = AMDGPU_GEM_DOMAIN_VRAM;
-else
-    bp.domain = AMDGPU_GEM_DOMAIN_GTT;
+1. **Is the GTT mapping physically backed?** The PTEs map to GTT pages, but are those pages pinned in system memory? If TTM hasn't populated the physical pages, the GPU reads from an unmapped physical address.
+
+2. **Is the BO validation complete before dispatch?** The `amdgpu_vm_bo_update()` submits PTE writes (via GFX ring with num_sdma=0). The dispatch fence should ensure completion, but maybe the fence isn't properly awaited by the KFD compute queue.
+
+3. **Is the issue in how the internal BO is remapped?** The unmap at `0x4102fff000` followed by remap to a larger range (`0x4102fff000 - 0x4105000000`) might leave a gap or use a stale PDE if the page directory entry for that range wasn't updated.
+
+4. **Is the fault address in the page directory or page table BO itself?** If the PDE pointing to the page table for the 0x41030xxxxx range was invalidated during remapping, the page walker can't find the PTE.
+
+5. **Does the fault happen with a smaller VRAM allocation that doesn't trigger remapping?** If we can find a 32MB allocation pattern that doesn't cause the GTT remapping, we can confirm the remapping is the trigger.
+
+## Recommended Next Steps (In Order)
+
+### Step 1: Characterize the remapping trigger
+What exactly is the BO at `0x4102fff000`? Is it a queue descriptor, scratch memory, code object? Enable kernel debug (`echo 'file amdgpu_amdkfd_gpuvm.c +p' | sudo tee /proc/dynamic_debug/control`) and trace which BO gets remapped and why.
+
+### Step 2: Check if the BO is a KFD internal allocation
+Cross-reference `0x4102fff000` with KFD's BO list. The BO might be allocated during `kfd_process_device_init_vm` and remapped during `hipMalloc`.
+
+### Step 3: Test without the GTT remapping
+If the BO at `0x4102fff000` is being moved from VRAM to GTT because of memory pressure, try reducing the allocation to avoid the move. Or try `hipMalloc(32MB)` without the preceding 16MB alloc/free cycle (the test does A=32MB memset, B=16MB H2D, then C=32MB H2D — B's 16MB alloc/free may fragment VRAM).
+
+### Step 4: Test with standalone 32MB (no prior allocations)
+Write a minimal test: single `hipMalloc(32MB)` + `hipMemcpy H2D` + `verify<<<1,256>>>` with no prior GPU operations. This isolates whether the fault requires the alloc/free cycling from tests A and B.
+
+## Packages (Current)
+
+- `linux-lts-rocm-polaris` 6.18.16-16: patches 0004-0006, 0008-0009 + TLB wait + eviction flush
+- `hsa-rocr-polaris` 7.2.0-13: UC shared memory, bounce buffer, cpu-wait blit deps
+- `hip-runtime-amd-polaris` 7.2.0-5: UC hostAlloc, synchronous flush, cpu_wait_for_signal
+- `rocblas-gfx803` 7.2.0-2: gfx803 target restored
+- `llama-cpp-rocm-polaris` b7376-1: native gfx803 build
+
+## Boot Parameters
+
+```
+amdgpu.sched_policy=2 amdgpu.runpm=0
 ```
 
-With PT BOs in GTT + SNOOPED=1, the page walker reads them through the PCIe coherency protocol. CPU can write PTEs directly (no SDMA). ~4MB of page tables in system memory is negligible.
-
-**Why it works:** Eliminates SDMA from the PTE write path entirely. CPU writes to GTT are coherent with the page walker via SNOOPED. This is analogous to `vm_update_mode=2` (CPU PTE updates) but without the sync_wait deadlock — the PT BOs start in GTT, no SDMA→CPU mode transition needed.
-
-### Option B: Disable SDMA rings (quick diagnostic)
-
-Boot with `amdgpu.num_sdma=0`. If the driver falls back to GFX for all DMA operations, the SDMA-GFX incoherence vanishes. Quick 30-second test to confirm the theory. Not a production fix (disables all SDMA).
-
-### Option C: Fix vm_update_mode=2 deadlock
-
-The CPU PTE mode (`vm_update_mode=2`) deadlocked in `amdgpu_bo_sync_wait(vm->root.bo)` during `amdgpu_vm_make_compute`. The wait tries to drain outstanding SDMA fences before switching to CPU mode. If an SDMA fence never signals (broken SDMA on gfx8), it hangs forever.
-
-Fix: skip or timeout the sync_wait when transitioning to CPU mode on gfx8. The stale SDMA fence is irrelevant — we're switching away from SDMA precisely because it's broken.
-
-```c
-// amdgpu_vm.c — amdgpu_vm_make_compute(), after setting use_cpu_for_update:
-if (vm->use_cpu_for_update) {
-    r = amdgpu_bo_sync_wait(vm->root.bo,
-                            AMDGPU_FENCE_OWNER_UNDEFINED, true);
-    // Add: skip wait failure on gfx8 — SDMA fences may be stale
-    if (r && amdgpu_ip_version(adev, GC_HWIP, 0) < IP_VERSION(9, 0, 0))
-        r = 0;  // ignore SDMA fence timeout on pre-gfx9
-```
-
-### Option D: Debug flush with hardcoded offsets (diagnostic)
-
-Rebuild the runtime-switchable gfx8_pte_flush parameter using raw hex register offsets instead of macro names (avoid gca include crash):
-
-```c
-#define GFX8_CP_COHER_CNTL   0xc07c
-#define GFX8_CP_COHER_SIZE   0xc07d
-#define GFX8_CP_COHER_BASE   0xc07e
-#define GFX8_CP_COHER_STATUS 0xc07f
-```
-
-Tests whether CP_COHER/HDP/VM_L2 flush resolves VRAM-internal incoherence at runtime without rebuilds.
-
-### Option E: Force GFX ring for PTE writes (Mesa's approach)
-
-Change the SDMA scheduler entity for gfx8 VM updates to use the GFX ring. Most comprehensive fix but deepest driver change. Mesa did the equivalent by disabling SDMA entirely.
-
-## Test Protocol
-
-After cold boot with each fix:
-
-```bash
-# Basic functionality
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 30 ~/rocm-polaris/tests/hip_smoke
-
-# Phase 7g test battery (32MB H2D + compute kernel)
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 120 ~/rocm-polaris/tests/test_h2d_kernel
-
-# Full boundary test (up to 512MB)
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 300 ~/rocm-polaris/tests/test_h2d_boundary
-
-# llama.cpp
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 600 llama-cli \
-  -m ~/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
-  -ngl 1 -p "2+2=" -n 8 --threads 4 --no-mmap
-```
-
-## Previous Attempts
-
-| Approach | Result | Why it failed |
-|----------|--------|---------------|
-| TLB wait (VM_INVALIDATE_RESPONSE poll) | No fix | Issue is data coherency, not TLB staleness |
-| KFD eviction flush (flush_delayed_work) | No fix | Eviction not the cause; SDMA incoherence is |
-| vm_update_mode=2 (CPU PTE writes) | Deadlock | sync_wait hangs on stale SDMA fences |
-| gfx8_pte_flush debug param | Kernel crash | gca/gfx_8_0 header include conflicts |
-| SNOOPED=1 for ttm_uncached only | Partial | Excluded ttm_write_combined PT BOs |
-
-## References
-
-- [RadeonSI Disables SDMA For Polaris](https://www.phoronix.com/news/RadeonSI-Disables-Polaris-SDMA)
-- [Mesa 20: SDMA Disabled on RX-Series](https://linuxreviews.org/Mesa_20_Will_Have_SDMA_Disabled_On_AMD_RX-Series_GPUs)
-- [AMDGPU Module Parameters: vm_update_mode](https://docs.kernel.org/gpu/amdgpu/module-parameters.html)
+Removed: `gartsize=2048` (caused GART table BO eviction), `vm_update_mode=2` (deadlocks), `num_sdma=0` (diagnostic only, didn't help)
