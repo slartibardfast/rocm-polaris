@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=16
+pkgrel=17
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -119,10 +119,12 @@ s = s.replace(old2, new2, 1)  # replace first occurrence only (map ioctl success
 with open('$_kfd', 'w') as f: f.write(s)
 "
 
-  # CPU page table updates for compute: DISABLED.
-  # vm_update_mode=2 deadlocks in amdgpu_bo_sync_wait during SDMA→CPU
-  # mode transition.  Retained as boot param option (amdgpu.vm_update_mode=2)
-  # but not forced in PKGBUILD.
+  # Enable TLB flush after unmap on gfx8.  kfd_flush_tlb_after_unmap() only
+  # returns true for GC >= 9.4.0, skipping the TLB flush for gfx8.  Without
+  # it, freed VA ranges retain stale TLB entries.  When the VA is reused by
+  # the next hipMalloc, the GPU reads stale PTEs → VM fault.
+  sed -i 's/KFD_GC_VERSION(dev) >= IP_VERSION(9, 4, 2)/KFD_GC_VERSION(dev) >= IP_VERSION(8, 0, 0)/' \
+    drivers/gpu/drm/amd/amdkfd/kfd_priv.h
 
   echo "Setting config..."
   cp ../config .config
