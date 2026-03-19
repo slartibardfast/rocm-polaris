@@ -11,18 +11,14 @@
 # This makes shared memory CPU-uncached, ensuring GPU writes are visible
 # to CPU without explicit cache flushes.
 #
-# Part 2: Set AMDGPU_PTE_SNOOPED for ttm_uncached system memory pages.
+# Part 2: Set AMDGPU_PTE_SNOOPED for ALL system memory pages.
 # GFX8/VI has no MTYPE field in PTEs — the SNOOPED bit is the only
-# per-page coherency control.  GFX8's ISA has no L2 flush instruction
-# (system-scope release is just s_waitcnt, acquire is L1-only
-# BUFFER_WBINVL1_VOL).  The hardware relies on the SNOOPED bit to make
-# GPU L2 participate in the PCIe coherency protocol.  Without SNOOPED=1,
-# GPU L2 dirty lines for system memory never propagate to DRAM, causing
-# silent data corruption on D2H transfers.
-#
-# With ttm_uncached + SNOOPED=1:
-#   CPU side: UC (writes go directly to DRAM, no cache lines to flush)
-#   GPU side: L2 coherent via PCIe snoop (writes reach DRAM reliably)
+# per-page coherency control.  Without SNOOPED=1, GPU L2 dirty lines
+# for system memory never propagate to DRAM, and SDMA writes to system
+# memory (including page table BOs in GTT) are invisible to the GFX
+# page walker.  Page table BOs use ttm_write_combined (CPU_GTT_USWC)
+# and were previously excluded from SNOOPED — this caused VM faults
+# when SDMA-written PTEs weren't visible to the page walker.
 #
 # Signed-off-by: David Connolly <david@connol.ly>
 
@@ -39,13 +35,13 @@
  		caching = ttm_write_combined;
  	else
  		caching = ttm_cached;
-@@ -1374,8 +1376,8 @@
+@@ -1374,8 +1376,7 @@
  		    mem->mem_type == AMDGPU_PL_MMIO_REMAP)) {
  		flags |= AMDGPU_PTE_SYSTEM;
 
 -		if (ttm && ttm->caching == ttm_cached)
-+		if (ttm && ttm->caching != ttm_write_combined)
- 			flags |= AMDGPU_PTE_SNOOPED;
+-			flags |= AMDGPU_PTE_SNOOPED;
++		flags |= AMDGPU_PTE_SNOOPED;
  	}
 
  	if (mem && mem->mem_type == TTM_PL_VRAM &&

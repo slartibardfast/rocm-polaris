@@ -57,7 +57,7 @@ sha256sums=('4f21c01f4d04c1d1b3ed794153f8900802c92497be620b07c4869530f2d28ee3'
             '90fc62e4796567cfa6a70671530eb155d7b98990bb1778b9987774860497f3c6'
             '317194725ad5c1ea387afd3bb2e22345ad56643d09dc715f448703bc208fed91'
             '12131d86e10a1d22b508f9c822ff54d0b69f90687a89d6a9436e47647beb72b8'
-            '84316a24a367b8c3af213c170b24637bc3acab67c6cd3b074ebcbdacf1ce57e1'
+            'db55b269d85034cce190ae07aaeacc89bc8c2d9b96674a2e60301e7e4183e2b6'
             'b364eae3a55fc2d3fd3029866b8f90430bc0c307cfa22a3e190ac1c13fcf8aa2')
 export KBUILD_BUILD_HOST=archlinux
 export KBUILD_BUILD_USER=$pkgbase
@@ -80,75 +80,20 @@ prepare() {
     patch -Np1 < "../$src"
   done
 
-  # SDMA-GFX L2 incoherence debug: runtime-switchable PTE flush modes.
-  # SDMA PTE writes may not be visible to the GFX page walker on gfx8.
-  # Add module param gfx8_pte_flush (bitflags, writable at runtime):
-  #   bit 0 (1): CP_COHER TC writeback+invalidate
-  #   bit 1 (2): HDP flush
-  #   bit 2 (4): VM L2 cache reset
-  # Also always wait for TLB invalidation completion (VM_INVALIDATE_RESPONSE).
+  # Wait for TLB invalidation completion on gmc_v8 (defense-in-depth).
   local _gmc=drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c
-  python3 -c "
-with open('$_gmc') as f: s = f.read()
-
-# Add module parameter after existing includes
-param_code = '''
-#include <linux/moduleparam.h>
-
-static int gfx8_pte_flush;
-module_param(gfx8_pte_flush, int, 0644);
-MODULE_PARM_DESC(gfx8_pte_flush,
-\t\"GFX8 PTE flush after TLB inv (bitmask): 1=CP_COHER, 2=HDP, 4=VM_L2\");
-'''
-s = s.replace('#include \"oss/oss_3_0_sh_mask.h\"',
-              '#include \"oss/oss_3_0_sh_mask.h\"\n#include \"gca/gfx_8_0_d.h\"\n#include \"gca/gfx_8_0_sh_mask.h\"' + param_code, 1)
-
-# Replace the flush_gpu_tlb function body
-old_body = '''\t/* bits 0-15 are the VM contexts0-15 */
-\tWREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
-}'''
-
-new_body = '''\tunsigned int i;
-
-\t/* Optional PTE flush modes for SDMA-GFX L2 incoherence (gfx8). */
-\tif (gfx8_pte_flush & 1) {
-\t\t/* CP_COHER: TC writeback + invalidate */
-\t\tWREG32(mmCP_COHER_CNTL,
-\t\t       CP_COHER_CNTL__TC_WB_ACTION_ENA_MASK |
-\t\t       CP_COHER_CNTL__TC_ACTION_ENA_MASK);
-\t\tWREG32(mmCP_COHER_SIZE, 0xFFFFFFFF);
-\t\tWREG32(mmCP_COHER_BASE, 0);
-\t\tfor (i = 0; i < adev->usec_timeout; i++) {
-\t\t\tif (!(RREG32(mmCP_COHER_STATUS) & 1))
-\t\t\t\tbreak;
-\t\t\tudelay(1);
-\t\t}
+  sed -i '/WREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);$/{
+    a\
+\n\t/* Wait for TLB invalidation to complete. */\
+\t{\
+\t\tunsigned int i;\
+\t\tfor (i = 0; i < adev->usec_timeout; i++) {\
+\t\t\tif (RREG32(mmVM_INVALIDATE_RESPONSE) \& (1 << vmid))\
+\t\t\t\tbreak;\
+\t\t\tudelay(1);\
+\t\t}\
 \t}
-\tif (gfx8_pte_flush & 2) {
-\t\t/* HDP flush */
-\t\tWREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 0);
-\t}
-\tif (gfx8_pte_flush & 4) {
-\t\t/* VM L2 cache reset: toggle enable bit */
-\t\tuint32_t tmp = RREG32(mmVM_L2_CNTL);
-\t\tWREG32(mmVM_L2_CNTL, tmp & ~VM_L2_CNTL__ENABLE_L2_CACHE_MASK);
-\t\tWREG32(mmVM_L2_CNTL, tmp);
-\t}
-
-\t/* bits 0-15 are the VM contexts0-15 */
-\tWREG32(mmVM_INVALIDATE_REQUEST, 1 << vmid);
-
-\t/* Wait for TLB invalidation to complete. */
-\tfor (i = 0; i < adev->usec_timeout; i++) {
-\t\tif (RREG32(mmVM_INVALIDATE_RESPONSE) & (1 << vmid))
-\t\t\tbreak;
-\t\tudelay(1);
-\t}
-}'''
-
-s = s.replace(old_body, new_body, 1)
-with open('$_gmc', 'w') as f: f.write(s)
-"
+  }' "$_gmc"
 
   # Flush pending KFD eviction restore before returning from alloc/map
   # ioctls.  VRAM allocation can trigger process eviction (queues stopped,
