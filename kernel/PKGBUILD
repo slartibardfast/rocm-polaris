@@ -158,9 +158,30 @@ s = s.replace(
 with open('$_kfd', 'w') as f: f.write(s)
 "
 
-  # PT BOs in GTT: DISABLED — causes hang during hipMalloc.
-  # The use_cpu_for_update path has a sync_wait deadlock when PT BOs
-  # are in GTT on small BAR systems.  Needs further investigation.
+  # Log fault VA details for debugging GPUVM page table issues.
+  # The VMID, fault VA, and protection status are already logged by the
+  # existing handler.  Add the page table base address for the faulting
+  # VMID so we can cross-reference with debugfs.
+  python3 -c "
+with open('$_gmc') as f: s = f.read()
+old = 'if (!addr && !status)\n\t\treturn 0;'
+new = '''if (!addr && !status)
+\t\treturn 0;
+
+\t/* Log the page table base for the faulting VMID. */
+\t{
+\t\tu32 vm_reg;
+\t\tvmid = REG_GET_FIELD(status, VM_CONTEXT1_PROTECTION_FAULT_STATUS, VMID);
+\t\tif (vmid < 8)
+\t\t\tvm_reg = RREG32(mmVM_CONTEXT0_PAGE_TABLE_BASE_ADDR + vmid);
+\t\telse
+\t\t\tvm_reg = RREG32(mmVM_CONTEXT8_PAGE_TABLE_BASE_ADDR + vmid - 8);
+\t\tdev_err(adev->dev, \"VMID %u PT base = 0x%x (pages), fault VA = 0x%llx\\\\n\",
+\t\t\tvmid, vm_reg, ((u64)addr) << 12);
+\t}'''
+s = s.replace(old, new, 1)
+with open('$_gmc', 'w') as f: f.write(s)
+"
 
   echo "Setting config..."
   cp ../config .config
