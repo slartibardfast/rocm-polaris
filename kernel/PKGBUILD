@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=19
+pkgrel=20
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -123,11 +123,26 @@ with open('$_kfd', 'w') as f: f.write(s)
   sed -i 's/KFD_GC_VERSION(dev) >= IP_VERSION(9, 4, 2)/KFD_GC_VERSION(dev) >= IP_VERSION(8, 0, 0)/' \
     drivers/gpu/drm/amd/amdkfd/kfd_priv.h
 
-  # Upgrade map_memory_to_gpu TLB flush from LEGACY to HEAVYWEIGHT on gfx8.
-  # Internal structures (0x4102fff000 range) get unmapped and remapped during
-  # alloc/free/realloc cycles.  LEGACY flush may not fully invalidate stale
-  # TLB entries from prior mappings on gfx8.
+  # Upgrade map_memory TLB flush to HEAVYWEIGHT for gfx8.
   sed -i 's/kfd_flush_tlb(peer_pdd, TLB_FLUSH_LEGACY);/kfd_flush_tlb(peer_pdd, TLB_FLUSH_HEAVYWEIGHT);/' "$_kfd"
+
+  # Wait for ALL pending VM page table updates before returning from
+  # map_memory_to_gpu.  The sync_memory call only waits on the user BO's
+  # fences.  During alloc/free/realloc, TTM evicts internal BOs whose PTE
+  # updates go through separate fence chains (vm->immediate/delayed entities).
+  # Without waiting on these, the next dispatch can hit stale PTEs for
+  # evicted/remapped internal structures.
+  python3 -c "
+with open('$_kfd') as f: s = f.read()
+# Insert amdgpu_vm_wait_idle after sync_memory in map_memory_to_gpu.
+# Target the unique 'mutex_unlock(&p->mutex);' followed by
+# 'Flush TLBs after waiting' comment.
+s = s.replace(
+    'mutex_unlock(&p->mutex);\n\n\t/* Flush TLBs after waiting for the page table updates to complete */',
+    'mutex_unlock(&p->mutex);\n\n\t/* Wait for ALL VM page table updates including evicted BO remaps. */\n\t{\n\t\tstruct amdgpu_vm *vm = drm_priv_to_vm(pdd->drm_priv);\n\t\tamdgpu_vm_wait_idle(vm, MAX_SCHEDULE_TIMEOUT);\n\t}\n\n\t/* Flush TLBs after waiting for the page table updates to complete */',
+    1)
+with open('$_kfd', 'w') as f: f.write(s)
+"
 
   # Add TLB flush to kfd_ioctl_free_memory_of_gpu.  The free ioctl has NO
   # TLB flush — freed VA ranges retain stale TLB entries.  When the VA is
