@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=20
+pkgrel=21
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -156,6 +156,21 @@ s = s.replace(
     'ret = amdgpu_amdkfd_gpuvm_free_memory_of_gpu(pdd->dev->adev,\n\t\t\t\t(struct kgd_mem *)mem, pdd->drm_priv, &size);\n\n\t/* Flush TLB to clear stale entries for the freed VA range. */\n\tif (!ret)\n\t\tkfd_flush_tlb(pdd, TLB_FLUSH_HEAVYWEIGHT);\n\n\t/* If freeing the buffer failed',
     1)
 with open('$_kfd', 'w') as f: f.write(s)
+"
+
+  # Force page table BOs to GTT on small BAR systems.  When PTs are in
+  # VRAM, SDMA/GFX writes PTEs and the page walker reads from VRAM — any
+  # incoherence in the write path produces stale PTEs.  With PTs in GTT
+  # (system memory), CPU writes PTEs directly, coherent with the page
+  # walker via SNOOPED=1 (patch 0009).
+  local _vmpt=drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c
+  python3 -c "
+with open('$_vmpt') as f: s = f.read()
+s = s.replace(
+    'if (!adev->gmc.is_app_apu)\n\t\tbp.domain = AMDGPU_GEM_DOMAIN_VRAM;',
+    'if (!adev->gmc.is_app_apu && amdgpu_gmc_vram_full_visible(&adev->gmc))\n\t\tbp.domain = AMDGPU_GEM_DOMAIN_VRAM;\n\telse if (!adev->gmc.is_app_apu)\n\t\tbp.domain = AMDGPU_GEM_DOMAIN_GTT;',
+    1)
+with open('$_vmpt', 'w') as f: f.write(s)
 "
 
   echo "Setting config..."
