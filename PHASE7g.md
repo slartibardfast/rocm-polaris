@@ -1,98 +1,119 @@
-# Phase 7g: SDMA-GFX L2 Incoherence — PTE Flush Debug Module
+# Phase 7g: SDMA-GFX L2 Incoherence for Page Table Updates
 
-## Status: TESTING FLUSH OPTIONS
+## Status: FIX UNDER TEST — SNOOPED=1 FOR ALL SYSTEM MEMORY
 
-## Root Cause (Confirmed)
+## Root Cause
 
-SDMA writes GPU page table entries (PTEs) to VRAM. The GFX engine's page walker reads PTEs from VRAM through a potentially stale cache. On gfx8, SDMA and GFX are not L2 cache coherent (known hardware limitation — Mesa disabled SDMA for Polaris entirely).
+SDMA and GFX engines are not L2 cache coherent on gfx8 (known hardware limitation — Mesa disabled SDMA for Polaris entirely). The kernel driver uses SDMA to write page table entries (PTEs). The GFX page walker reads stale PTE data, causing VM faults after hipMalloc triggers internal BO remapping.
 
-The kernel driver's TLB flush (`VM_INVALIDATE_REQUEST`) invalidates the TLB and VM L2 translation cache, but does NOT ensure the underlying **data** written by SDMA has reached VRAM's backing store. The page walker re-walks, reads from VRAM (or an intermediate cache), and gets stale PTE data.
+On VI/gfx8, the SNOOPED PTE bit (bit 2) is the only per-page coherency control. It determines whether GPU accesses to system memory participate in the PCIe coherency protocol. Without SNOOPED=1, GPU reads may see stale data from SDMA writes.
 
-## Approach: Runtime-Switchable Flush Modes
+## Current Fix: Unconditional SNOOPED=1 (kernel 6.18.16-16)
 
-Add a kernel module parameter `gfx8_pte_flush` (writable at runtime via sysfs) that controls which cache flush operations run after SDMA PTE writes, before the TLB invalidation. This allows testing each approach without rebuilding or rebooting.
+Page table BOs are created with `AMDGPU_GEM_CREATE_CPU_GTT_USWC` → `ttm_write_combined`. Our previous patch 0009 set SNOOPED only for `ttm_cached` and `ttm_uncached`, excluding `ttm_write_combined`. This meant page table BOs that fall back to GTT (system memory) had SNOOPED=0 — SDMA writes to them were invisible to the page walker.
 
+**Fix:** Set `AMDGPU_PTE_SNOOPED` unconditionally for ALL system memory pages in `amdgpu_ttm_tt_pde_flags()`. No caching mode check. On VI where SNOOPED is the only coherency knob, it must always be on.
+
+```c
+// Before (ttm_write_combined excluded):
+if (ttm && ttm->caching != ttm_write_combined)
+    flags |= AMDGPU_PTE_SNOOPED;
+
+// After (unconditional):
+flags |= AMDGPU_PTE_SNOOPED;
 ```
-/sys/module/amdgpu/parameters/gfx8_pte_flush
+
+## Contingency: If SNOOPED=1 Doesn't Fix 32MB
+
+SNOOPED only affects system memory (GTT) pages. If page table BOs remain in VRAM (their preferred domain), SNOOPED has no effect — the SDMA-GFX incoherence is within the GPU's internal fabric. Contingency plans ranked by feasibility:
+
+### Option A: Force page table BOs to GTT (highest confidence)
+
+```c
+// amdgpu_vm_pt.c — amdgpu_vm_pt_create()
+// Current:
+if (!adev->gmc.is_app_apu)
+    bp.domain = AMDGPU_GEM_DOMAIN_VRAM;
+// Change for small BAR:
+if (!adev->gmc.is_app_apu && amdgpu_gmc_vram_full_visible(&adev->gmc))
+    bp.domain = AMDGPU_GEM_DOMAIN_VRAM;
+else
+    bp.domain = AMDGPU_GEM_DOMAIN_GTT;
 ```
 
-### Flush Mode Bitflags
+With PT BOs in GTT + SNOOPED=1, the page walker reads them through the PCIe coherency protocol. CPU can write PTEs directly (no SDMA). ~4MB of page tables in system memory is negligible.
 
-| Bit | Value | Mode | Mechanism | What it flushes |
-|-----|-------|------|-----------|-----------------|
-| 0 | 1 | CP_COHER | MMIO write to `CP_COHER_CNTL` with `TC_WB_ACTION_ENA \| TC_ACTION_ENA` | GFX shader L2 (TC) writeback + invalidate |
-| 1 | 2 | HDP | MMIO write to `HDP_MEM_COHERENCY_FLUSH_CNTL` | Host Data Path — CPU↔VRAM coherency |
-| 2 | 4 | VM_L2 | Toggle `VM_L2_CNTL.ENABLE_L2_CACHE` off/on | VM page table L2 cache (direct reset) |
+**Why it works:** Eliminates SDMA from the PTE write path entirely. CPU writes to GTT are coherent with the page walker via SNOOPED. This is analogous to `vm_update_mode=2` (CPU PTE updates) but without the sync_wait deadlock — the PT BOs start in GTT, no SDMA→CPU mode transition needed.
 
-Modes can be combined: `echo 5 > .../gfx8_pte_flush` = CP_COHER + VM_L2.
+### Option B: Disable SDMA rings (quick diagnostic)
 
-### Testing Protocol
+Boot with `amdgpu.num_sdma=0`. If the driver falls back to GFX for all DMA operations, the SDMA-GFX incoherence vanishes. Quick 30-second test to confirm the theory. Not a production fix (disables all SDMA).
 
-After kexec with the debug kernel:
+### Option C: Fix vm_update_mode=2 deadlock
+
+The CPU PTE mode (`vm_update_mode=2`) deadlocked in `amdgpu_bo_sync_wait(vm->root.bo)` during `amdgpu_vm_make_compute`. The wait tries to drain outstanding SDMA fences before switching to CPU mode. If an SDMA fence never signals (broken SDMA on gfx8), it hangs forever.
+
+Fix: skip or timeout the sync_wait when transitioning to CPU mode on gfx8. The stale SDMA fence is irrelevant — we're switching away from SDMA precisely because it's broken.
+
+```c
+// amdgpu_vm.c — amdgpu_vm_make_compute(), after setting use_cpu_for_update:
+if (vm->use_cpu_for_update) {
+    r = amdgpu_bo_sync_wait(vm->root.bo,
+                            AMDGPU_FENCE_OWNER_UNDEFINED, true);
+    // Add: skip wait failure on gfx8 — SDMA fences may be stale
+    if (r && amdgpu_ip_version(adev, GC_HWIP, 0) < IP_VERSION(9, 0, 0))
+        r = 0;  // ignore SDMA fence timeout on pre-gfx9
+```
+
+### Option D: Debug flush with hardcoded offsets (diagnostic)
+
+Rebuild the runtime-switchable gfx8_pte_flush parameter using raw hex register offsets instead of macro names (avoid gca include crash):
+
+```c
+#define GFX8_CP_COHER_CNTL   0xc07c
+#define GFX8_CP_COHER_SIZE   0xc07d
+#define GFX8_CP_COHER_BASE   0xc07e
+#define GFX8_CP_COHER_STATUS 0xc07f
+```
+
+Tests whether CP_COHER/HDP/VM_L2 flush resolves VRAM-internal incoherence at runtime without rebuilds.
+
+### Option E: Force GFX ring for PTE writes (Mesa's approach)
+
+Change the SDMA scheduler entity for gfx8 VM updates to use the GFX ring. Most comprehensive fix but deepest driver change. Mesa did the equivalent by disabling SDMA entirely.
+
+## Test Protocol
+
+After cold boot with each fix:
 
 ```bash
-# Baseline — should fault at 32MB (confirms bug present)
-echo 0 | sudo tee /sys/module/amdgpu/parameters/gfx8_pte_flush
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 30 ~/rocm-polaris/tests/test_h2d_kernel
+# Basic functionality
+ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 30 ~/rocm-polaris/tests/hip_smoke
 
-# Option 1: CP_COHER TC writeback+invalidate
-# Cold reboot required after each fault
-echo 1 | sudo tee /sys/module/amdgpu/parameters/gfx8_pte_flush
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 30 ~/rocm-polaris/tests/test_h2d_kernel
+# Phase 7g test battery (32MB H2D + compute kernel)
+ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 120 ~/rocm-polaris/tests/test_h2d_kernel
 
-# Option 2: HDP flush
-echo 2 | sudo tee /sys/module/amdgpu/parameters/gfx8_pte_flush
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 30 ~/rocm-polaris/tests/test_h2d_kernel
+# Full boundary test (up to 512MB)
+ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 300 ~/rocm-polaris/tests/test_h2d_boundary
 
-# Option 3: VM L2 cache reset
-echo 4 | sudo tee /sys/module/amdgpu/parameters/gfx8_pte_flush
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 30 ~/rocm-polaris/tests/test_h2d_kernel
-
-# Option 4: CP_COHER + VM L2 (belt and suspenders)
-echo 5 | sudo tee /sys/module/amdgpu/parameters/gfx8_pte_flush
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 30 ~/rocm-polaris/tests/test_h2d_kernel
-
-# Option 5: All three
-echo 7 | sudo tee /sys/module/amdgpu/parameters/gfx8_pte_flush
-ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 30 ~/rocm-polaris/tests/test_h2d_kernel
+# llama.cpp
+ROC_CPU_WAIT_FOR_SIGNAL=1 timeout 600 llama-cli \
+  -m ~/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+  -ngl 1 -p "2+2=" -n 8 --threads 4 --no-mmap
 ```
 
-**Note:** After any VM fault, the GPU is in a degraded state. Must cold boot between tests that fault.
+## Previous Attempts
 
-### Registers Used
+| Approach | Result | Why it failed |
+|----------|--------|---------------|
+| TLB wait (VM_INVALIDATE_RESPONSE poll) | No fix | Issue is data coherency, not TLB staleness |
+| KFD eviction flush (flush_delayed_work) | No fix | Eviction not the cause; SDMA incoherence is |
+| vm_update_mode=2 (CPU PTE writes) | Deadlock | sync_wait hangs on stale SDMA fences |
+| gfx8_pte_flush debug param | Kernel crash | gca/gfx_8_0 header include conflicts |
+| SNOOPED=1 for ttm_uncached only | Partial | Excluded ttm_write_combined PT BOs |
 
-**CP_COHER_CNTL (0xc07c):**
-- `TC_WB_ACTION_ENA` (bit 18): L2 writeback — dirty lines written to VRAM
-- `TC_ACTION_ENA` (bit 23): L2 invalidate — cache lines discarded
-- `CP_COHER_SIZE` (0xc07d): Set to 0xFFFFFFFF for full range
-- `CP_COHER_BASE` (0xc07e): Set to 0 for full range
-- `CP_COHER_STATUS` (0xc07f): Poll bit 0 for completion
+## References
 
-**HDP_MEM_COHERENCY_FLUSH_CNTL (0x5520):**
-- Write any value to trigger HDP cache flush
-- Normally used for CPU-VRAM coherency, but may also affect SDMA write buffers
-
-**VM_L2_CNTL (0x500):**
-- `ENABLE_L2_CACHE` (bit 0): Toggle off/on to reset VM L2 state
-- Nuclear option — discards ALL cached page table data
-
-### Overhead Estimates
-
-| Mode | Mechanism | Estimated overhead | Notes |
-|------|-----------|-------------------|-------|
-| CP_COHER (1) | 4 MMIO writes + poll | ~2-10µs | May race with GFX ring if active |
-| HDP (2) | 1 MMIO write | ~1µs | Cheapest option |
-| VM_L2 (4) | 3 MMIO writes (read-modify-write) | ~2-5µs | Most disruptive, clears all translations |
-| All (7) | All combined | ~5-15µs | Maximum coverage |
-
-Per hipMalloc overhead. Negligible for compute workloads.
-
-### What vm_update_mode=2 Taught Us
-
-The CPU PTE write approach (`vm_update_mode=2`) deadlocked in `amdgpu_bo_sync_wait()` during the SDMA→CPU mode transition. The sync_wait tries to drain outstanding SDMA fences on the page directory BO, and at least one fence never signals. This suggests the SDMA engine itself has completion issues on our platform — which aligns with the broader SDMA incoherence theory.
-
-### Previous Attempts (Superseded)
-
-- **TLB invalidation wait (patch 0010):** Polls VM_INVALIDATE_RESPONSE. Correct but insufficient alone.
-- **KFD eviction flush:** flush_delayed_work in alloc/map ioctls. Harmless belt-and-suspenders.
-- **vm_update_mode=2:** Deadlocks on sync_wait. Cannot be used without fixing SDMA fence completion.
+- [RadeonSI Disables SDMA For Polaris](https://www.phoronix.com/news/RadeonSI-Disables-Polaris-SDMA)
+- [Mesa 20: SDMA Disabled on RX-Series](https://linuxreviews.org/Mesa_20_Will_Have_SDMA_Disabled_On_AMD_RX-Series_GPUs)
+- [AMDGPU Module Parameters: vm_update_mode](https://docs.kernel.org/gpu/amdgpu/module-parameters.html)
