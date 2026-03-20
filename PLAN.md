@@ -1661,3 +1661,6 @@ Once inference works, measure performance:
 | 2026-03-15 | Combined NOP + cpu_wait: 286 ops stable | NOP handles CP wake, cpu_wait prevents CLR barriers; drift remains from ROCR barriers |
 | 2026-03-16 | SLOT_BASED_WPTR=0 fixes CP idle stall | 1000 rapid serial dispatches pass; CP directly reads WPTR from doorbell, no polling needed |
 | 2026-03-16 | D2H coherency: clflush insufficient under load | Iter 297-379 of 500: stale/partial data; llama.cpp hipHostFree hangs on SyncAllStreams |
+| 2026-03-20 | VM fault root cause: pinned host memory path | CLR unpins (clears PTEs) before DMA reads complete; disabling pinning on no-atomics fixes all sizes 1-512MB |
+| 2026-03-20 | kernel PT coherence patches were red herrings | CPU_ACCESS_REQUIRED, wait=true, vm_update_mode=3 — all unnecessary; PTEs were correct, just cleared too early by CLR unpin |
+| 2026-03-20 | hip-runtime-amd-polaris 7.2.0-6 | Fix 4: `doHostPinning &&= dev().info().pcie_atomics_` in getBuffer(); forces staging pool path |
