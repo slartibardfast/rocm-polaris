@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=5
+pkgrel=6
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -30,6 +30,43 @@ options=(!lto)
 prepare() {
   cd "$_dirname/projects/clr"
   patch -Np1 -i "$srcdir/0001-use-fine-grain-staging-and-flush-cpu-cache-for-d2h.patch"
+
+  # Fix 4: Disable pinned host memory path on no-atomics platforms.
+  # The pinned path unpins (clears PTEs) after the DMA signal fires, but
+  # on gfx8 the DMA engine still has in-flight reads from the pinned VA
+  # range, causing VM faults.  Force all copies through the persistent
+  # staging buffer pool which is never unmapped.
+  local _blit=rocclr/device/rocm/rocblit.cpp
+  python3 -c "
+with open('$_blit') as f: s = f.read()
+# Add x86intrin.h include for _mm_clflush/_mm_mfence
+s = s.replace(
+    '#include <algorithm>',
+    '#include <algorithm>\n\n#if defined(__x86_64__) || defined(__i386__)\n#include <x86intrin.h>\n#endif',
+    1)
+# Disable pinning on no-atomics platforms
+s = s.replace(
+    'bool doHostPinning = enablePin && (size > MinSizeForPinnedXfer);',
+    '// Disable pinning on no-atomics platforms: pinned path unpins before DMA completes\n  bool doHostPinning = enablePin && (size > MinSizeForPinnedXfer) && dev().info().pcie_atomics_;',
+    1)
+# Add WaitCurrent after H2D staging chunk on no-atomics
+s = s.replace(
+    '    } else {  // D2H Path',
+    '      // On no-atomics platforms, wait for each H2D staging chunk.\n      if (!dev().info().pcie_atomics_)\n        gpu().Barriers().WaitCurrent();\n    } else {  // D2H Path',
+    1)
+# Add clflush after D2H staging wait (non-pinned path)
+s = s.replace(
+    '          // Wait for current signal of previous rocr copy if its not pinned mem\n          gpu().Barriers().WaitCurrent();\n          ClPrint(amd::LOG_DETAIL_DEBUG',
+    '          // Wait for current signal of previous rocr copy if its not pinned mem\n          gpu().Barriers().WaitCurrent();\n#if defined(__x86_64__) || defined(__i386__)\n          if (!dev().info().pcie_atomics_) {\n            for (size_t off = 0; off < copysize; off += 64)\n              _mm_clflush(reinterpret_cast<char*>(stagingBuffer) + off);\n            _mm_mfence();\n          }\n#endif\n          ClPrint(amd::LOG_DETAIL_DEBUG',
+    1)
+# Add clflush for pinned D2H path
+s = s.replace(
+    '    gpu().Barriers().WaitCurrent();\n    gpu().command()->ReleasePinnedMemory();',
+    '    gpu().Barriers().WaitCurrent();\n#if defined(__x86_64__) || defined(__i386__)\n    if (!hostToDev && !dev().info().pcie_atomics_) {\n      for (size_t off = 0; off < size; off += 64)\n        _mm_clflush(reinterpret_cast<char*>(hostDst) + off);\n      _mm_mfence();\n    }\n#endif\n    gpu().command()->ReleasePinnedMemory();',
+    1)
+with open('$_blit', 'w') as f: f.write(s)
+print('OK: Fix 2-4 applied to rocblit.cpp')
+"
 
   # Force CPU-side signal waits on no-atomics platforms.
   # Disables GPU-side AQL barrier deps that stall the CP.
