@@ -1,6 +1,4 @@
-// Phase 7g: Minimal reproducer + page table dump request.
-// Does: alloc 32MB, free, alloc 32MB, H2D, verify.
-// On fault, prints the VA and asks for /sys/kernel/debug analysis.
+// Definitive alloc/free/realloc test — run on clean cold-booted GPU.
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -14,46 +12,52 @@ __global__ void verify(const unsigned char* d, unsigned char expected, int n, in
     if (i < n && d[i] != expected) atomicAdd(bad, 1);
 }
 
-int main() {
-    printf("=== Minimal alloc/free/realloc reproducer ===\n\n");
-
-    // Step 1: alloc 32MB, touch it, free it
-    void *first;
-    CHECK(hipMalloc(&first, 32<<20));
-    CHECK(hipMemset(first, 0x42, 32<<20));
-    CHECK(hipDeviceSynchronize());
-    printf("First alloc: %p\n", first);
-    CHECK(hipFree(first));
-    printf("First freed.\n");
-
-    // Step 2: alloc 32MB again (same VA expected)
+static int h2d_verify(size_t mb, const char* label) {
+    size_t sz = mb << 20;
+    unsigned char *h = (unsigned char*)malloc(sz);
+    std::memset(h, 0xAB, sz);
     unsigned char *d; int *d_bad;
-    CHECK(hipMalloc(&d, 32<<20));
+    CHECK(hipMalloc(&d, sz));
     CHECK(hipMalloc(&d_bad, sizeof(int)));
-    printf("Second alloc: %p (d_bad: %p)\n", (void*)d, (void*)d_bad);
-
-    // Step 3: H2D
-    unsigned char *h = (unsigned char*)malloc(32<<20);
-    std::memset(h, 0xAB, 32<<20);
     CHECK(hipMemset(d_bad, 0, sizeof(int)));
-    CHECK(hipMemcpy(d, h, 32<<20, hipMemcpyHostToDevice));
     CHECK(hipDeviceSynchronize());
-    printf("H2D done.\n");
-
-    // Step 4: verify
-    printf("Launching verify<<<1,256>>>...\n");
-    fflush(stdout);
+    CHECK(hipMemcpy(d, h, sz, hipMemcpyHostToDevice));
+    CHECK(hipDeviceSynchronize());
     verify<<<1, 256>>>(d, 0xAB, 256, d_bad);
     hipError_t sync = hipDeviceSynchronize();
-    if (sync != hipSuccess) {
-        printf("SYNC FAIL: %s\n", hipGetErrorString(sync));
-        return 1;
-    }
-    int bad = 0;
-    CHECK(hipMemcpy(&bad, d_bad, sizeof(int), hipMemcpyDeviceToHost));
-    printf("verify: bad=%d %s\n", bad, bad==0?"PASS":"FAIL");
-
+    int bad = -1;
+    if (sync == hipSuccess)
+        CHECK(hipMemcpy(&bad, d_bad, sizeof(int), hipMemcpyDeviceToHost));
+    printf("%s: %zuMB ptr=%p %s (bad=%d)\n", label, mb, (void*)d,
+           (sync==hipSuccess && bad==0)?"PASS":"FAIL", bad);
+    fflush(stdout);
     CHECK(hipFree(d_bad)); CHECK(hipFree(d)); free(h);
-    printf("ALL PASS\n");
+    return (sync != hipSuccess || bad != 0);
+}
+
+int main() {
+    printf("=== Cold boot definitive test ===\n\n");
+
+    // 1. Standalone sizes (no prior alloc/free)
+    for (size_t mb : {1, 4, 16, 32, 64}) {
+        if (h2d_verify(mb, "standalone")) return 1;
+    }
+
+    // 2. Sequential increasing (each alloc/free before next)
+    printf("\n--- Sequential increasing ---\n");
+    for (size_t mb : {1, 4, 16, 32, 64}) {
+        if (h2d_verify(mb, "sequential")) return 1;
+    }
+
+    // 3. Same-size realloc (the known trigger)
+    printf("\n--- Same-size realloc ---\n");
+    for (size_t mb : {16, 32, 64}) {
+        char label[64];
+        snprintf(label, sizeof(label), "realloc-%zu", mb);
+        if (h2d_verify(mb, label)) return 1;
+        if (h2d_verify(mb, label)) return 1;
+    }
+
+    printf("\nALL PASS\n");
     return 0;
 }
