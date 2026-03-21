@@ -113,41 +113,12 @@ INJECT
   # 7e-4: PM4 indirect buffer (icache invalidation commands).
   sed -i 's,pm4_ib_size_b_\, 0x1000\, core::MemoryRegion::AllocateExecutable),pm4_ib_size_b_\, 0x1000\, core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateUncached),' "$_aq"
 
-  # Phase 7h: HDP flush after AQL ring buffer write on no-atomics.
-  # CPU writes the AQL packet to the ring buffer (system memory).
-  # GPU L2 may retain stale packet data from a previous dispatch at the
-  # same ring slot.  HDP flush invalidates GPU L2, ensuring the CP reads
-  # the fresh packet.  Insert after the AQL packet write, before doorbell.
-  #
-  # HDP_flush_ is protected on GpuAgent.  Add a public accessor.
+  # Phase 7h: HDP flush accessor for CLR.
   local _agent_h=runtime/hsa-runtime/core/inc/amd_gpu_agent.h
   sed -i '/NoPlatformAtomics/a\
 \
   \/\/ Phase 7h: public accessor for HDP flush register\
   __forceinline uint32_t* HdpFlushCntl() const { return HDP_flush_.HDP_MEM_FLUSH_CNTL; }' "$_agent_h"
-
-  # HDP flush at TWO points in StoreRelaxed:
-  # 1. BEFORE the sfence (before ring buffer write) — invalidates stale L2
-  # 2. AFTER the ring buffer write, before doorbell — flushes new data
-  # Both with posting read for synchronous completion.
-  sed -i '/_mm_sfence();/{
-    /Hardware doorbell/!{
-      i\
-    // Phase 7h: HDP flush BEFORE ring buffer write — invalidate stale L2.\
-    if (no_atomics_ \&\& agent_->HdpFlushCntl()) {\
-      *agent_->HdpFlushCntl() = 1u;\
-      volatile uint32_t dummy = *agent_->HdpFlushCntl();\
-      (void)dummy;\
-    }
-    }
-  }' "$_aq"
-  sed -i '/Hardware doorbell supports AQL semantics/i\
-    // Phase 7h: HDP flush AFTER ring buffer write, before doorbell.\
-    if (no_atomics_ \&\& agent_->HdpFlushCntl()) {\
-      *agent_->HdpFlushCntl() = 1u;\
-      volatile uint32_t dummy = *agent_->HdpFlushCntl();\
-      (void)dummy;\
-    }' "$_aq"
 
   # Phase 7f (ACQUIRE_MEM L2 WB hack): REMOVED.
   # Root cause was SNOOPED=0 in GPU PTE, not missing L2 flush.

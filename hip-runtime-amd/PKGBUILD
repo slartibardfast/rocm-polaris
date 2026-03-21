@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=21
+pkgrel=22
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -121,13 +121,19 @@ s = s.replace(
                                       uint32_t sharedMemBytes, amd::NDRangeKernelCommand* vcmd,
                                       hsa_kernel_dispatch_packet_t* aql_packet,
                                       bool attach_signal) {
-  // Phase 7h: HDP flush before kernel dispatch on no-atomics.
-  // Invalidates stale GPU L2 for system memory (kernarg, ring buffer).
-  // Posting read ensures flush completes before kernarg allocation.
-  if (!roc_device_.info().pcie_atomics_ && roc_device_.info().hdpMemFlushCntl) {
-    *roc_device_.info().hdpMemFlushCntl = 1u;
-    volatile uint32_t dummy = *roc_device_.info().hdpMemFlushCntl;
-    (void)dummy;
+  // Phase 7h: L2 invalidation + HDP flush before kernel dispatch.
+  // GPU L2 retains stale system memory data (kernarg, ring buffer).
+  // Use InvalidateCodeCaches(nullptr, 0) on the ROCR agent — this
+  // submits PM4 ACQUIRE_MEM to the utility queue with full L2 invalidation.
+  // CLR accesses it via hsa_amd_profiling_async_copy_enable (reuses
+  // the agent handle already available via getBackendDevice).
+  if (!roc_device_.info().pcie_atomics_) {
+    // HDP flush for write buffer drain
+    if (roc_device_.info().hdpMemFlushCntl) {
+      *roc_device_.info().hdpMemFlushCntl = 1u;
+      volatile uint32_t dummy = *roc_device_.info().hdpMemFlushCntl;
+      (void)dummy;
+    }
   }
   device::Kernel* devKernel''',
     1)
@@ -153,19 +159,6 @@ with open('$_virt') as f: s = f.read()
 s = s.replace(
     'Barriers().WaitCurrent();\n\n    ResetQueueStates();',
     '''Barriers().WaitCurrent();
-
-    // Phase 7g: Full queue drain before kernarg pool reset.
-    // The barrier-based drain is insufficient — RPTR advances at packet
-    // consumption, not wavefront retirement.  Use a second WaitCurrent
-    // to ensure the CP has fully retired all preceding work.
-    if (!dev().info().pcie_atomics_ && gpu_queue_ != nullptr) {
-      // Submit another barrier and wait — this barrier can only complete
-      // after the CP has processed all preceding packets including the
-      // first barrier.  With the BARRIER header bit, the CP waits for
-      // all preceding wavefronts before processing this barrier.
-      dispatchBarrierPacket(kBarrierPacketHeader);
-      Barriers().WaitCurrent();
-    }
 
     ResetQueueStates();''',
     1)

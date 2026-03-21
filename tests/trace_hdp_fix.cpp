@@ -39,8 +39,12 @@ int main() {
         int h_in = i * 3;
         hipMemcpy(tmp, &h_in, sizeof(int), hipMemcpyHostToDevice);
 
-        // HDP flush BEFORE kernel dispatch
+        // HDP flush BEFORE kernel dispatch — double flush with posting reads
         *g_hdp_flush = 1u;
+        volatile uint32_t dummy1 = *g_hdp_flush;
+        *g_hdp_flush = 1u;
+        volatile uint32_t dummy2 = *g_hdp_flush;
+        (void)dummy1; (void)dummy2;
 
         write_val<<<1,1>>>(d, i);
         hipDeviceSynchronize();
