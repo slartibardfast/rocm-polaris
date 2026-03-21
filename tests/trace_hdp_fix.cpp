@@ -4,7 +4,8 @@
 #include <hsa/hsa_ext_amd.h>
 #include <cstdio>
 
-static uint32_t *g_hdp_flush = nullptr;
+static uint32_t *g_hdp_mem_flush = nullptr;
+static uint32_t *g_hdp_reg_flush = nullptr;
 
 void init_hdp() {
     hsa_agent_t gpu = {};
@@ -17,9 +18,11 @@ void init_hdp() {
     hsa_iterate_agents(cb, &gpu);
     hsa_amd_hdp_flush_t hdp;
     if (HSA_STATUS_SUCCESS == hsa_agent_get_info(gpu,
-            (hsa_agent_info_t)HSA_AMD_AGENT_INFO_HDP_FLUSH, &hdp))
-        g_hdp_flush = hdp.HDP_MEM_FLUSH_CNTL;
-    printf("HDP flush: %p\n", g_hdp_flush);
+            (hsa_agent_info_t)HSA_AMD_AGENT_INFO_HDP_FLUSH, &hdp)) {
+        g_hdp_mem_flush = hdp.HDP_MEM_FLUSH_CNTL;
+        g_hdp_reg_flush = hdp.HDP_REG_FLUSH_CNTL;
+    }
+    printf("HDP mem flush: %p  reg flush: %p\n", g_hdp_mem_flush, g_hdp_reg_flush);
 }
 
 __global__ void write_val(int *out, int val) {
@@ -30,7 +33,7 @@ int main() {
     int *d;
     hipMalloc(&d, sizeof(int));
     init_hdp();
-    if (!g_hdp_flush) { printf("No HDP flush\n"); return 1; }
+    if (!g_hdp_mem_flush) { printf("No HDP flush\n"); return 1; }
 
     int fail = 0;
     for (int i = 0; i < 2000; i++) {
@@ -39,12 +42,17 @@ int main() {
         int h_in = i * 3;
         hipMemcpy(tmp, &h_in, sizeof(int), hipMemcpyHostToDevice);
 
-        // HDP flush BEFORE kernel dispatch — double flush with posting reads
-        *g_hdp_flush = 1u;
-        volatile uint32_t dummy1 = *g_hdp_flush;
-        *g_hdp_flush = 1u;
-        volatile uint32_t dummy2 = *g_hdp_flush;
-        (void)dummy1; (void)dummy2;
+        // HDP flush: MEM + REG + MEM with posting reads
+        *g_hdp_mem_flush = 1u;
+        volatile uint32_t d1 = *g_hdp_mem_flush;
+        if (g_hdp_reg_flush) {
+            *g_hdp_reg_flush = 1u;
+            volatile uint32_t d2 = *g_hdp_reg_flush;
+            (void)d2;
+        }
+        *g_hdp_mem_flush = 1u;
+        volatile uint32_t d3 = *g_hdp_mem_flush;
+        (void)d1; (void)d3;
 
         write_val<<<1,1>>>(d, i);
         hipDeviceSynchronize();
