@@ -1733,6 +1733,82 @@ KFD set VM_DONTCOPY on doorbell, event, and reserved memory VMAs.
    forced serialization fixes the issue, it's a signal/completion race.
    If it doesn't, it's a resource exhaustion.
 
+#### Phase 7g fix: CPU-verified resource fencing (Option 5)
+
+**Principle:** On no-atomics platforms, never trust GPU-side signal management
+for resource lifecycle decisions.  All recycling gates must be CPU-verifiable
+against the bounce buffer's monotonic `read_dispatch_id`.
+
+**Root cause (confirmed):** CLR's `ManagedBuffer::Acquire()` recycles staging
+and kernarg chunks via barrier packets with completion signals.  On no-atomics,
+clearing the barrier's dep_signals (Phase 8 fix) allows the CP to complete the
+barrier before preceding wavefronts retire.  The completion signal fires early,
+the chunk is recycled, and the next H2D/kernel dispatch overwrites data the GPU
+is still reading.
+
+**Why RPTR alone is insufficient:** On gfx8 with `NO_UPDATE_RPTR=0`, RPTR
+advances when the CP **consumes** a dispatch packet (launches wavefronts), not
+when wavefronts **retire**.  Only for barrier packets with the `BARRIER` header
+bit does RPTR advance after preceding work retires (because the CP can't
+consume the barrier until retirement is complete).
+
+**Design:**
+
+Add CPU-side dispatch_id tracking to `ManagedBuffer`:
+
+```
+class ManagedBuffer {
+    // Existing: pool_signal_[16], active_chunk_, pool_cur_offset_
+    // New: fence point for each chunk
+    uint64_t chunk_fence_id_[kPoolNumSignals];
+    hsa_queue_t* queue_;  // reference to AQL queue
+};
+```
+
+**Acquire() with CPU fencing (chunk rotation path):**
+
+```
+1. Submit barrier packet with BARRIER bit
+   - Keep dep_signals (already 0 from Phase 8 CPU-wait)
+   - completion_signal = pool_signal_[active_chunk_] (unchanged)
+2. Record fence: chunk_fence_id_[active_chunk_] =
+   hsa_queue_load_write_index(queue_)
+3. Advance: active_chunk_ = (active_chunk_ + 1) % 16
+4. CPU fence check: spin until
+   hsa_queue_load_read_index(queue_) >= chunk_fence_id_[next_chunk]
+   (This means the CP has processed the barrier for next_chunk,
+    which means all work before that barrier has retired)
+5. Also keep existing WaitForSignal (belt-and-suspenders)
+```
+
+Step 4 is the key addition.  `read_dispatch_id` for the BARRIER packet
+(not the dispatch) only advances after the CP processes the barrier, which
+requires all preceding wavefronts to retire.
+
+**releaseGpuMemoryFence() with CPU fencing (kernarg reset):**
+
+```
+1. Submit barrier packet (existing)
+2. CPU-wait barrier's completion signal (existing WaitCurrent)
+3. CPU fence: verify read_dispatch_id >= write_index at barrier submission
+4. Only then: ResetQueueStates() / resetKernArgPool()
+```
+
+**Why this is robust:**
+- No reliance on GPU-side signal atomics (broken on no-atomics)
+- No reliance on CP dep_signal evaluation (broken with SLOT_BASED_WPTR=0)
+- Uses the bounce buffer's RPTR→dispatch_id conversion (proven working)
+- Barrier's BARRIER bit ensures RPTR for barrier reflects retirement
+- CPU-side check is deterministic (no timing dependency)
+
+**Implementation:** Python injection in `hip-runtime-amd/PKGBUILD` targeting
+`ManagedBuffer::Acquire()` and `releaseGpuMemoryFence()` in `rocvirtual.cpp`.
+Access queue via `gpu_.gpu_queue_` (already used in `dispatchBarrierPacket`).
+
+**Verification:** All 9 tests in `test_kernarg_stability.cpp` must pass on
+10 consecutive runs.  `test_h2d_degradation.cpp` must pass through 50k ops.
+`hip_barrier_test` must achieve 15/15 on 5 consecutive runs.
+
 ### Phase 8: CPU-managed barriers for no-atomics platforms
 
 #### Problem: CP idle stall on AQL barrier deps
