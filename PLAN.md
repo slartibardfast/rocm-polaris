@@ -1733,81 +1733,59 @@ KFD set VM_DONTCOPY on doorbell, event, and reserved memory VMAs.
    forced serialization fixes the issue, it's a signal/completion race.
    If it doesn't, it's a resource exhaustion.
 
-#### Phase 7g fix: CPU-verified resource fencing (Option 5)
+#### Phase 7g fix: CPU-verified resource fencing
 
-**Principle:** On no-atomics platforms, never trust GPU-side signal management
-for resource lifecycle decisions.  All recycling gates must be CPU-verifiable
-against the bounce buffer's monotonic `read_dispatch_id`.
+**Tested and eliminated:**
+- Option 3 (keep dep_signals): WORSE (80% failure rate — CP stalls on signals
+  that are 0 but reads race with bounce buffer decrement)
+- Option 5 fence in dispatchBarrierPacket: did NOT help (~same failure rate)
+- WB memory instead of UC for kernarg: MUCH WORSE (100% failure rate — CPU
+  WB-cached writes not reliably visible to GPU on Westmere PCIe 2.0)
+- UC confirmed correct: DRAM writes are visible to GPU, but something else
+  causes intermittent corruption
 
-**Root cause (confirmed):** CLR's `ManagedBuffer::Acquire()` recycles staging
-and kernarg chunks via barrier packets with completion signals.  On no-atomics,
-clearing the barrier's dep_signals (Phase 8 fix) allows the CP to complete the
-barrier before preceding wavefronts retire.  The completion signal fires early,
-the chunk is recycled, and the next H2D/kernel dispatch overwrites data the GPU
-is still reading.
+**KFD queue teardown audit (critical gaps):**
 
-**Why RPTR alone is insufficient:** On gfx8 with `NO_UPDATE_RPTR=0`, RPTR
-advances when the CP **consumes** a dispatch packet (launches wavefronts), not
-when wavefronts **retire**.  Only for barrier packets with the `BARRIER` header
-bit does RPTR advance after preceding work retires (because the CP can't
-consume the barrier until retirement is complete).
+Audited the complete queue destroy path: `kfd_ioctl_destroy_queue` →
+`pqm_destroy_queue` → `destroy_queue_nocpsch` → `kfd_destroy_mqd_cp` →
+`kgd_hqd_destroy` (amdgpu_amdkfd_gfx_v8.c:391-493).
 
-**Design:**
+| Gap | What's missing | Impact |
+|-----|---------------|--------|
+| CP_HQD_PQ_WPTR not cleared | After HQD deactivate, WPTR register retains last value | Next queue on same HQD slot may read stale ring entries |
+| No L2 cache flush | gfx8 has no L2 flush (Hawaii gets TC flush, gfx8 skipped) | GPU L2 dirty lines persist across queue destroy |
+| MQD not zeroed | GTT page freed but not cleared; reuse gets old MQD values | Next alloc at same page reads stale MQD fields |
+| Doorbell not cleared in HW | Software clears bitmap but BAR page retains old value | Stale doorbell writes could trigger old queue action |
+| No memory barrier | No fence between dequeue and MQD free | Race between HW teardown and memory reclaim |
 
-Add CPU-side dispatch_id tracking to `ManagedBuffer`:
+`kgd_hqd_destroy()` does:
+1. Wait for IQ timer to settle ✓
+2. Send DRAIN_PIPE or RESET_WAVES dequeue request ✓
+3. Wait for CP_HQD_ACTIVE to clear ✓
+4. Return — **no register cleanup, no cache flush, no barrier**
 
-```
-class ManagedBuffer {
-    // Existing: pool_signal_[16], active_chunk_, pool_cur_offset_
-    // New: fence point for each chunk
-    uint64_t chunk_fence_id_[kPoolNumSignals];
-    hsa_queue_t* queue_;  // reference to AQL queue
-};
-```
+**Cross-process scenario:**
+1. Process A destroys queue → CP_HQD_ACTIVE cleared
+2. CP_HQD_PQ_WPTR, L2 cache, MQD contents all retain Process A's state
+3. Process B creates queue on same HQD slot
+4. `kgd_hqd_load()` reinitializes registers from MQD → should be clean
+5. BUT: GPU L2 may cache stale data at reused VAs (kernarg, staging)
 
-**Acquire() with CPU fencing (chunk rotation path):**
+**Within-process scenario (the primary issue):**
+The cross-process gaps may contribute to inter-run degradation, but the
+corruption also occurs WITHIN a single process after ~200+ rapid
+alloc/free+dispatch cycles.  This suggests an additional mechanism beyond
+queue teardown — possibly in the CLR ManagedBuffer pool rotation or the
+ROCR bounce buffer's signal management under sustained load.
 
-```
-1. Submit barrier packet with BARRIER bit
-   - Keep dep_signals (already 0 from Phase 8 CPU-wait)
-   - completion_signal = pool_signal_[active_chunk_] (unchanged)
-2. Record fence: chunk_fence_id_[active_chunk_] =
-   hsa_queue_load_write_index(queue_)
-3. Advance: active_chunk_ = (active_chunk_ + 1) % 16
-4. CPU fence check: spin until
-   hsa_queue_load_read_index(queue_) >= chunk_fence_id_[next_chunk]
-   (This means the CP has processed the barrier for next_chunk,
-    which means all work before that barrier has retired)
-5. Also keep existing WaitForSignal (belt-and-suspenders)
-```
-
-Step 4 is the key addition.  `read_dispatch_id` for the BARRIER packet
-(not the dispatch) only advances after the CP processes the barrier, which
-requires all preceding wavefronts to retire.
-
-**releaseGpuMemoryFence() with CPU fencing (kernarg reset):**
-
-```
-1. Submit barrier packet (existing)
-2. CPU-wait barrier's completion signal (existing WaitCurrent)
-3. CPU fence: verify read_dispatch_id >= write_index at barrier submission
-4. Only then: ResetQueueStates() / resetKernArgPool()
-```
-
-**Why this is robust:**
-- No reliance on GPU-side signal atomics (broken on no-atomics)
-- No reliance on CP dep_signal evaluation (broken with SLOT_BASED_WPTR=0)
-- Uses the bounce buffer's RPTR→dispatch_id conversion (proven working)
-- Barrier's BARRIER bit ensures RPTR for barrier reflects retirement
-- CPU-side check is deterministic (no timing dependency)
-
-**Implementation:** Python injection in `hip-runtime-amd/PKGBUILD` targeting
-`ManagedBuffer::Acquire()` and `releaseGpuMemoryFence()` in `rocvirtual.cpp`.
-Access queue via `gpu_.gpu_queue_` (already used in `dispatchBarrierPacket`).
-
-**Verification:** All 9 tests in `test_kernarg_stability.cpp` must pass on
-10 consecutive runs.  `test_h2d_degradation.cpp` must pass through 50k ops.
-`hip_barrier_test` must achieve 15/15 on 5 consecutive runs.
+**Next investigation steps:**
+1. Fix kernel teardown gaps (clear WPTR/RPTR, zero MQD) — defensive
+2. Add kernel-side L2 invalidation on queue destroy (via PM4 if possible,
+   or by setting all PTEs to uncached before teardown)
+3. Investigate CLR ManagedBuffer pool_signal_ lifecycle — do signals
+   leak or get recycled before GPU is done with them?
+4. Add ROCR bounce buffer monitoring — track signal alloc/free counts
+   and detect if ProcessAllBounceBuffers stops processing
 
 ### Phase 8: CPU-managed barriers for no-atomics platforms
 
