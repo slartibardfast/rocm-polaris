@@ -1759,13 +1759,71 @@ code on platforms without ATC.
 Keep the `gfx8_wptr_poll` module parameter as a debug/documentation artifact
 (default=0 now means direct doorbell for no-atomics).
 
-#### Verification
+#### Acceptance tests
 
-1. `test_h2d_kernel` — 17/17 pass (regression)
-2. `test_h2d_boundary` — 10/10 pass (regression)
-3. `llama-cli -ngl 1 -p "2+2=" -n 8` — tokens generated, no hang
-4. `sudo dmesg | grep 'fault VA'` — zero faults
-5. If tokens generate: measure t/s vs CPU baseline (13.3 t/s)
+All tests must pass on clean boot (kexec).  Each test has a timeout; hang =
+fail.  Tests are ordered from isolated/simple to integrated/complex.  A failure
+in an early test means later tests are unreliable.
+
+**Tier 1: Regression (existing tests, must not regress)**
+
+| # | Test | What it covers | Timeout | Pass criteria |
+|---|------|---------------|---------|---------------|
+| 1.1 | `test_h2d_kernel` | H2D + GPU verify, alloc/free/realloc, 1-64MB | 120s | 17/17 |
+| 1.2 | `test_h2d_boundary` | H2D boundary sizes near staging buffer edge | 60s | 10/10 |
+| 1.3 | `test_memset_verify` | hipMemset + D2H readback | 30s | PASS |
+| 1.4 | `hip_torture_test` tests 1-6 | Dispatch correctness (serial, multi-stream, interleaved) | 120s | 6/6 |
+| 1.5 | `hip_torture_test` tests 7-12 | Completion visibility (signal storm, D2H sweep, ring wrap) | 120s | 6/6 |
+
+**Tier 2: Barrier-specific (new tests targeting Phase 8 fix)**
+
+| # | Test | What it covers | Timeout | Pass criteria |
+|---|------|---------------|---------|---------------|
+| 2.1 | Kernel→memcpy→kernel chain | `hipLaunchKernel` + `hipMemcpy(D2H)` + `hipLaunchKernel` interleaved 100x — exercises `releaseGpuMemoryFence()` barriers | 60s | 100 correct readbacks |
+| 2.2 | hipEventRecord + hipEventSynchronize | Record event after kernel, sync on it, verify result — exercises marker barrier path | 30s | 500 iterations |
+| 2.3 | hipStreamSynchronize under load | Launch 100 kernels, hipStreamSynchronize, verify all completed — exercises flush barrier | 30s | 10 rounds |
+| 2.4 | Cross-stream event wait | Stream A records event, stream B waits on it via hipStreamWaitEvent, stream B kernel reads stream A result — exercises `dispatchBlockingWait()` | 60s | 100 iterations |
+| 2.5 | hipMemcpyAsync + hipStreamSync | Async H2D on stream, sync, verify — exercises staging barrier + marker | 30s | 1-64MB sweep |
+| 2.6 | Rapid hipMalloc/hipFree cycle | Alloc 1MB, H2D, kernel, D2H verify, free — repeat 200x — exercises queue drain barriers during free | 120s | 200/200 correct |
+| 2.7 | Back-to-back hipDeviceSynchronize | Launch kernel, device sync, repeat 500x — exercises global barrier path | 60s | 500 syncs |
+
+**Tier 3: Stress (sustained load, race conditions)**
+
+| # | Test | What it covers | Timeout | Pass criteria |
+|---|------|---------------|---------|---------------|
+| 3.1 | Multi-stream sustained | 4 streams, each: 200 kernels + hipStreamSync, all concurrent — exercises multi-queue barrier interaction | 120s | All streams complete, correct results |
+| 3.2 | Alloc/compute/free pipeline | Pipeline: alloc→H2D→kernel→D2H→verify→free, 500 iterations, overlapping allocs — exercises barrier + VM lifecycle | 300s | 500/500 correct |
+| 3.3 | Mixed sizes sustained | Random sizes 4KB-16MB, random H2D/D2H direction, random kernel dispatch, 300 ops — exercises all copy + barrier paths | 180s | Zero corruption, zero hangs |
+| 3.4 | Queue pressure | Launch 4096 tiny kernels without sync, then hipDeviceSynchronize — exercises ring buffer wrap + barrier accumulation | 60s | Correct final value |
+
+**Tier 4: Integration (llama.cpp-like patterns)**
+
+| # | Test | What it covers | Timeout | Pass criteria |
+|---|------|---------------|---------|---------------|
+| 4.1 | Model load pattern | 50x sequential: alloc VRAM, H2D 1MB, verify — simulates tensor loading | 120s | 50/50 correct |
+| 4.2 | Inference pattern | Kernel dispatch chain: 10 kernels writing to shared buffer, readback, verify — simulates forward pass | 60s | 100 iterations correct |
+| 4.3 | `llama-cli -ngl 1 -p "2+2=" -n 8` | Actual llama.cpp inference with 1 GPU layer | 120s | Tokens generated, no hang, no VM fault |
+| 4.4 | `llama-cli -ngl 1 -n 32` longer generation | Sustained token generation | 300s | 32 tokens, clean exit |
+
+**Tier 5: Cleanup (process exit, error paths)**
+
+| # | Test | What it covers | Timeout | Pass criteria |
+|---|------|---------------|---------|---------------|
+| 5.1 | Clean process exit | Run any kernel, `_exit(0)` — verifies no hang during HIP shutdown | 10s | Exit code 0 |
+| 5.2 | Exit with pending work | Launch 1000 async kernels, `_exit(0)` immediately — verifies queue destroy doesn't hang | 10s | Exit code 0 |
+| 5.3 | `dmesg` audit | After all tests: `dmesg \| grep 'fault VA'` | — | Zero faults |
+
+**Implementation:** Tests 1.x use existing binaries.  Tests 2.x-5.x will be a
+new `hip_barrier_test.cpp` compiled with hipcc.  Each test function returns
+bool, with alarm-based timeout.  Test runner prints per-test PASS/FAIL and
+summary.
+
+**Run protocol:**
+1. Cold boot or kexec to clean GPU state
+2. `make -C tests` to rebuild all test binaries
+3. Run tiers in order; stop on first failure in tier 1 (fundamental regression)
+4. Tiers 2-5 run even if some tests fail (collect all failures)
+5. Final `dmesg` audit (tier 5.3)
 
 ### Phase 8b: llama.cpp GPU inference optimization
 
