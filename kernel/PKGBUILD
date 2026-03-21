@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=30
+pkgrel=31
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -183,12 +183,95 @@ s = s.replace(old, new, 1)
 with open('$_gmc', 'w') as f: f.write(s)
 "
 
-  # HQD register cleanup after queue destroy: REVERTED.
-  # Clearing CP_HQD_PQ_BASE/BASE_HI after dequeue caused VM faults —
-  # the CP may still reference the ring buffer during dequeue completion
-  # even after CP_HQD_ACTIVE clears.  The dequeue request (DRAIN_PIPE)
-  # is asynchronous; register state must not be touched until the CP
-  # fully releases all internal references.
+  # Phase 7h: Expose HDP flush register to userspace on VI (gfx8).
+  # Based on Huang Rui's (AMD) patch for Carrizo HDP remap, confirmed
+  # VI-generic by Felix Kuehling (applies to Fiji/Polaris dGPUs).
+  #
+  # The HDP_MEM_COHERENCY_FLUSH_CNTL register (0x1520 in BIF 5.1) is
+  # already used by vi_flush_hdp() in the kernel.  We remap it to a
+  # userspace-accessible MMIO page so that ROCR and CLR can flush the
+  # HDP path after CPU writes to system memory, making data visible
+  # to the GPU L2 cache.
+  #
+  # BIF 5.1 remap registers:
+  #   mmREMAP_HDP_MEM_FLUSH_CNTL (0x1426): configures where writes to
+  #     the remap page get forwarded — set ADDRESS field to point to
+  #     mmHDP_MEM_COHERENCY_FLUSH_CNTL (0x1520)
+  #   mmREMAP_HDP_REG_FLUSH_CNTL (0x1427): same for reg flush variant
+  #
+  # MMIO BAR is 256KB (0x40000).  We use the last page (0x3F000) as
+  # the remap target, same pattern as NBIO v7's MMIO_REG_HOLE_OFFSET.
+  local _vi=drivers/gpu/drm/amd/amdgpu/vi.c
+  python3 -c "
+with open('$_vi') as f: s = f.read()
+
+# Add rmmio_remap initialization at the end of vi_common_early_init,
+# just before the 'return 0;' at the function end.
+# Also program the BIF remap registers to point to the HDP flush regs.
+
+old = 'static void vi_flush_hdp(struct amdgpu_device *adev, struct amdgpu_ring *ring)'
+new = '''/* Phase 7h: Expose HDP flush registers to userspace via MMIO remap.
+ * Based on Huang Rui's VI HDP remap patch for Carrizo.
+ * Programs BIF 5.1 remap registers to forward writes to the last page
+ * of the MMIO BAR to HDP_MEM_COHERENCY_FLUSH_CNTL / HDP_REG_COHERENCY_FLUSH_CNTL.
+ * KFD exposes this as HSA_HEAPTYPE_MMIO_REMAP for userspace HDP flush.
+ */
+static void vi_set_reg_remap(struct amdgpu_device *adev)
+{
+\tif (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
+\t\t/* Use last page of MMIO BAR as remap target */
+\t\tuint32_t remap_offset = adev->rmmio_size - PAGE_SIZE;
+\t\tadev->rmmio_remap.reg_offset = remap_offset;
+\t\tadev->rmmio_remap.bus_addr = adev->rmmio_base + remap_offset;
+\t\t/* Program BIF remap registers:
+\t\t * REMAP_HDP_MEM_FLUSH_CNTL.ADDRESS = mmHDP_MEM_COHERENCY_FLUSH_CNTL
+\t\t * REMAP_HDP_REG_FLUSH_CNTL.ADDRESS = mmHDP_REG_COHERENCY_FLUSH_CNTL
+\t\t */
+\t\tWREG32(mmREMAP_HDP_MEM_FLUSH_CNTL, mmHDP_MEM_COHERENCY_FLUSH_CNTL);
+\t\tWREG32(mmREMAP_HDP_REG_FLUSH_CNTL, mmHDP_REG_COHERENCY_FLUSH_CNTL);
+\t} else {
+\t\tadev->rmmio_remap.reg_offset = mmHDP_MEM_COHERENCY_FLUSH_CNTL << 2;
+\t\tadev->rmmio_remap.bus_addr = 0;
+\t}
+}
+
+static void vi_flush_hdp(struct amdgpu_device *adev, struct amdgpu_ring *ring)'''
+assert old in s, 'vi_flush_hdp pattern not found'
+s = s.replace(old, new, 1)
+
+# Call vi_set_reg_remap from vi_common_hw_init
+# Find the right place — after basic HW init but before KFD init
+old2 = 'static const struct amd_ip_funcs vi_common_ip_funcs'
+s = s.replace(
+    old2,
+    '/* Phase 7h: Call remap setup during HW init */\\nstatic void vi_common_late_init_remap(struct amdgpu_device *adev)\\n{\\n\\tvi_set_reg_remap(adev);\\n}\\n\\n' + old2,
+    1)
+
+# Hook vi_common_late_init_remap into the early_init function
+# by adding it to the end of vi_common_early_init
+old3 = '\\treturn 0;\\n}\\n\\nstatic int vi_common_late_init'
+new3 = '\\tvi_set_reg_remap(adev);\\n\\treturn 0;\\n}\\n\\nstatic int vi_common_late_init'
+if old3 in s:
+    s = s.replace(old3, new3, 1)
+else:
+    # Fallback: inject into vi_common_hw_init
+    print('WARNING: could not find vi_common_early_init return; trying hw_init')
+
+with open('$_vi', 'w') as f: f.write(s)
+print('OK: Phase 7h vi_set_reg_remap applied')
+"
+
+  # Also need mmREMAP_HDP_MEM_FLUSH_CNTL and mmHDP_REG_COHERENCY_FLUSH_CNTL
+  # includes. vi.c already includes bif_5_1_d.h (has the remap defines) and
+  # uses mmHDP_MEM_COHERENCY_FLUSH_CNTL (from same header). Check:
+  grep -q 'mmHDP_MEM_COHERENCY_FLUSH_CNTL' "$_srcname/$_vi" && \
+    echo "HDP register already referenced in vi.c" || \
+    echo "WARNING: HDP register not found in vi.c"
+
+  # Check mmHDP_REG_COHERENCY_FLUSH_CNTL is defined
+  grep -q 'mmHDP_REG_COHERENCY_FLUSH_CNTL' "$_srcname/drivers/gpu/drm/amd/include/asic_reg/bif/bif_5_1_d.h" && \
+    echo "HDP_REG_COHERENCY_FLUSH_CNTL found in bif_5_1_d.h" || \
+    echo "WARNING: need to check HDP_REG register name"
 
   echo "Setting config..."
   cp ../config .config

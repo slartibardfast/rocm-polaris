@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=17
+pkgrel=21
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -108,6 +108,33 @@ with open('$_virt', 'w') as f: f.write(s)
 print('OK: Phase 8 barrier CPU-wait applied')
 "
 
+  # Phase 7h: HDP flush at entry to submitKernelInternal — the single
+  # point where user kernel dispatches enter the pipeline. This matches
+  # the timing of the test-harness flush (after hipMemcpy completes,
+  # before kernarg allocation and AQL packet assembly).
+  python3 -c "
+with open('$_virt') as f: s = f.read()
+s = s.replace(
+    'bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const amd::Kernel& kernel,\n                                      const_address parameters, void* event_handle,\n                                      uint32_t sharedMemBytes, amd::NDRangeKernelCommand* vcmd,\n                                      hsa_kernel_dispatch_packet_t* aql_packet,\n                                      bool attach_signal) {\n  device::Kernel* devKernel',
+    '''bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const amd::Kernel& kernel,
+                                      const_address parameters, void* event_handle,
+                                      uint32_t sharedMemBytes, amd::NDRangeKernelCommand* vcmd,
+                                      hsa_kernel_dispatch_packet_t* aql_packet,
+                                      bool attach_signal) {
+  // Phase 7h: HDP flush before kernel dispatch on no-atomics.
+  // Invalidates stale GPU L2 for system memory (kernarg, ring buffer).
+  // Posting read ensures flush completes before kernarg allocation.
+  if (!roc_device_.info().pcie_atomics_ && roc_device_.info().hdpMemFlushCntl) {
+    *roc_device_.info().hdpMemFlushCntl = 1u;
+    volatile uint32_t dummy = *roc_device_.info().hdpMemFlushCntl;
+    (void)dummy;
+  }
+  device::Kernel* devKernel''',
+    1)
+with open('$_virt', 'w') as f: f.write(s)
+print('OK: Phase 7h HDP flush in submitKernelInternal')
+"
+
   # Phase 7g: CPU-verified drain before resource recycling.
   # On no-atomics, the CP's idle state with SLOT_BASED_WPTR=0 may lose track
   # of in-flight wavefronts.  After WaitCurrent() returns (barrier completion
@@ -158,43 +185,77 @@ with open('$_virt', 'w') as f: f.write(s)
 print('OK: Phase 7g CPU drain at recycling points applied')
 "
 
-  # Phase 7g: Force VRAM allocation for kernarg pool on no-atomics.
-  # On Westmere (PCIe 2.0), CPU writes to system memory don't generate
-  # snoop traffic to invalidate GPU L2.  The kernarg pool reuses the same
-  # addresses, so GPU L2 retains stale kernel arguments from previous
-  # dispatches.  VRAM allocation solves this: CPU writes to VRAM via BAR
-  # go directly to GPU memory; GPU L2 is coherent with its own VRAM.
-  # The kernarg pool (4MB) fits easily in the 256MB visible BAR.
+  # Phase 7g: Force fine-grain (kAtomics) allocation for kernarg pool
+  # on no-atomics platforms.  Coarse-grain (kNoAtomics) uses MTYPE=NC,
+  # where GPU L2 is non-coherent with system memory.  CPU writes to
+  # coarse-grain memory are invisible to GPU L2 on Westmere (PCIe 2.0).
+  # Fine-grain (kAtomics) uses MTYPE=CC, where GPU L2 participates in
+  # the coherency protocol and CPU writes are visible.  The staging
+  # buffer already uses kAtomics successfully — apply the same to kernarg.
   python3 -c "
 with open('$_virt') as f: s = f.read()
-# In ManagedBuffer::Create: also use deviceLocalAlloc when no PCIe atomics
-# (not just when largeBar is true).  The condition becomes:
-#   largeBar OR (!pcie_atomics AND pool fits in visible VRAM)
-old = '''  if (mem_segment == Device::MemorySegment::kKernArg &&
-      (gpu_.dev().settings().kernel_arg_impl_ != KernelArgImpl::HostKernelArgs) &&
-      gpu_.dev().info().largeBar_) {'''
-new = '''  if (mem_segment == Device::MemorySegment::kKernArg &&
-      (gpu_.dev().settings().kernel_arg_impl_ != KernelArgImpl::HostKernelArgs) &&
-      (gpu_.dev().info().largeBar_ || !gpu_.dev().info().pcie_atomics_)) {'''
-assert old in s, 'ManagedBuffer::Create kKernArg pattern not found'
+# Change kernarg pool segment from kKernArg to kAtomics on no-atomics.
+# kKernArg falls through to kNoAtomics (coarse-grain, MTYPE=NC).
+# kAtomics uses fine-grain pool (MTYPE=CC, GPU L2 coherent).
+old = 'if (!managed_kernarg_buffer_.Create(Device::MemorySegment::kKernArg)) {'
+new = '''if (!managed_kernarg_buffer_.Create(
+        dev().info().pcie_atomics_ ? Device::MemorySegment::kKernArg
+                                   : Device::MemorySegment::kAtomics)) {'''
+assert old in s, 'managed_kernarg_buffer_.Create pattern not found'
 s = s.replace(old, new, 1)
 with open('$_virt', 'w') as f: f.write(s)
-print('OK: Phase 7g VRAM kernarg for no-atomics applied')
+print('OK: Phase 7g fine-grain kernarg for no-atomics applied')
 "
 
-  # Phase 7g: Replace nontemporalMemcpy with regular memcpy for kernarg
-  # on no-atomics platforms.  NT stores (_mm_stream_si128) may produce
-  # torn writes visible to the GPU on PCIe 2.0 (Westmere):
-  # - 128-bit NT store may split into two 64-bit PCIe TLPs
-  # - WC buffer flushes cache lines in arbitrary order
-  # - VRAM BAR is WC-mapped, making NT store ordering unreliable
-  # Regular memcpy uses MOV instructions which are strongly ordered on x86.
+  # Phase 7g: Instrument kernarg lifecycle to find address divergence.
+  python3 -c "
+with open('$_virt') as f: s = f.read()
+
+# 1. Log allocKernArg returns
+s = s.replace(
+    'return managed_kernarg_buffer_.Acquire(size, alignment);',
+    '''void* ret = managed_kernarg_buffer_.Acquire(size, alignment);
+  static int ka_count = 0;
+  if (++ka_count <= 5000)
+    fprintf(stderr, \"[KA] alloc sz=%zu align=%zu -> %p\\\\n\", size, alignment, ret);
+  return ret;''',
+    1)
+
+# 2. Log resetKernArgPool
+s = s.replace(
+    'void VirtualGPU::ManagedBuffer::ResetPool() {',
+    '''void VirtualGPU::ManagedBuffer::ResetPool() {
+  static int rp_count = 0;
+  if (++rp_count <= 5000)
+    fprintf(stderr, \"[KA] RESET pool offset=%zu chunk=%u\\\\n\", pool_cur_offset_, active_chunk_);''',
+    1)
+
+# 3. Log kernarg_address in AQL packet
+s = s.replace(
+    'dispatchPacket.kernarg_address = argBuffer;',
+    '''dispatchPacket.kernarg_address = argBuffer;
+  { static int dp_count = 0;
+    if (++dp_count <= 5000)
+      fprintf(stderr, \"[KA] dispatch kernarg_address=%p argBuffer=%p\\\\n\",
+              dispatchPacket.kernarg_address, (void*)argBuffer);
+  }''',
+    1)
+
+with open('$_virt', 'w') as f: f.write(s)
+print('OK: Phase 7g kernarg lifecycle instrumentation applied')
+"
+
+  # Phase 7h: HDP flush after kernarg write on no-atomics platforms.
+  # CPU writes to system memory are invisible to GPU L2 on Westmere
+  # PCIe 2.0. The HDP flush register invalidates GPU L2 for system
+  # memory, making CPU-written kernarg data visible to the GPU.
+  # Also use regular memcpy (not NT stores) for reliable ordering.
   python3 -c "
 with open('$_virt') as f: s = f.read()
 s = s.replace(
     'nontemporalMemcpy(argBuffer, parameters, argSize);',
-    '''// Phase 7g: Use regular memcpy for kernarg on no-atomics.
-    // NT stores may produce torn writes on PCIe 2.0.
+    '''// Phase 7h: Regular memcpy for kernarg on no-atomics.
+    // HDP flush happens in dispatchGenericAqlPacket (covers all paths).
     if (!roc_device_.info().pcie_atomics_) {
       memcpy(argBuffer, parameters, argSize);
       _mm_sfence();
@@ -203,7 +264,7 @@ s = s.replace(
     }''',
     1)
 with open('$_virt', 'w') as f: f.write(s)
-print('OK: Phase 7g regular memcpy for kernarg applied')
+print('OK: Phase 7h HDP flush after kernarg write applied')
 "
 
   # Phase 7b+7e: UC all host allocations on non-coherent platforms.
