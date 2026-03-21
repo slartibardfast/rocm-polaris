@@ -1624,7 +1624,150 @@ The `HSA_AMD_MEMORY_POOL_UNCACHED_FLAG` sets the CPU mapping to UC via `set_memo
 
 **Phase 7f (ACQUIRE_MEM hack): REMOVED.** The PM4 TC_WB_ACTION_ENA is a hardware operation outside the GFX8 ISA memory model. It caused VM faults when ExecutePM4 was called on the blit queue. The kernel SNOOPED fix is the correct solution.
 
-### Phase 8: llama.cpp GPU inference optimization
+### Phase 8: CPU-managed barriers for no-atomics platforms
+
+#### Problem: CP idle stall on AQL barrier deps
+
+The Command Processor (CP) goes idle after encountering an unsatisfied AQL
+barrier dependency and never re-evaluates.  With `SLOT_BASED_WPTR=0` (direct
+doorbell), the CP only re-reads WPTR on a doorbell hit.  When the barrier dep
+signal is decremented externally (by another queue or CPU), the CP doesn't
+notice — it's idle, no new doorbell arrives (same WPTR), no `DOORBELL_HIT`
+interrupt fires.
+
+This causes:
+- llama.cpp inference hangs (CP stalls on internal barrier, never resumes)
+- Queue drain failures → scratch/context freed while GPU executing → VM faults
+- All "use-after-free" VM faults trace back to failed queue drain
+
+#### SLOT_BASED_WPTR=2 is not viable without ATC/IOMMU
+
+`SLOT_BASED_WPTR=2` (CP polls WPTR from memory) would solve the idle stall by
+making the CP periodically re-evaluate.  However, the CP polling engine reads
+from `cp_hqd_pq_wptr_poll_addr` via ATC (Address Translation Cache), not via
+GPUVM.  On gfx8 without ATC/IOMMU (our platform: Westmere PCIe 2.0, no ATS,
+no PASID), the CP cannot resolve the poll address.
+
+Evidence:
+- Allocated poll buffer from kernarg pool (CPU VA = GPU VA, GPUVM-mapped)
+- Set `CP_PQ_WPTR_POLL_CNTL.EN=1` and queue bit in `CNTL1`
+- CP never fetches packets — 100% CPU spin, no VM fault, no dmesg errors
+- DRM compute rings on gfx8 never use `SLOT_BASED_WPTR=2` (pure doorbell)
+- KFD was designed for APUs with shared memory and ATC (Kaveri)
+- IOMMU without ATS/PASID (our platform) cannot provide ATC translation
+
+IOMMU alone (Intel VT-d) provides DMA remapping but NOT the on-demand VA→PA
+translation that ATC needs.  ATS (PCIe 3.0) and PASID are required for the
+GPU to request translations from the IOMMU.  Westmere is PCIe 2.0.
+
+#### What's logically impossible on gfx8/no-atomics/no-ATC
+
+| Capability | Status | Implication |
+|---|---|---|
+| GPU atomic write to system memory | **Impossible** | GPU can't decrement HSA signals |
+| ATC address translation | **Impossible** | CP can't resolve CPU VAs for polling |
+| SLOT_BASED_WPTR=2 polling | **Impossible** | Depends on ATC |
+| System-scope L2 flush (ISA) | **Not in ISA** | gfx8 has no L2 flush instruction |
+| GPU-side barrier dep evaluation | **Hangs** | CP goes idle, never re-evaluates |
+| GPU-side signal completion | **Unreliable** | Needs PCIe atomics |
+
+| Capability | Status | |
+|---|---|---|
+| GPUVM ring buffer fetch | **Works** | CP fetches AQL packets |
+| GPUVM RPTR write | **Works** | Proven with rptr_gpu_buf_ |
+| Direct doorbell (SLOT_BASED_WPTR=0) | **Works** | Doorbell value IS WPTR |
+| CPU-side signal management | **Works** | Bounce buffer, CPU waits |
+| Staging buffer copies | **Works** | All H2D/D2H sizes verified |
+
+#### Root cause: CLR submits AQL barriers with GPU-side deps
+
+ROCR's BlitKernel already has a CPU-wait bypass (Phase 6a): when
+`NoPlatformAtomics()`, it CPU-waits all dep signals and clears them before
+submitting the AQL packet.  This eliminates barrier deps from the blit copy
+path.
+
+CLR's `dispatchBarrierPacket()` has **no equivalent bypass**.  It submits
+`BARRIER_AND` packets with dep_signals that require the CP to evaluate them on
+the GPU.  When any dep is unsatisfied, the CP stalls permanently.
+
+Complete barrier source inventory:
+
+**ROCR (1 site, BYPASSED):**
+- `BlitKernel::SubmitLinearCopyCommand()` — Phase 6a CPU-wait ✅
+
+**CLR (10+ call sites, NOT BYPASSED):**
+
+| Call site | Function | Dep signals? | Risk |
+|---|---|---|---|
+| `releaseGpuMemoryFence()` | Memory ordering | Yes (active signal) | **HANG** |
+| `dispatchBlockingWait()` | Multi-signal wait | Yes (1-5 deps) | **HANG** |
+| Marker (cache flush) | hipEvent/Stream sync | Yes (active signal) | **HANG** |
+| Marker (no cache) | Lightweight sync | Sometimes | **HANG if deps** |
+| KernelArgPool chunk | Pool flush | Possibly | **HANG if deps** |
+| Stream write | hipStreamWriteValue | Yes | **HANG** |
+| VM mapping | Virtual memory ops | Yes | **HANG** |
+| Dynamic parallelism | Child dispatch sync | Yes | **HANG** |
+| Accumulate | NOP barrier | No deps typically | Low risk |
+
+#### Fix: CPU-wait barrier deps in CLR
+
+Single change in `dispatchBarrierPacket()`: when `!dev().info().pcie_atomics_`,
+CPU-wait each dep_signal to completion before submitting the AQL barrier.  The
+barrier is still submitted (with completion_signal) but with all dep_signal
+slots cleared — the CP sees it as an immediate barrier and completes it
+instantly.
+
+```
+dispatchBarrierPacket(header, skipSignal):
+  if (!dev().info().pcie_atomics_) {
+      for each dep_signal[j] in barrier_packet_:
+          if (dep_signal[j].handle != 0):
+              while (hsa_signal_load_relaxed(dep_signal[j]) > 0):
+                  yield()
+              dep_signal[j] = {0}   // clear — no GPU-side eval needed
+  }
+  // ... normal AQL submission with completion_signal only
+```
+
+**Why this is safe on gfx8:**
+- AQL queues are in-order — removing deps doesn't reorder execution
+- gfx8 fence scopes are effectively NOPs (no ISA L2 flush; SNOOPED=1 handles
+  coherency at PTE level via kernel patch 0009)
+- Completion signal is set by CP after barrier completes (bounce buffer handles
+  signal lifecycle)
+- Pattern identical to proven Phase 6a BlitKernel fix
+
+**Performance impact:** Barriers become synchronous CPU waits, serializing the
+pipeline at barrier points.  For llama.cpp (many small kernel dispatches), this
+may reduce throughput.  But correctness is required before optimization, and the
+no-atomics platform is inherently CPU-bound for signal management.
+
+#### Implementation
+
+Single python injection in `hip-runtime-amd/PKGBUILD` targeting
+`rocclr/device/rocm/rocvirtual.cpp` `dispatchBarrierPacket()`.  Add CPU-wait
+loop before the existing AQL submission code, conditional on
+`!dev().info().pcie_atomics_`.
+
+#### Revert: SLOT_BASED_WPTR=2 changes
+
+Revert kernel patch 0008 to the working `SLOT_BASED_WPTR=0` (direct doorbell)
+for no-atomics.  Remove `wptr_gpu_buf_` from ROCR patch 0003.  Remove
+`CP_PQ_WPTR_POLL_CNTL` injection from kernel PKGBUILD.  These changes are dead
+code on platforms without ATC.
+
+Keep the `gfx8_wptr_poll` module parameter as a debug/documentation artifact
+(default=0 now means direct doorbell for no-atomics).
+
+#### Verification
+
+1. `test_h2d_kernel` — 17/17 pass (regression)
+2. `test_h2d_boundary` — 10/10 pass (regression)
+3. `llama-cli -ngl 1 -p "2+2=" -n 8` — tokens generated, no hang
+4. `sudo dmesg | grep 'fault VA'` — zero faults
+5. If tokens generate: measure t/s vs CPU baseline (13.3 t/s)
+
+### Phase 8b: llama.cpp GPU inference optimization
 
 Once inference works, measure performance:
 - Token generation rate (t/s) vs CPU-only baseline (13.3 t/s)
@@ -1664,3 +1807,6 @@ Once inference works, measure performance:
 | 2026-03-20 | VM fault root cause: pinned host memory path | CLR unpins (clears PTEs) before DMA reads complete; disabling pinning on no-atomics fixes all sizes 1-512MB |
 | 2026-03-20 | kernel PT coherence patches were red herrings | CPU_ACCESS_REQUIRED, wait=true, vm_update_mode=3 — all unnecessary; PTEs were correct, just cleared too early by CLR unpin |
 | 2026-03-20 | hip-runtime-amd-polaris 7.2.0-6 | Fix 4: `doHostPinning &&= dev().info().pcie_atomics_` in getBuffer(); forces staging pool path |
+| 2026-03-21 | SLOT_BASED_WPTR=2 confirmed dead on gfx8/no-ATC | CP polling engine uses ATC, not GPUVM; kernarg pool address mapped but CP never reads; no VM fault confirms CP ignores poll addr |
+| 2026-03-21 | Phase 8: CPU-managed barriers | Eliminate all GPU-side barrier dep evaluation; CPU-wait deps in CLR dispatchBarrierPacket(); same pattern as proven Phase 6a blit fix |
+| 2026-03-21 | Revert SLOT_BASED_WPTR=2 changes | Dead code on no-ATC platforms; revert to SLOT_BASED_WPTR=0 (direct doorbell) which is proven working |
