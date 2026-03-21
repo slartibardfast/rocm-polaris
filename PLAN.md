@@ -1624,6 +1624,45 @@ The `HSA_AMD_MEMORY_POOL_UNCACHED_FLAG` sets the CPU mapping to UC via `set_memo
 
 **Phase 7f (ACQUIRE_MEM hack): REMOVED.** The PM4 TC_WB_ACTION_ENA is a hardware operation outside the GFX8 ISA memory model. It caused VM faults when ExecutePM4 was called on the blit queue. The kernel SNOOPED fix is the correct solution.
 
+#### Phase 7g: D2H coherency under sustained mixed-size load
+
+**Status: INVESTIGATING**
+
+Phase 7a-f verified D2H correctness for sequential alloc→copy→verify→free
+patterns (1MB-512MB).  Under sustained rapid alloc/free cycling with mixed
+sizes (4KB-4MB, 300+ ops), intermittent data corruption appears.
+
+**Test:** `hip_barrier_test` test 3.3 — 300 random ops, each: malloc→memset→
+H2D→GPU verify→D2H verify→free.  Fails between op 24 and op 230 depending
+on run.
+
+**Failure signatures (non-deterministic):**
+- `gpu_bad=0, d2h_bad=1`: GPU has correct data, CPU reads wrong D2H (coherency)
+- `gpu_bad=N, d2h_bad=0`: GPU reads wrong data, D2H matches GPU (H2D or PTE)
+- `gpu_bad=N, d2h_bad=1`: Both wrong (cascading corruption)
+
+**What's different from Phase 7 testing:**
+- Rapid VA reuse: hipMalloc returns same VA ~60% of the time after hipFree
+- Interleaved diagnostic buffer allocs (d_bad): 3 hipMalloc + 3 hipFree per op
+- Mixed sizes stress TLB and page table update paths differently than sequential
+
+**Not caused by fork test:** KFD already blocks forked children at ioctl level
+(`lead_thread != current->group_leader` → `-EBADF`).  Test 5.2 children cannot
+modify GPU state.  Run degradation between test invocations may be from GPU
+L2/TLB state that persists between processes.
+
+**Hypotheses:**
+1. TLB stale after rapid free→realloc at same VA (heavyweight flush not completing)
+2. GPU L2 dirty lines from previous allocation visible at reused VA
+3. Page table update race: PTE write not committed to VRAM before GPU dispatch
+4. `hipMemset(d_bad, 0, sizeof(int))` and `hipMemcpy` to same staging pool race
+
+**Investigation plan:**
+1. Reproduce on clean kexec boot, collect GPU-side byte samples at failure
+2. Check if failure VA matches previous operation's VA (reuse correlation)
+3. Add explicit hipDeviceSynchronize between free and next malloc
+4. Test with TLB flush forced between every op
+
 ### Phase 8: CPU-managed barriers for no-atomics platforms
 
 #### Problem: CP idle stall on AQL barrier deps
