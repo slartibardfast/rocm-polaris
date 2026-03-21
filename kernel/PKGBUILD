@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=22
+pkgrel=30
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -182,6 +182,13 @@ new = '''if (!addr && !status)
 s = s.replace(old, new, 1)
 with open('$_gmc', 'w') as f: f.write(s)
 "
+
+  # HQD register cleanup after queue destroy: REVERTED.
+  # Clearing CP_HQD_PQ_BASE/BASE_HI after dequeue caused VM faults —
+  # the CP may still reference the ring buffer during dequeue completion
+  # even after CP_HQD_ACTIVE clears.  The dequeue request (DRAIN_PIPE)
+  # is asynchronous; register state must not be touched until the CP
+  # fully releases all internal references.
 
   echo "Setting config..."
   cp ../config .config
