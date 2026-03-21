@@ -1778,14 +1778,129 @@ alloc/free+dispatch cycles.  This suggests an additional mechanism beyond
 queue teardown — possibly in the CLR ManagedBuffer pool rotation or the
 ROCR bounce buffer's signal management under sustained load.
 
-**Next investigation steps:**
-1. Fix kernel teardown gaps (clear WPTR/RPTR, zero MQD) — defensive
-2. Add kernel-side L2 invalidation on queue destroy (via PM4 if possible,
-   or by setting all PTEs to uncached before teardown)
-3. Investigate CLR ManagedBuffer pool_signal_ lifecycle — do signals
-   leak or get recycled before GPU is done with them?
-4. Add ROCR bounce buffer monitoring — track signal alloc/free counts
-   and detect if ProcessAllBounceBuffers stops processing
+**Key finding (2026-03-21):** Corruption happens on FIRST run from clean
+kexec boot.  7/9 on run 1.  NOT a cross-process accumulation issue.  The
+problem is inherent to Phase 8 barrier dep-clearing.
+
+**Root cause confirmed:** Phase 8 clears dep_signals in ALL barriers
+including resource recycling barriers.  When deps are cleared:
+
+1. `ManagedBuffer::Acquire()` chunk rotation (line 1947 in rocvirtual.cpp):
+   - Dispatches barrier with `completion_signal = pool_signal_[chunk]`
+   - Our Phase 8 clears its dep_signals → CP completes barrier instantly
+   - `pool_signal_[chunk]` goes to 0 via bounce buffer at RPTR advance
+   - RPTR advances when CP **consumes** (launches) the preceding blit kernel
+   - Preceding blit kernel wavefronts may still be **reading** the chunk
+   - Next iteration overwrites the chunk → blit reads corrupted data
+
+2. `releaseGpuMemoryFence()` (line 1695 in rocvirtual.cpp):
+   - Dispatches barrier → `WaitCurrent()` → `ResetQueueStates()`
+   - Same issue: barrier completes before preceding kernels finish
+   - `resetKernArgPool()` reuses kernarg memory → kernel reads stale args
+
+**The fix:** In these TWO specific recycling paths (not all barriers), add a
+CPU-side drain that waits for ALL preceding wavefronts to retire before
+recycling.  The drain uses `Barriers().WaitCurrent()` which CPU-waits
+the barrier's completion signal.  The key insight: the barrier's completion
+signal goes to 0 when the bounce buffer sees RPTR advance PAST the barrier
+packet.  For a barrier with the BARRIER header bit, the CP can't advance
+RPTR past it until all preceding wavefronts retire.
+
+So the flow becomes:
+1. Phase 8 clears dep_signals → barrier has no deps
+2. Barrier is submitted to AQL queue with BARRIER bit
+3. CP processes preceding dispatches (launches wavefronts)
+4. CP reaches barrier → BARRIER bit forces wait for wavefront retirement
+5. Wavefronts retire → CP advances RPTR past barrier
+6. Bounce buffer sees RPTR advance → decrements completion signal
+7. CPU `WaitCurrent()` returns → safe to recycle
+
+The issue was that `WaitCurrent()` in `releaseGpuMemoryFence()` already
+does this!  And `WaitForSignal(pool_signal_[next_chunk])` in Acquire()
+should too.  So why doesn't it work?
+
+**Hypothesis:** The `pool_signal_[active_chunk_]` in Acquire() is set to
+1 and used as the barrier's completion_signal.  But on no-atomics, the
+GPU can't decrement this signal — the bounce buffer does it.  The bounce
+buffer only processes signals for packets in the AQL queue's ring buffer.
+The `pool_signal_` is a SEPARATE signal created outside the AQL queue.
+The bounce buffer may NOT process it.
+
+If the bounce buffer doesn't decrement `pool_signal_[chunk]`, then
+`WaitForSignal()` at line 1951 spins forever... unless there's a timeout
+or the signal is processed by a different mechanism.
+
+**Actually:** Looking at the bounce buffer code (ROCR ProcessCompletions),
+it processes the completion_signal of each AQL packet it encounters in
+the ring buffer.  The barrier packet has `completion_signal = pool_signal_[chunk]`.
+When the bounce buffer processes the barrier packet, it decrements
+pool_signal_[chunk].  So the bounce buffer DOES handle it.
+
+**Revised hypothesis:** The bounce buffer processes packets in order.
+If the barrier's RPTR hasn't advanced yet (CP waiting for wavefront
+retirement), the bounce buffer hasn't reached the barrier packet.
+Meanwhile, the NEXT Acquire() call finds the NEXT chunk's signal already
+at 0 (from 16 rotations ago, or initial value).  So it proceeds to
+recycle the next chunk — but the CURRENT chunk might still have in-flight
+blit kernels reading from it.
+
+Wait — Acquire() waits on `pool_signal_[NEXT_chunk]`, not the current
+one.  The current chunk gets its signal set and barrier submitted.  The
+next chunk was used 16 rotations ago.  If that barrier completed, its
+signal is 0.
+
+The issue is the CURRENT chunk's preceding blit kernel.  The blit kernel
+reads from the CURRENT chunk.  Acquire() submits a barrier for the current
+chunk, then moves to the NEXT chunk and returns an address in the NEXT
+chunk.  The caller writes new data to the NEXT chunk.  The old blit kernel
+reads from the CURRENT chunk.  These are DIFFERENT chunks — no overlap!
+
+So where is the corruption?  It must be in the kernarg pool, not the
+staging buffer.  The kernarg pool uses `releaseGpuMemoryFence()` which
+resets the ENTIRE pool (`pool_cur_offset_ = 0`).  If the reset happens
+while a kernel is still reading its kernarg, the next kernel's args
+overwrite the in-use memory.
+
+**Fix: add explicit CPU drain before kernarg pool reset.**
+
+In `releaseGpuMemoryFence()`, `WaitCurrent()` should already provide
+this.  But `WaitCurrent()` waits on the barrier's completion signal.
+If the barrier was submitted with cleared deps (Phase 8), and the CP
+completes it instantly (no deps, BARRIER bit doesn't help because the
+CP considers itself "idle" after processing all preceding packets with
+SLOT_BASED_WPTR=0)...
+
+**NEW INSIGHT:** With SLOT_BASED_WPTR=0, when the CP finishes processing
+all packets in the ring buffer, it goes idle.  When a new barrier arrives
+(via doorbell), the CP wakes, reads the barrier.  The barrier has BARRIER
+bit set.  Does the idle CP remember that preceding wavefronts haven't
+retired?  Or does it consider the queue "drained" (all packets consumed)?
+
+If the CP goes idle and "forgets" about in-flight wavefronts, then the
+BARRIER bit on the newly-arrived barrier is useless — the CP thinks all
+preceding work is done.
+
+**This is the root cause.** The CP's idle state with SLOT_BASED_WPTR=0
+loses track of in-flight wavefronts.  The BARRIER bit only checks the
+CP's internal state, which resets on idle.
+
+**Probability of fix: 70%** if we add an explicit `hipDeviceSynchronize`
+(or `Barriers().WaitCurrent()` with a preceding NOP dispatch) before
+every kernarg pool reset in `releaseGpuMemoryFence()`.  This forces the
+CP to process a NOP dispatch (which resets its "all packets consumed"
+state), then hit the barrier (which now correctly waits for the NOP and
+all preceding wavefronts).
+
+The 30% uncertainty is from: (a) this theory could be wrong — the CP
+might actually track wavefronts correctly even when idle, and the real
+issue is elsewhere; (b) the NOP dispatch workaround might have its own
+timing issues.
+
+**Alternative (probability 90%):** Skip barriers entirely for resource
+recycling.  Instead, use `hipDeviceSynchronize`-equivalent at recycling
+points: submit a barrier, wait for it via WaitCurrent, AND add a CPU
+sleep/spin to ensure wavefronts actually complete.  The sleep approach
+is ugly but empirically verifiable.
 
 ### Phase 8: CPU-managed barriers for no-atomics platforms
 
