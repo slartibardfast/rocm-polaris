@@ -1896,11 +1896,74 @@ might actually track wavefronts correctly even when idle, and the real
 issue is elsewhere; (b) the NOP dispatch workaround might have its own
 timing issues.
 
-**Alternative (probability 90%):** Skip barriers entirely for resource
-recycling.  Instead, use `hipDeviceSynchronize`-equivalent at recycling
-points: submit a barrier, wait for it via WaitCurrent, AND add a CPU
-sleep/spin to ensure wavefronts actually complete.  The sleep approach
-is ugly but empirically verifiable.
+**Breakthrough diagnostic (2026-03-21):**
+
+Instrumented kernel records what arguments it ACTUALLY received:
+
+```
+FAIL iter 256:
+  GPU val arg     = 0     ← kernel received val = 0
+  GPU out ptr lo  = 0x0   ← kernel received out = NULL
+  d ptr           = 0x4100600000   ← CPU passed this pointer
+```
+
+**ALL kernel arguments are ZERO at iter 256.**  Not stale, not partially
+correct — completely zeroed.  The kernarg_address in the AQL dispatch
+packet points to memory containing all zeros.
+
+Earlier test showed sequential aliasing: iter 1035 reads values from iter 11
+(offset = 1024 exactly).  With deeper instrumentation, iter 256 shows
+all-zero args.
+
+**Eliminated hypotheses (total 10):**
+
+| # | Hypothesis | How tested | Result |
+|---|-----------|-----------|--------|
+| 1 | GPU L2 stale from UC system memory | VRAM kernarg via BAR | Still fails |
+| 2 | GPU L2 stale from WB system memory | WB hostAlloc | Much worse (100%) |
+| 3 | Premature recycling (single barrier) | Phase 8 dep-clear + WaitCurrent | Fails |
+| 4 | Premature recycling (double barrier) | Two barriers + WaitCurrent | Fails |
+| 5 | read_index fence | Spin on read_idx >= write_idx | Fails |
+| 6 | Keep dep_signals in barrier | Don't clear after CPU-wait | Much worse (80%) |
+| 7 | NT store torn writes | Regular memcpy instead | Fails |
+| 8 | Cross-process HQD state | Clear HQD regs after destroy | VM faults; reverted |
+| 9 | Cross-process accumulation | Test on clean kexec | Fails on first run |
+| 10 | Ring buffer wrap stale AQL | Count packets vs ring size | No wrap at failure point |
+
+**What we KNOW from the diagnostic:**
+- Kernel receives `val=0`, `out=NULL` — ALL args zeroed
+- The kernarg CPU-side write is correct (CPU passes `val=542`, `out=0x4100600000`)
+- Failure at iter 256 (or 1035, 542 — varies) — no single clean boundary
+- `allocKernArg` returns an address, CPU writes there, but GPU reads zeros
+
+**Current investigation path:**
+
+The kernarg pool offset and the AQL packet's `kernarg_address` may diverge
+when `resetKernArgPool()` is called between `allocKernArg()` and the AQL
+packet submission.  Sequence:
+
+```
+1. allocKernArg() returns address A (offset X in pool)
+2. nontemporalMemcpy writes args to address A
+3. releaseGpuMemoryFence() triggered by hipMemcpy or barrier
+   → resetKernArgPool() → offset = 0
+4. dispatchAqlPacket() constructs AQL packet with kernarg_address = A
+5. BUT: another allocKernArg (from blit kernel) now returns offset 0
+   in the SAME pool, potentially overwriting address A's data with zeros
+```
+
+**OR:** `allocKernArg` returns an address in a VRAM chunk that was just
+rotated.  The chunk contains zeros (never initialized).  The CPU writes
+correct data.  But the AQL packet's `kernarg_address` was set BEFORE
+the write completed (PCIe BAR write latency vs AQL packet submission).
+
+**Next steps:**
+1. Add stderr logging to `allocKernArg`: address, offset, pool state
+2. Add logging to `resetKernArgPool`: when and where reset happens
+3. Check if hipMemcpy/hipMemset between allocKernArg and dispatchAqlPacket
+   triggers a reset
+4. Instrument `submitKernelInternal` to print kernarg_address in AQL packet
+5. Compare: does kernarg_address match what allocKernArg returned?
 
 ### Phase 8: CPU-managed barriers for no-atomics platforms
 
