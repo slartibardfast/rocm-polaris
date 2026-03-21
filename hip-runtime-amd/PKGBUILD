@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=6
+pkgrel=17
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -44,10 +44,13 @@ s = s.replace(
     '#include <algorithm>',
     '#include <algorithm>\n\n#if defined(__x86_64__) || defined(__i386__)\n#include <x86intrin.h>\n#endif',
     1)
-# Disable pinning on no-atomics platforms
+# Disable ALL host memory pinning on no-atomics platforms.
+# pinHostMemory is the single gateway for 5 callers (getBuffer, readImage,
+# writeImage, readBufferRect, writeBufferRect).  Returning nullptr makes
+# each caller fall back to staging buffers.
 s = s.replace(
-    'bool doHostPinning = enablePin && (size > MinSizeForPinnedXfer);',
-    '// Disable pinning on no-atomics platforms: pinned path unpins before DMA completes\n  bool doHostPinning = enablePin && (size > MinSizeForPinnedXfer) && dev().info().pcie_atomics_;',
+    'amd::Memory* DmaBlitManager::pinHostMemory(const void* hostMem, size_t pinSize,\n                                           size_t& partial) const {',
+    'amd::Memory* DmaBlitManager::pinHostMemory(const void* hostMem, size_t pinSize,\n                                           size_t& partial) const {\n  // No-atomics: pinned path unpins (clears PTEs) before DMA completes\n  if (!dev().info().pcie_atomics_) return nullptr;',
     1)
 # Add WaitCurrent after H2D staging chunk on no-atomics
 s = s.replace(
@@ -76,9 +79,138 @@ print('OK: Fix 2-4 applied to rocblit.cpp')
         continue;\
       }' rocclr/device/rocm/rocvirtual.cpp
 
+  # Phase 8: CPU-wait barrier dep_signals on no-atomics platforms.
+  # The CP goes idle on unsatisfied AQL barrier deps with SLOT_BASED_WPTR=0
+  # and never re-evaluates.  CPU-wait all deps, then clear them so the CP
+  # sees an immediate barrier.
+  local _virt=rocclr/device/rocm/rocvirtual.cpp
+  python3 -c "
+with open('$_virt') as f: s = f.read()
+old = 'void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,\n                                       hsa_signal_t signal) {\n  const uint32_t queueSize = gpu_queue_->size;'
+new = '''void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
+                                       hsa_signal_t signal) {
+  // Phase 8: CPU-wait all barrier dep signals on no-atomics platforms.
+  // Without this, the CP stalls permanently on unsatisfied deps.
+  if (!dev().info().pcie_atomics_) {
+    for (int j = 0; j < 5; j++) {
+      if (barrier_packet_.dep_signal[j].handle != 0) {
+        while (hsa_signal_load_relaxed(barrier_packet_.dep_signal[j]) > 0) {
+          amd::Os::yield();
+        }
+        barrier_packet_.dep_signal[j] = hsa_signal_t{0};
+      }
+    }
+  }
+  const uint32_t queueSize = gpu_queue_->size;'''
+assert old in s, 'dispatchBarrierPacket pattern not found'
+s = s.replace(old, new, 1)
+with open('$_virt', 'w') as f: f.write(s)
+print('OK: Phase 8 barrier CPU-wait applied')
+"
+
+  # Phase 7g: CPU-verified drain before resource recycling.
+  # On no-atomics, the CP's idle state with SLOT_BASED_WPTR=0 may lose track
+  # of in-flight wavefronts.  After WaitCurrent() returns (barrier completion
+  # signal fired via bounce buffer), add explicit queue drain check to ensure
+  # ALL preceding dispatches have fully retired before kernarg pool reset.
+  # Also add drain to ManagedBuffer::Acquire() chunk rotation.
+  python3 -c "
+with open('$_virt') as f: s = f.read()
+
+# 1. Full queue drain before kernarg pool reset in releaseGpuMemoryFence.
+# Submit a NOP dispatch, then wait for it to complete via WaitCurrent.
+# The NOP dispatch forces the CP to process it in-order (BARRIER bit),
+# which means all preceding wavefronts must retire first.  The subsequent
+# WaitCurrent waits for the NOP's completion, guaranteeing all prior
+# kernels have finished reading their kernarg data.
+s = s.replace(
+    'Barriers().WaitCurrent();\n\n    ResetQueueStates();',
+    '''Barriers().WaitCurrent();
+
+    // Phase 7g: Full queue drain before kernarg pool reset.
+    // The barrier-based drain is insufficient — RPTR advances at packet
+    // consumption, not wavefront retirement.  Use a second WaitCurrent
+    // to ensure the CP has fully retired all preceding work.
+    if (!dev().info().pcie_atomics_ && gpu_queue_ != nullptr) {
+      // Submit another barrier and wait — this barrier can only complete
+      // after the CP has processed all preceding packets including the
+      // first barrier.  With the BARRIER header bit, the CP waits for
+      // all preceding wavefronts before processing this barrier.
+      dispatchBarrierPacket(kBarrierPacketHeader);
+      Barriers().WaitCurrent();
+    }
+
+    ResetQueueStates();''',
+    1)
+
+# 2. Same for chunk recycling in ManagedBuffer::Acquire
+s = s.replace(
+    'bool test = WaitForSignal(pool_signal_[active_chunk_], gpu_.ActiveWait());',
+    '''bool test = WaitForSignal(pool_signal_[active_chunk_], gpu_.ActiveWait());
+    // Phase 7g: Full drain before chunk reuse.
+    if (!gpu_.dev().info().pcie_atomics_ && gpu_.gpu_queue_ != nullptr) {
+      gpu_.dispatchBarrierPacket(kBarrierPacketHeader);
+      gpu_.Barriers().WaitCurrent();
+    }''',
+    1)
+
+with open('$_virt', 'w') as f: f.write(s)
+print('OK: Phase 7g CPU drain at recycling points applied')
+"
+
+  # Phase 7g: Force VRAM allocation for kernarg pool on no-atomics.
+  # On Westmere (PCIe 2.0), CPU writes to system memory don't generate
+  # snoop traffic to invalidate GPU L2.  The kernarg pool reuses the same
+  # addresses, so GPU L2 retains stale kernel arguments from previous
+  # dispatches.  VRAM allocation solves this: CPU writes to VRAM via BAR
+  # go directly to GPU memory; GPU L2 is coherent with its own VRAM.
+  # The kernarg pool (4MB) fits easily in the 256MB visible BAR.
+  python3 -c "
+with open('$_virt') as f: s = f.read()
+# In ManagedBuffer::Create: also use deviceLocalAlloc when no PCIe atomics
+# (not just when largeBar is true).  The condition becomes:
+#   largeBar OR (!pcie_atomics AND pool fits in visible VRAM)
+old = '''  if (mem_segment == Device::MemorySegment::kKernArg &&
+      (gpu_.dev().settings().kernel_arg_impl_ != KernelArgImpl::HostKernelArgs) &&
+      gpu_.dev().info().largeBar_) {'''
+new = '''  if (mem_segment == Device::MemorySegment::kKernArg &&
+      (gpu_.dev().settings().kernel_arg_impl_ != KernelArgImpl::HostKernelArgs) &&
+      (gpu_.dev().info().largeBar_ || !gpu_.dev().info().pcie_atomics_)) {'''
+assert old in s, 'ManagedBuffer::Create kKernArg pattern not found'
+s = s.replace(old, new, 1)
+with open('$_virt', 'w') as f: f.write(s)
+print('OK: Phase 7g VRAM kernarg for no-atomics applied')
+"
+
+  # Phase 7g: Replace nontemporalMemcpy with regular memcpy for kernarg
+  # on no-atomics platforms.  NT stores (_mm_stream_si128) may produce
+  # torn writes visible to the GPU on PCIe 2.0 (Westmere):
+  # - 128-bit NT store may split into two 64-bit PCIe TLPs
+  # - WC buffer flushes cache lines in arbitrary order
+  # - VRAM BAR is WC-mapped, making NT store ordering unreliable
+  # Regular memcpy uses MOV instructions which are strongly ordered on x86.
+  python3 -c "
+with open('$_virt') as f: s = f.read()
+s = s.replace(
+    'nontemporalMemcpy(argBuffer, parameters, argSize);',
+    '''// Phase 7g: Use regular memcpy for kernarg on no-atomics.
+    // NT stores may produce torn writes on PCIe 2.0.
+    if (!roc_device_.info().pcie_atomics_) {
+      memcpy(argBuffer, parameters, argSize);
+      _mm_sfence();
+    } else {
+      nontemporalMemcpy(argBuffer, parameters, argSize);
+    }''',
+    1)
+with open('$_virt', 'w') as f: f.write(s)
+print('OK: Phase 7g regular memcpy for kernarg applied')
+"
+
   # Phase 7b+7e: UC all host allocations on non-coherent platforms.
-  # CPU WB-cached writes may not reach DRAM before GPU reads via PCIe.
-  # Applies to staging buffers AND kernarg (user kernel arguments).
+  # CPU WB-cached writes are NOT reliably visible to GPU on Westmere
+  # (PCIe 2.0, no cache-to-cache snoop). UC ensures data reaches DRAM
+  # before GPU reads. Applies to staging buffers and other host allocs
+  # (kernarg pool now uses VRAM instead — see Phase 7g above).
   local _dev=rocclr/device/rocm/rocdevice.cpp
   sed -i '/^void\* Device::hostAlloc/,/^}$/{
     /uint32_t memFlags = 0;/a\
