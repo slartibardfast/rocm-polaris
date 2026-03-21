@@ -1957,13 +1957,188 @@ rotated.  The chunk contains zeros (never initialized).  The CPU writes
 correct data.  But the AQL packet's `kernarg_address` was set BEFORE
 the write completed (PCIe BAR write latency vs AQL packet submission).
 
-**Next steps:**
-1. Add stderr logging to `allocKernArg`: address, offset, pool state
-2. Add logging to `resetKernArgPool`: when and where reset happens
-3. Check if hipMemcpy/hipMemset between allocKernArg and dispatchAqlPacket
-   triggers a reset
-4. Instrument `submitKernelInternal` to print kernarg_address in AQL packet
-5. Compare: does kernarg_address match what allocKernArg returned?
+**Instrumentation results (completed):** Addresses are always correct.
+Pool lifecycle is not the bug. CPU writes correct data to correct address.
+GPU reads zeros from that address. This is a GPU L2 stale cache read.
+
+**Root cause confirmed (2026-03-21):** GPU L2 retains stale cache lines
+from previous dispatches at the same kernarg pool address. CPU writes to
+system memory (UC) update DRAM, but do NOT invalidate GPU L2 on Westmere
+PCIe 2.0 (no PCIe coherency extensions). The kernarg pool resets to
+offset 0 on every `releaseGpuMemoryFence`, so every dispatch reuses the
+same address → same L2 set → stale read.
+
+**Evidence:**
+- Offset between expected and got is ALWAYS a multiple of 256 iterations
+  (= 128KB of L2 working set, exactly 1/4 of the 512KB L2, matching
+  4-way set-associative aliasing stride)
+- Increasing ring buffer to 8MB (max HW) doesn't help (ring doesn't wrap)
+- Retry without hipMalloc/hipMemcpy trigger sometimes works (L2 eviction
+  is probabilistic)
+- hipMemcpy to the OUTPUT buffer (GPU-side blit write) before kernel
+  dispatch nearly eliminates failures (GPU write updates L2)
+- gfx803 has NO fine-grain GPU memory pool (only coarse-grain VRAM);
+  fine-grain system pools on CPU agents are identical to coarse-grain
+  on gfx8 (both SNOOPED=1 in PTE, no MTYPE field)
+
+### Phase 7h: HDP flush for gfx8 no-atomics
+
+#### Problem
+
+CPU writes to system memory (kernarg pool, AQL ring buffer) are invisible
+to the GPU L2 cache on Westmere PCIe 2.0. The GPU reads stale L2 entries
+from previous dispatches at the same address. This causes intermittent
+kernel argument corruption (~30% failure rate under sustained dispatch).
+
+All software-level mitigations failed (10 hypotheses eliminated) because
+the root cause is a HARDWARE coherency gap: PCIe 2.0 has no snoop
+protocol for CPU→GPU L2 invalidation. The fix must use GPU hardware
+mechanisms to invalidate L2.
+
+#### Solution: HDP (Host Data Path) flush register
+
+AMD GPUs have an HDP flush register (`HDP_MEM_COHERENCY_FLUSH_CNTL`)
+that flushes the Host Data Path buffers, ensuring CPU writes to system
+memory are visible to the GPU. Writing 1 to this register:
+1. Flushes any pending HDP write-combining buffers
+2. Invalidates GPU L2 cache lines for system memory
+3. Ensures subsequent GPU reads fetch from DRAM (not stale L2)
+
+On gfx9+ (NBIO v7+), this register is exposed to userspace via KFD's
+MMIO_REMAP topology. On gfx8 (BIF v5), the register EXISTS in hardware
+(`mmREMAP_HDP_MEM_FLUSH_CNTL = 0x1426` in BIF 5.1) but is NOT exposed
+by the kernel driver. The fix has three parts:
+
+#### Part 1: Kernel — expose HDP flush MMIO remap for gfx8
+
+**File:** `kernel/PKGBUILD` (python injection targeting `vi.c` or
+`amdgpu_device.c`)
+
+Add `rmmio_remap` initialization for VI (Volcanic Islands / gfx8):
+
+```c
+// In vi_common_early_init() or equivalent:
+adev->rmmio_remap.reg_offset = mmREMAP_HDP_MEM_FLUSH_CNTL * 4;
+adev->rmmio_remap.bus_addr = adev->rmmio_base + mmREMAP_HDP_MEM_FLUSH_CNTL * 4;
+```
+
+This makes KFD expose the HDP flush register as a `HSA_HEAPTYPE_MMIO_REMAP`
+topology node. ROCR's `GpuAgent` reads this and populates
+`HDP_flush_.HDP_MEM_FLUSH_CNTL` with a userspace-accessible pointer.
+
+**Verification:**
+- After kernel install + kexec:
+  `cat /sys/devices/virtual/kfd/kfd/topology/nodes/2/mem_banks/*/properties`
+  should show `heap_type 3` (MMIO_REMAP) in addition to `heap_type 2`
+- ROCR should report non-null HDP flush pointer
+
+#### Part 2: CLR — use HDP flush after kernarg writes on no-atomics
+
+**File:** `hip-runtime-amd/PKGBUILD` (python injection targeting
+`rocvirtual.cpp`)
+
+In `submitKernelInternal()`, after `nontemporalMemcpy(argBuffer, ...)`:
+
+```cpp
+if (!roc_device_.info().pcie_atomics_ && roc_device_.info().hdpMemFlushCntl) {
+    *roc_device_.info().hdpMemFlushCntl = 1u;
+}
+```
+
+This single MMIO write (~500ns) ensures the kernarg data written by
+the CPU is visible to the GPU before the kernel dispatch reads it.
+
+Also add HDP flush in:
+- `releaseGpuMemoryFence()` before `ResetQueueStates()` — ensures all
+  preceding CPU writes (kernarg, staging) are visible before pool reset
+- `ManagedBuffer::Acquire()` chunk rotation — ensures chunk data is
+  visible before GPU reads from the recycled chunk
+
+#### Part 3: ROCR — use HDP flush for AQL ring buffer writes
+
+**File:** `hsa-rocr/PKGBUILD` (sed injection targeting
+`amd_aql_queue.cpp`)
+
+In `StoreRelaxed()` (the doorbell write path), after writing the AQL
+packet to the ring buffer and before ringing the doorbell:
+
+```cpp
+if (no_atomics_ && agent_->HDP_flush_.HDP_MEM_FLUSH_CNTL) {
+    *agent_->HDP_flush_.HDP_MEM_FLUSH_CNTL = 1u;
+}
+```
+
+This ensures the AQL packet data is visible to the CP before the doorbell
+wakes it. Without this, the CP might read a stale AQL packet from L2
+(though the ring buffer aliasing is less frequent than kernarg due to
+larger ring size).
+
+#### Part 4: Cleanup — remove workarounds made obsolete by HDP flush
+
+With HDP flush providing proper CPU→GPU coherency, we can remove:
+- Phase 7g double-drain barriers in `releaseGpuMemoryFence` (no longer
+  needed — HDP flush ensures visibility)
+- Phase 7g fine-grain kernarg pool change (ineffective on gfx8 — no
+  fine-grain GPU pool)
+- Phase 7g regular memcpy for kernarg (NT stores are fine with HDP flush)
+- Phase 7g kernarg lifecycle instrumentation (debug logging)
+- UC flag on hostAlloc may become optional (HDP flush handles coherency)
+
+Keep:
+- Phase 8 barrier dep-clearing (still needed — CP idle stall is separate)
+- UC flag on hostAlloc (defense-in-depth — UC + HDP flush = belt and
+  suspenders)
+- ROCR Phase 7b UC signals and ring buffer (same defense-in-depth)
+
+#### Build order
+
+1. Kernel: add HDP MMIO remap → build → install → kexec
+2. Verify: `cat /sys/.../mem_banks/*/properties` shows heap_type 3
+3. ROCR: add HDP flush to ring buffer write → build → install
+4. Verify: ROCR debug log shows non-null HDP flush pointer
+5. HIP: add HDP flush after kernarg write → build → install
+6. Verify: `test_kernarg_vram` 5/5 PASS on 10 consecutive runs
+
+#### Verification plan
+
+**Tier 1: HDP flush register accessible**
+- KFD topology shows MMIO_REMAP node
+- `check_hdp` test program gets non-null pointer
+- Writing 1 to HDP flush doesn't crash
+
+**Tier 2: Kernarg corruption eliminated**
+- `test_kernarg_vram` 5/5 PASS on 10 consecutive runs (was 0-2/5)
+- `test_kernarg_stability` 9/9 PASS on 10 consecutive runs
+- `trace_aql` retry test: 0 failures on 10 runs
+
+**Tier 3: Regression — existing tests still pass**
+- `test_h2d_kernel` 17/17
+- `hip_barrier_test` 15/15
+- `hip_inference_test` 9/9
+
+**Tier 4: Integration**
+- `llama-completion --simple-io --log-disable --no-display-prompt
+  -m models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf -ngl 1 -p "2+2=" -n 8`
+  produces tokens without hang or fault
+
+**Tier 5: Cross-process + dmesg**
+- `run_acceptance.sh 10` — all tiers pass, zero dmesg faults
+
+#### Risk assessment
+
+**Probability of fix: 90%.** The HDP flush is the AMD-designed mechanism
+for CPU→GPU memory visibility. It exists in gfx8 hardware. The only risk
+is that the BIF 5.1 `mmREMAP_HDP_MEM_FLUSH_CNTL` register behaves
+differently than the NBIO v7+ equivalent (different register semantics
+or address space).
+
+**Fallback if HDP flush doesn't work:** Direct MMIO write to the HDP
+flush register from kernel space (via a custom KFD ioctl or debugfs
+interface), bypassing the userspace MMIO mapping.
+
+**Performance impact:** One MMIO write (~500ns) per kernel dispatch.
+For llama.cpp inference with ~100 kernel dispatches per token at ~10ms
+per token, the overhead is ~50μs per token = ~0.5% overhead. Negligible.
 
 ### Phase 8: CPU-managed barriers for no-atomics platforms
 
