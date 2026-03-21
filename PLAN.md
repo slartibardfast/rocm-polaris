@@ -1624,44 +1624,114 @@ The `HSA_AMD_MEMORY_POOL_UNCACHED_FLAG` sets the CPU mapping to UC via `set_memo
 
 **Phase 7f (ACQUIRE_MEM hack): REMOVED.** The PM4 TC_WB_ACTION_ENA is a hardware operation outside the GFX8 ISA memory model. It caused VM faults when ExecutePM4 was called on the blit queue. The kernel SNOOPED fix is the correct solution.
 
-#### Phase 7g: D2H coherency under sustained mixed-size load
+#### Phase 7g: hipMemcpy silently fails after sustained use
 
 **Status: INVESTIGATING**
 
-Phase 7a-f verified D2H correctness for sequential alloc→copy→verify→free
-patterns (1MB-512MB).  Under sustained rapid alloc/free cycling with mixed
-sizes (4KB-4MB, 300+ ops), intermittent data corruption appears.
+**Root cause: hipMemcpy H2D silently fails after ~7000+ GPU operations in a
+single process.  VRAM retains stale fill data; GPU kernels execute on wrong
+input; no HIP error returned.**
 
-**Test:** `hip_barrier_test` test 3.3 — 300 random ops, each: malloc→memset→
-H2D→GPU verify→D2H verify→free.  Fails between op 24 and op 230 depending
-on run.
+#### Evidence chain
 
-**Failure signatures (non-deterministic):**
-- `gpu_bad=0, d2h_bad=1`: GPU has correct data, CPU reads wrong D2H (coherency)
-- `gpu_bad=N, d2h_bad=0`: GPU reads wrong data, D2H matches GPU (H2D or PTE)
-- `gpu_bad=N, d2h_bad=1`: Both wrong (cascading corruption)
+1. `test_mixed_stress` (isolated alloc→H2D→GPU verify→free): **500/500 PASS**
+   on clean boot with 292 VA reuses.  Simple single-buffer pattern works
+   perfectly.
 
-**What's different from Phase 7 testing:**
-- Rapid VA reuse: hipMalloc returns same VA ~60% of the time after hipFree
-- Interleaved diagnostic buffer allocs (d_bad): 3 hipMalloc + 3 hipFree per op
-- Mixed sizes stress TLB and page table update paths differently than sequential
+2. `hip_barrier_test` full suite (15 tests in one process):
+   - Tests 2.1-4.1 all PASS (~7000 kernel dispatches, ~700 alloc/free cycles,
+     multiple stream/event create/destroy)
+   - Test 4.2 FAILS at iter 0: `expected 10, got 0x9A9A9A9A`
+   - Tests 5.1 cascades (same garbage value)
 
-**Not caused by fork test:** KFD already blocks forked children at ioctl level
-(`lead_thread != current->group_leader` → `-EBADF`).  Test 5.2 children cannot
-modify GPU state.  Run degradation between test invocations may be from GPU
-L2/TLB state that persists between processes.
+3. Test 4.2 in isolation (separate process): **PASSES**.  Same test, fresh
+   HIP/CLR state.  Runs correctly every time.
 
-**Hypotheses:**
-1. TLB stale after rapid free→realloc at same VA (heavyweight flush not completing)
-2. GPU L2 dirty lines from previous allocation visible at reused VA
-3. Page table update race: PTE write not committed to VRAM before GPU dispatch
-4. `hipMemset(d_bad, 0, sizeof(int))` and `hipMemcpy` to same staging pool race
+4. Test 4.2 after running tests 2.1-4.1 in the same process: **FAILS**.
+   The prior tests' cumulative HIP/CLR state changes cause the failure.
 
-**Investigation plan:**
-1. Reproduce on clean kexec boot, collect GPU-side byte samples at failure
-2. Check if failure VA matches previous operation's VA (reuse correlation)
-3. Add explicit hipDeviceSynchronize between free and next malloc
-4. Test with TLB flush forced between every op
+#### Failure analysis
+
+The value `0x9A9A9A9A` in test 4.2 is diagnostic:
+- Test does: `hipMemcpy(d_a, h_init, ...)` where h_init = {0, 0, ...}
+- Then runs 10 `add_one` kernels: a→b→a→b... (each adds 1)
+- Expected: d_a[0] = 10
+- Got: d_a[0] = 0x9A9A9A9A
+
+Working backwards: `0x9A9A9A9A = 0x9A9A9A90 + 10`.  The kernels DID execute
+(added 10).  But d_a started at `0x9A9A9A90` instead of 0.  **The hipMemcpy
+H2D wrote zeros to d_a, but the GPU read stale VRAM content** — the H2D copy
+silently failed or wrote to the wrong address.
+
+`0x9A` is a VRAM fill pattern (uninitialized allocation content).  The GPU
+is reading the allocation's original VRAM content, not the H2D-copied data.
+
+#### What degrades after sustained use
+
+The first ~7000 operations work perfectly.  After that, hipMemcpy H2D begins
+silently failing.  Possible degradation mechanisms:
+
+1. **Staging buffer pool exhaustion/corruption** — CLR uses a fixed staging
+   buffer pool for H2D copies.  After thousands of copies, pool management
+   state (free list, active chunk tracking) may become inconsistent.
+
+2. **Bounce buffer signal leak** — ROCR's bounce buffer tracks completion
+   via signals.  If signals are not properly released after ~7000 dispatches,
+   the signal pool exhausts and new copies can't get completion signals.
+
+3. **AQL queue ring buffer wrap race** — after ~7000 dispatches, the ring
+   buffer has wrapped many times.  RPTR/WPTR tracking via the bounce buffer
+   may accumulate small errors that eventually cause the queue to appear full
+   or cause packets to be dropped.
+
+4. **kernarg pool exhaustion** — each kernel dispatch allocates from the
+   kernarg pool.  If the pool fills and recycling barriers (which our Phase 8
+   fix modifies) don't work correctly, subsequent dispatches get wrong
+   kernarg addresses.
+
+5. **CLR command batch overflow** — CLR's VirtualGPU batches commands into
+   a command list.  After thousands of operations, batch bookkeeping may
+   overflow or wrap, causing commands to target wrong buffers.
+
+#### Implications for llama.cpp
+
+This directly explains the llama.cpp inference hang:
+- Model loading does hundreds of hipMemcpy H2D (one per tensor)
+- Each load also involves hipMalloc, hipDeviceSynchronize, barriers
+- After enough operations, subsequent H2D copies silently fail
+- GPU inference kernels read stale/uninitialized VRAM → wrong results
+- If results are NaN/Inf, downstream kernels may produce garbage or hang
+
+#### Test structure finding
+
+Test degradation between runs of `hip_barrier_test` is NOT caused by:
+- Fork test (5.2) — KFD blocks forked children at ioctl level
+  (`process->lead_thread != current->group_leader` → `-EBADF`)
+- GPU hardware corruption — clean kexec boot reproduces same pattern
+- D2H coherency (Phase 7a-f) — the H2D path is failing, not D2H
+
+The ROCR SIGSEGV at offset 0x62c23 in forked children is benign:
+the signal validation reads from a VM_DONTCOPY page (unmapped in child).
+KFD set VM_DONTCOPY on doorbell, event, and reserved memory VMAs.
+
+#### Investigation plan
+
+1. **Binary search for degradation point** — run N operations (varying N),
+   then test H2D correctness.  Find the exact threshold where H2D fails.
+
+2. **Monitor ROCR signal pool** — add logging to signal alloc/free to detect
+   leaks.  Check if `ProcessAllBounceBuffers()` stops processing after
+   sustained use.
+
+3. **Monitor staging buffer state** — log CLR staging pool active chunk,
+   free list, allocation count.  Check if pool recycling breaks.
+
+4. **Monitor AQL queue state** — log RPTR, WPTR, dispatch_id, ring buffer
+   wrap count.  Check for RPTR tracking drift.
+
+5. **Bisect: test with hipDeviceSynchronize after every operation** — if
+   forced serialization fixes the issue, it's a signal/completion race.
+   If it doesn't, it's a resource exhaustion.
 
 ### Phase 8: CPU-managed barriers for no-atomics platforms
 
