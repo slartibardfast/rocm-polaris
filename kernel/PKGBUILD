@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=31
+pkgrel=33
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -227,6 +227,11 @@ static void vi_set_reg_remap(struct amdgpu_device *adev)
 \t\t * REMAP_HDP_MEM_FLUSH_CNTL.ADDRESS = mmHDP_MEM_COHERENCY_FLUSH_CNTL
 \t\t * REMAP_HDP_REG_FLUSH_CNTL.ADDRESS = mmHDP_REG_COHERENCY_FLUSH_CNTL
 \t\t */
+\t\t/* Remap to HDP_MEM/REG_COHERENCY_FLUSH_CNTL for userspace
+\t\t * HDP flush (write-only — BIF remap does not forward reads).
+\t\t * For completion-tracked flush, use the KFD_IOC_HDP_FLUSH ioctl
+\t\t * which does WREG32/RREG32 on GPU_HDP_FLUSH_REQ/DONE directly.
+\t\t */
 \t\tWREG32(mmREMAP_HDP_MEM_FLUSH_CNTL, mmHDP_MEM_COHERENCY_FLUSH_CNTL);
 \t\tWREG32(mmREMAP_HDP_REG_FLUSH_CNTL, mmHDP_REG_COHERENCY_FLUSH_CNTL);
 \t} else {
@@ -272,6 +277,131 @@ print('OK: Phase 7h vi_set_reg_remap applied')
   grep -q 'mmHDP_REG_COHERENCY_FLUSH_CNTL' "$_srcname/drivers/gpu/drm/amd/include/asic_reg/bif/bif_5_1_d.h" && \
     echo "HDP_REG_COHERENCY_FLUSH_CNTL found in bif_5_1_d.h" || \
     echo "WARNING: need to check HDP_REG register name"
+
+  # Phase 7h: KFD ioctl for completion-tracked HDP flush.
+  # BIF remap only forwards WRITES, not READS — can't poll FLUSH_DONE
+  # from userspace.  This ioctl does the REQ/DONE protocol in kernel space.
+  local _kfd=drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+  local _ioctl_h="include/uapi/linux/kfd_ioctl.h"
+  python3 -c "
+import re
+
+# 1. Add ioctl struct and number to kfd_ioctl.h
+with open('$_ioctl_h') as f: h = f.read()
+
+# Add struct before AMDKFD_COMMAND_START
+hdp_struct = '''
+/* Phase 7h: Completion-tracked HDP flush */
+struct kfd_ioctl_hdp_flush_args {
+\t__u32 gpu_id;
+\t__u32 flush_mask;
+\t__u32 queue_id;
+\t__u32 timeout_us;
+\t__u32 actual_us;
+\t__u32 status;
+};
+
+'''
+h = h.replace('#define AMDKFD_COMMAND_START', hdp_struct + '#define AMDKFD_COMMAND_START')
+
+# Add ioctl number and bump COMMAND_END
+h = h.replace(
+    '#define AMDKFD_COMMAND_END\\t\\t0x27',
+    '#define AMDKFD_IOC_HDP_FLUSH\\t\\t\\\\\\n\\tAMDKFD_IOWR(0x27, struct kfd_ioctl_hdp_flush_args)\\n\\n#define AMDKFD_COMMAND_END\\t\\t0x28')
+
+with open('$_ioctl_h', 'w') as f: f.write(h)
+print('OK: kfd_ioctl.h updated')
+
+# 2. Add handler to kfd_chardev.c
+with open('$_kfd') as f: s = f.read()
+
+handler = '''#include \"asic_reg/bif/bif_5_1_d.h\"
+
+/* Phase 7h: Completion-tracked HDP flush for no-atomics platforms. */
+static int kfd_ioctl_hdp_flush(struct file *filp,
+\t\tstruct kfd_process *p, void *data)
+{
+\tstruct kfd_ioctl_hdp_flush_args *args = data;
+\tstruct kfd_process_device *pdd;
+\tstruct amdgpu_device *adev;
+\tuint32_t mask = args->flush_mask;
+\tuint32_t timeout_us = args->timeout_us ? args->timeout_us : 10000;
+\tuint32_t tmp;
+\tktime_t start;
+
+\t/* Find the GPU device */
+\tmutex_lock(&p->mutex);
+\tpdd = kfd_process_device_data_by_id(p, args->gpu_id);
+\tif (!pdd && p->n_pdds > 0)
+\t\tpdd = p->pdds[0]; /* first GPU if gpu_id=0 */
+\tif (!pdd) {
+\t\tmutex_unlock(&p->mutex);
+\t\treturn -EINVAL;
+\t}
+\tadev = pdd->dev->adev;
+\tif (!mask) mask = 0x3FC; /* all compute CPs */
+\tmutex_unlock(&p->mutex);
+
+\t/* REQ/DONE protocol */
+\tstart = ktime_get();
+\tWREG32(mmGPU_HDP_FLUSH_REQ, mask);
+\tdo {
+\t\ttmp = RREG32(mmGPU_HDP_FLUSH_DONE);
+\t\tif ((tmp & mask) == mask) {
+\t\t\targs->status = 0;
+\t\t\targs->actual_us = (uint32_t)ktime_us_delta(ktime_get(), start);
+\t\t\treturn 0;
+\t\t}
+\t\tudelay(1);
+\t} while (ktime_us_delta(ktime_get(), start) < timeout_us);
+
+\targs->status = 1;
+\targs->actual_us = timeout_us;
+\treturn 0;
+}
+
+'''
+
+# Insert before kfd_ioctl_get_version
+old = 'static int kfd_ioctl_get_version(struct file *filep, struct kfd_process *p,'
+assert old in s, 'kfd_ioctl_get_version not found'
+s = s.replace(old, handler + old, 1)
+
+# Add to ioctl table — after the last entry (DBG_TRAP)
+old_table = 'AMDKFD_IOCTL_DEF(AMDKFD_IOC_DBG_TRAP,\\n\\t\\t\\tkfd_ioctl_set_debug_trap, 0),'
+new_table = old_table + '\\n\\tAMDKFD_IOCTL_DEF(AMDKFD_IOC_HDP_FLUSH,\\n\\t\\t\\tkfd_ioctl_hdp_flush, 0),'
+s = s.replace(old_table, new_table, 1)
+
+# bif_5_1_d.h included directly in the handler function above
+
+with open('$_kfd', 'w') as f: f.write(s)
+print('OK: kfd_chardev.c ioctl handler + table entry added')
+"
+
+  # Also upgrade vi_flush_hdp to use REQ/DONE for kernel-side flushes
+  python3 -c "
+with open('$_vi') as f: s = f.read()
+old = 'static void vi_flush_hdp(struct amdgpu_device *adev, struct amdgpu_ring *ring)\\n{\\n\\tif (!ring || !ring->funcs->emit_wreg) {\\n\\t\\tWREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);\\n\\t\\tRREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);'
+new = '''static void vi_flush_hdp(struct amdgpu_device *adev, struct amdgpu_ring *ring)
+{
+\\tif (!ring || !ring->funcs->emit_wreg) {
+\\t\\t/* Phase 7h: REQ/DONE completion-tracked flush */
+\\t\\tuint32_t tmp;
+\\t\\tint timeout = 10000;
+\\t\\tWREG32(mmGPU_HDP_FLUSH_REQ, 0xFFF);
+\\t\\tdo {
+\\t\\t\\ttmp = RREG32(mmGPU_HDP_FLUSH_DONE);
+\\t\\t\\tif ((tmp & 0xFFF) == 0xFFF)
+\\t\\t\\t\\tbreak;
+\\t\\t\\tudelay(1);
+\\t\\t} while (--timeout > 0);'''
+if old in s:
+    s = s.replace(old, new, 1)
+    print('OK: vi_flush_hdp upgraded to REQ/DONE (10ms timeout)')
+else:
+    print('WARNING: vi_flush_hdp pattern not found')
+with open('$_vi', 'w') as f: f.write(s)
+"
 
   echo "Setting config..."
   cp ../config .config

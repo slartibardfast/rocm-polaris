@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=22
+pkgrel=24
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -121,19 +121,12 @@ s = s.replace(
                                       uint32_t sharedMemBytes, amd::NDRangeKernelCommand* vcmd,
                                       hsa_kernel_dispatch_packet_t* aql_packet,
                                       bool attach_signal) {
-  // Phase 7h: L2 invalidation + HDP flush before kernel dispatch.
-  // GPU L2 retains stale system memory data (kernarg, ring buffer).
-  // Use InvalidateCodeCaches(nullptr, 0) on the ROCR agent — this
-  // submits PM4 ACQUIRE_MEM to the utility queue with full L2 invalidation.
-  // CLR accesses it via hsa_amd_profiling_async_copy_enable (reuses
-  // the agent handle already available via getBackendDevice).
+  // Phase 7h: Completion-tracked HDP flush before kernel dispatch.
+  // Calls thunk's hsaKmtHdpFlush which uses the existing KFD fd.
+  // The thunk function is declared in our injected header and linked
+  // via libhsakmt (already a dependency of CLR via ROCR).
   if (!roc_device_.info().pcie_atomics_) {
-    // HDP flush for write buffer drain
-    if (roc_device_.info().hdpMemFlushCntl) {
-      *roc_device_.info().hdpMemFlushCntl = 1u;
-      volatile uint32_t dummy = *roc_device_.info().hdpMemFlushCntl;
-      (void)dummy;
-    }
+    roc_device_.HdpFlushWait();
   }
   device::Kernel* devKernel''',
     1)
@@ -258,6 +251,42 @@ s = s.replace(
     1)
 with open('$_virt', 'w') as f: f.write(s)
 print('OK: Phase 7h HDP flush after kernarg write applied')
+"
+
+  # Phase 7h: Add HdpFlushWait to roc::Device
+  # Calls thunk hsaKmtHdpFlush (linked via libhsakmt, ROCR dependency).
+  # Passes device node ID and 0 for mask (kernel derives CP bits from queue).
+  local _dev_h=rocclr/device/rocm/rocdevice.hpp
+  local _dev_cpp=rocclr/device/rocm/rocdevice.cpp
+  sed -i '/hsa_agent_t getBackendDevice/a\
+  void HdpFlushWait() const;' "$_dev_h"
+
+  # Inject HdpFlushWait into rocdevice.cpp using python (proper namespace)
+  python3 -c "
+with open('$_dev_cpp') as f: s = f.read()
+# Add include at top
+if '#include <hsakmt/hsakmt.h>' not in s:
+    s = s.replace('#include \"device/rocm/rocdevice.hpp\"',
+                  '#include \"device/rocm/rocdevice.hpp\"\n#include <hsakmt/hsakmt.h>', 1)
+# Add method before the last closing brace of the roc namespace
+# Find last '} // namespace roc' or just append before the final '}'
+import re
+# Insert before the very last function in the file
+old = 'void Device::memFree('
+new = '''/* Phase 7h: Completion-tracked HDP flush via KFD ioctl. */
+void Device::HdpFlushWait() const {
+    if (info().pcie_atomics_) return;
+    HSAuint32 actual_us = 0;
+    hsaKmtHdpFlush(0, 0, 0, 10000, &actual_us);
+}
+
+void Device::memFree('''
+if old in s:
+    s = s.replace(old, new, 1)
+    print('OK: Device::HdpFlushWait injected into rocdevice.cpp')
+else:
+    print('WARNING: memFree pattern not found')
+with open('$_dev_cpp', 'w') as f: f.write(s)
 "
 
   # Phase 7b+7e: UC all host allocations on non-coherent platforms.
