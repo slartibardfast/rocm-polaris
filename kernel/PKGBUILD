@@ -476,13 +476,11 @@ with open('$_mqd_vi') as f: s = f.read()
 old = '\tm = get_mqd(mqd);\n\n\tm->cp_hqd_pq_control ='
 new = '''\tm = get_mqd(mqd);
 
-\t/* Phase 7h: L2 bypass for system memory on no-atomics platforms.
-\t * DISPATCH_CACHE_CNTL=1: miss/evict L1, bypass L2.
-\t * Only set when atc_bit=0 (no PCIe atomics).
+\t/* Phase 7h: DISPATCH_CACHE_CNTL REVERTED.
+\t * L2 bypass causes blit kernel to read STALE VRAM data — compute
+\t * kernel writes are in L2, not yet flushed to VRAM MC.  Bypassing
+\t * L2 makes blit read old data from MC, corrupting D2H copies.
 \t */
-\tif (!atc_bit)
-\t\tm->compute_dispatch_initiator =
-\t\t\t1 << COMPUTE_DISPATCH_INITIATOR__DISPATCH_CACHE_CNTL__SHIFT;
 
 \tm->cp_hqd_pq_control ='''
 assert old in s, '__update_mqd get_mqd+cp_hqd_pq_control pattern not found'
