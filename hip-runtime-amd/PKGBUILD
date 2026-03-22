@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=27
+pkgrel=28
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -106,6 +106,33 @@ assert old in s, 'dispatchBarrierPacket pattern not found'
 s = s.replace(old, new, 1)
 with open('$_virt', 'w') as f: f.write(s)
 print('OK: Phase 8 barrier CPU-wait applied')
+"
+
+  # Phase 7h-debug: Dump all GPU DMA target addresses on first dispatch.
+  # Check for overlap with AQL ring buffer address range.
+  python3 -c "
+with open('$_virt') as f: s = f.read()
+s = s.replace(
+    'Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);',
+    '''// Phase 7h-debug: dump address map on first dispatch
+  {
+    static bool dumped = false;
+    if (!dumped && !roc_device_.info().pcie_atomics_) {
+      dumped = true;
+      uintptr_t ring_base = (uintptr_t)gpu_queue_->base_address;
+      uintptr_t ring_end = ring_base + gpu_queue_->size * 64;
+      fprintf(stderr, \"[ADDR-MAP] AQL ring:     [0x%lx - 0x%lx) (%u slots)\\\\n\",
+              ring_base, ring_end, gpu_queue_->size);
+      // Access kernarg pool via allocKernArg to get current pointer
+      fprintf(stderr, \"[ADDR-MAP] queue_id:     %u\\\\n\", gpu_queue_->id);
+      fprintf(stderr, \"[ADDR-MAP] doorbell:     0x%lx\\\\n\",
+              (uintptr_t)gpu_queue_->doorbell_signal.handle);
+    }
+  }
+  Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);''',
+    2)
+with open('$_virt', 'w') as f: f.write(s)
+print('OK: Phase 7h-debug address map dump added')
 "
 
   # Phase 7h: HDP flush at entry to submitKernelInternal.
@@ -208,6 +235,36 @@ s = s.replace(
     1)
 with open('$_virt', 'w') as f: f.write(s)
 print('OK: Phase 7h-fix ResetPool neutered for no-atomics')
+"
+
+  # Phase 7h-debug: Verify AQL packet in ring buffer before doorbell.
+  # Read back the AQL packet from the ring AFTER struct copy + header write,
+  # BEFORE doorbell. If kernarg_address is wrong here, CLR wrote it wrong.
+  # If it's correct here but the kernel sees NULL, the corruption is post-write.
+  python3 -c "
+with open('$_virt') as f: s = f.read()
+s = s.replace(
+    'Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);',
+    '''// Phase 7h-debug: verify AQL packet before doorbell
+  if (!roc_device_.info().pcie_atomics_) {
+    auto* dbg_pkt = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(
+        reinterpret_cast<char*>(gpu_queue_->base_address) + (index & (gpu_queue_->size - 1)) * 64);
+    volatile uint64_t dbg_ka = reinterpret_cast<volatile uint64_t*>(dbg_pkt)[5]; // offset 40 = kernarg_address
+    volatile uint16_t dbg_hdr = reinterpret_cast<volatile uint16_t*>(dbg_pkt)[0]; // offset 0 = header
+    if (dbg_ka == 0 && (dbg_hdr & 0xFF) != 0) {
+      static int dbg_count = 0;
+      if (++dbg_count <= 20)
+        fprintf(stderr, \"[AQL-BUG] slot=%lu hdr=0x%x kernarg_addr=0x%lx (NULL!) signal=0x%lx\\\\n\",
+                (unsigned long)(index & (gpu_queue_->size - 1)),
+                (unsigned)dbg_hdr,
+                (unsigned long)dbg_ka,
+                (unsigned long)reinterpret_cast<volatile uint64_t*>(dbg_pkt)[7]);
+    }
+  }
+  Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);''',
+    1)
+with open('$_virt', 'w') as f: f.write(s)
+print('OK: Phase 7h-debug AQL packet verification added')
 "
 
   # Phase 7h: Regular memcpy for kernarg on no-atomics platforms.

@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=23
+pkgrel=24
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -384,6 +384,7 @@ print('OK: hsa_amd_hdp_flush_wait C wrapper added to table interface')
   local _def=runtime/hsa-runtime/hsacore.so.def
   sed -i '/^local:/i\	hsa_amd_hdp_flush_wait;' "$_def"
 
+
   # --- Phase 7h Layer 5: StoreRelaxed HDP flush before doorbell ---
   # On no-atomics platforms, flush HDP before writing the doorbell so
   # the GPU sees fresh kernarg/ring data.  Recursion guard prevents
@@ -406,14 +407,26 @@ new = '''void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
   // pending DRAM writes for this address range before the doorbell write.
   // Also flush HDP read cache (separate buffer below L2).
   if (no_atomics_) {
-    // Readback: force IOH to commit AQL packet + kernarg DRAM writes.
-    // Read the last dword of the AQL packet we just wrote.
+    // Phase 7h-debug: dump all GPU DMA target addresses on first call
+    { static int d=0; if(d++<5){
+      auto rb = reinterpret_cast<uintptr_t>(amd_queue_.hsa_queue.base_address);
+      auto re = rb + amd_queue_.hsa_queue.size * 64;
+      auto ra = reinterpret_cast<uintptr_t>(rptr_gpu_buf_);
+      auto rp = amd_queue_.read_dispatch_id;
+      auto wp = amd_queue_.write_dispatch_id;
+      fprintf(stderr, \"[ROCR] ring %lx-%lx %u\\\\n\", rb, re, amd_queue_.hsa_queue.size);
+      fprintf(stderr, \"[ROCR] rpt %lx wpoll %lx bounce %lx\\\\n\", rp, wp, ra);
+      if(ra>=rb&&ra<re) fprintf(stderr, \"[ROCR] OVERLAP bounce\\\\n\");
+      if(rp>=rb&&rp<re) fprintf(stderr, \"[ROCR] OVERLAP rpt\\\\n\");
+      if(wp>=rb&&wp<re) fprintf(stderr, \"[ROCR] OVERLAP wpoll\\\\n\");
+    } }
+
+    // Readback + HDP flush
     uint64_t slot = value & (amd_queue_.hsa_queue.size - 1);
     volatile uint32_t* pkt = (volatile uint32_t*)(
         (char*)amd_queue_.hsa_queue.base_address + slot * 64);
-    (void)pkt[15];  // read last dword (byte 60-63) of 64-byte AQL packet
+    (void)pkt[15];
 
-    // HDP flush (recursion-guarded)
     static thread_local bool in_hdp_flush = false;
     if (!in_hdp_flush) {
       in_hdp_flush = true;
