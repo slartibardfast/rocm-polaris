@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=17
+pkgrel=19
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -113,12 +113,126 @@ INJECT
   # 7e-4: PM4 indirect buffer (icache invalidation commands).
   sed -i 's,pm4_ib_size_b_\, 0x1000\, core::MemoryRegion::AllocateExecutable),pm4_ib_size_b_\, 0x1000\, core::MemoryRegion::AllocateExecutable | core::MemoryRegion::AllocateUncached),' "$_aq"
 
-  # Phase 7h: HDP flush accessor for CLR.
+  # Phase 7h: Full-stack HDP flush with hardware completion.
+  #
+  # Layer 1: KFD ioctl (kernel) — WREG32(GPU_HDP_FLUSH_REQ) + poll RREG32(DONE)
+  # Layer 2: Thunk (libhsakmt) — hsaKmtHdpFlush() wrapper
+  # Layer 3: Driver (KfdDriver) — HdpFlush() method
+  # Layer 4: GpuAgent — HdpFlushWait() public API
+  # Layer 5: AqlQueue/CLR — calls before dispatch
+
+  # --- Layer 2: Thunk wrapper ---
+  local _thunk_q=libhsakmt/src/queues.c
+  local _thunk_h=libhsakmt/include/hsakmt/hsakmt.h
+  local _thunk_lib=libhsakmt/src/libhsakmt.h
+
+  # Add ioctl struct definition to thunk (mirrors kernel kfd_ioctl.h)
+  sed -i '/#include "libhsakmt.h"/a\
+\
+\/\* Phase 7h: HDP flush ioctl struct (mirrors kfd_ioctl.h) *\/\
+struct kfd_ioctl_hdp_flush_args {\
+\tuint32_t gpu_id;\
+\tuint32_t flush_mask;\
+\tuint32_t queue_id;\
+\tuint32_t timeout_us;\
+\tuint32_t actual_us;\
+\tuint32_t status;\
+};\
+\
+\/* ioctl number — must match kernel kfd_ioctl.h *\/\
+\#define AMDKFD_IOC_HDP_FLUSH _IOWR('"'"'K'"'"', 0x27, struct kfd_ioctl_hdp_flush_args)' "$_thunk_q"
+
+  # Add hsaKmtHdpFlush implementation at end of queues.c
+  cat >> "$_thunk_q" << 'THUNK_HDP_FLUSH'
+
+/* Phase 7h: Completion-tracked HDP flush via KFD ioctl */
+HSAKMT_STATUS HSAKMTAPI hsaKmtHdpFlush(HSAuint32 NodeId, HSAuint32 QueueId,
+                              HSAuint32 FlushMask, HSAuint32 TimeoutUs,
+                              HSAuint32 *ActualUs)
+{
+    struct kfd_ioctl_hdp_flush_args args = {0};
+    HsaKFDContext *ctx = &hsakmt_primary_kfd_ctx;
+
+    args.gpu_id = NodeId;
+    args.queue_id = QueueId;
+    args.flush_mask = FlushMask;
+    args.timeout_us = TimeoutUs ? TimeoutUs : 10000;
+
+    long err = hsakmt_ioctl(ctx->fd, AMDKFD_IOC_HDP_FLUSH, &args);
+    if (err) return HSAKMT_STATUS_ERROR;
+    if (ActualUs) *ActualUs = args.actual_us;
+    return args.status ? HSAKMT_STATUS_ERROR : HSAKMT_STATUS_SUCCESS;
+}
+THUNK_HDP_FLUSH
+
+  # Add declaration to thunk header (insert before the HSAKMT_STATUS line above hsaKmtAllocQueueGWS)
+  python3 -c "
+with open('$_thunk_h') as f: h = f.read()
+h = h.replace(
+    'HSAKMT_STATUS\nHSAKMTAPI\nhsaKmtAllocQueueGWS(',
+    '''HSAKMT_STATUS
+HSAKMTAPI
+hsaKmtHdpFlush(
+                HSAuint32          NodeId,
+                HSAuint32          QueueId,
+                HSAuint32          FlushMask,
+                HSAuint32          TimeoutUs,
+                HSAuint32          *ActualUs);
+
+HSAKMT_STATUS
+HSAKMTAPI
+hsaKmtAllocQueueGWS(''',
+    1)
+with open('$_thunk_h', 'w') as f: f.write(h)
+print('OK: hsaKmtHdpFlush declaration added to hsakmt.h')
+"
+
+  # --- Layer 3: KfdDriver method ---
+  local _drv_h=runtime/hsa-runtime/core/inc/amd_kfd_driver.h
+  local _drv_cpp=runtime/hsa-runtime/core/runtime/amd_kfd_driver.cpp
+  local _base_drv=runtime/hsa-runtime/core/inc/driver.h
+
+  # Add virtual method to base Driver class
+  sed -i '/virtual.*DestroyQueue/a\
+  virtual hsa_status_t HdpFlush(HSA_QUEUEID queue_id, uint32_t timeout_us) const { return HSA_STATUS_SUCCESS; }' "$_base_drv"
+
+  # Add override to KfdDriver
+  sed -i '/DestroyQueue.*override/a\
+  hsa_status_t HdpFlush(HSA_QUEUEID queue_id, uint32_t timeout_us) const override;' "$_drv_h"
+
+  # Add implementation to KfdDriver
+  cat >> "$_drv_cpp" << 'KFD_HDP_FLUSH'
+
+/* Phase 7h: Completion-tracked HDP flush */
+hsa_status_t KfdDriver::HdpFlush(HSA_QUEUEID queue_id, uint32_t timeout_us) const {
+    HSAKMT_STATUS status = hsaKmtHdpFlush(node_id(), queue_id, 0, timeout_us, nullptr);
+    return (status == HSAKMT_STATUS_SUCCESS) ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR;
+}
+KFD_HDP_FLUSH
+
+  # --- Layer 4: GpuAgent public API ---
   local _agent_h=runtime/hsa-runtime/core/inc/amd_gpu_agent.h
   sed -i '/NoPlatformAtomics/a\
 \
-  \/\/ Phase 7h: public accessor for HDP flush register\
-  __forceinline uint32_t* HdpFlushCntl() const { return HDP_flush_.HDP_MEM_FLUSH_CNTL; }' "$_agent_h"
+  \/\/ Phase 7h: completion-tracked HDP flush via KFD ioctl\
+  void HdpFlushWait(uint32_t timeout_us = 10000) const;' "$_agent_h"
+
+  local _agent_cpp=runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp
+  python3 -c "
+with open('$_agent_cpp') as f: s = f.read()
+old = 'lazy_ptr<core::Blit>& GpuAgent::GetBlitObject'
+new = '''/* Phase 7h: Completion-tracked HDP flush */
+void GpuAgent::HdpFlushWait(uint32_t timeout_us) const {
+  if (!no_platform_atomics_) return;
+  driver().HdpFlush(0, timeout_us);
+}
+
+lazy_ptr<core::Blit>& GpuAgent::GetBlitObject'''
+assert old in s
+s = s.replace(old, new, 1)
+with open('$_agent_cpp', 'w') as f: f.write(s)
+print('OK: GpuAgent::HdpFlushWait added')
+"
 
   # Phase 7f (ACQUIRE_MEM L2 WB hack): REMOVED.
   # Root cause was SNOOPED=0 in GPU PTE, not missing L2 flush.
