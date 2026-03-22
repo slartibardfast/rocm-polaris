@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=22
+pkgrel=23
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -396,11 +396,24 @@ old = 'void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {\n  ScanNewPackets
 new = '''void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
   ScanNewPackets();
 
-  // Phase 7h: HDP flush before doorbell on no-atomics platforms.
-  // Invalidates GPU HDP read cache for system memory.
-  // Thread-local recursion guard prevents infinite loop:
-  //   StoreRelaxed → HdpFlushWait → ioctl → signal → StoreRelaxed
+  // Phase 7h: Drain IOH + flush HDP before doorbell on no-atomics platforms.
+  //
+  // On Westmere (PCIe 2.0), the IOH can deliver the doorbell write (PCIe
+  // MMIO) to the GPU before prior DRAM writes (kernarg, AQL packet) have
+  // committed.  The GPU starts the dispatch and reads partial data.
+  //
+  // Fix: readback from the AQL ring slot to force the IOH to commit ALL
+  // pending DRAM writes for this address range before the doorbell write.
+  // Also flush HDP read cache (separate buffer below L2).
   if (no_atomics_) {
+    // Readback: force IOH to commit AQL packet + kernarg DRAM writes.
+    // Read the last dword of the AQL packet we just wrote.
+    uint64_t slot = value & (amd_queue_.hsa_queue.size - 1);
+    volatile uint32_t* pkt = (volatile uint32_t*)(
+        (char*)amd_queue_.hsa_queue.base_address + slot * 64);
+    (void)pkt[15];  // read last dword (byte 60-63) of 64-byte AQL packet
+
+    // HDP flush (recursion-guarded)
     static thread_local bool in_hdp_flush = false;
     if (!in_hdp_flush) {
       in_hdp_flush = true;
