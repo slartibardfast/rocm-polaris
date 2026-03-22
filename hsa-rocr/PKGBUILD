@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=20
+pkgrel=22
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -152,8 +152,14 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtHdpFlush(HSAuint32 NodeId, HSAuint32 QueueId,
 {
     struct kfd_ioctl_hdp_flush_args args = {0};
     HsaKFDContext *ctx = &hsakmt_primary_kfd_ctx;
+    uint32_t gpu_id;
+    HSAKMT_STATUS r;
 
-    args.gpu_id = NodeId;
+    /* Convert node_id to KFD gpu_id (same pattern as hsaKmtCreateQueue) */
+    r = hsakmt_validate_nodeid(NodeId, &gpu_id);
+    if (r != HSAKMT_STATUS_SUCCESS) return r;
+
+    args.gpu_id = gpu_id;
     args.queue_id = QueueId;
     args.flush_mask = FlushMask;
     args.timeout_us = TimeoutUs ? TimeoutUs : 10000;
@@ -194,11 +200,11 @@ print('OK: hsaKmtHdpFlush declaration added to hsakmt.h')
 
   # Add virtual method to base Driver class
   sed -i '/virtual.*DestroyQueue/a\
-  virtual hsa_status_t HdpFlush(HSA_QUEUEID queue_id, uint32_t timeout_us) const { return HSA_STATUS_SUCCESS; }' "$_base_drv"
+  virtual hsa_status_t HdpFlush(uint32_t node_id, uint32_t timeout_us) const { return HSA_STATUS_SUCCESS; }' "$_base_drv"
 
   # Add override to KfdDriver
   sed -i '/DestroyQueue.*override/a\
-  hsa_status_t HdpFlush(HSA_QUEUEID queue_id, uint32_t timeout_us) const override;' "$_drv_h"
+  hsa_status_t HdpFlush(uint32_t node_id, uint32_t timeout_us) const override;' "$_drv_h"
 
   # Add implementation to KfdDriver (inside namespace, using python)
   python3 -c "
@@ -209,8 +215,8 @@ import re
 for marker in ['hsa_status_t KfdDriver::QueryKernelModeDriver', 'hsa_status_t KfdDriver::GetSystemProperties']:
     if marker in s:
         s = s.replace(marker, '''/* Phase 7h: Completion-tracked HDP flush */
-hsa_status_t KfdDriver::HdpFlush(HSA_QUEUEID queue_id, uint32_t timeout_us) const {
-    HSAKMT_STATUS status = hsaKmtHdpFlush(0, queue_id, 0, timeout_us, nullptr);
+hsa_status_t KfdDriver::HdpFlush(uint32_t node_id, uint32_t timeout_us) const {
+    HSAKMT_STATUS status = hsaKmtHdpFlush(node_id, 0, 0, timeout_us, nullptr);
     return (status == HSAKMT_STATUS_SUCCESS) ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR;
 }
 
@@ -234,7 +240,7 @@ old = 'lazy_ptr<core::Blit>& GpuAgent::GetBlitObject'
 new = '''/* Phase 7h: Completion-tracked HDP flush */
 void GpuAgent::HdpFlushWait(uint32_t timeout_us) const {
   if (!no_platform_atomics_) return;
-  driver().HdpFlush(0, timeout_us);
+  driver().HdpFlush(node_id(), timeout_us);
 }
 
 lazy_ptr<core::Blit>& GpuAgent::GetBlitObject'''
@@ -247,6 +253,167 @@ print('OK: GpuAgent::HdpFlushWait added')
   # Phase 7f (ACQUIRE_MEM L2 WB hack): REMOVED.
   # Root cause was SNOOPED=0 in GPU PTE, not missing L2 flush.
   # Fixed in kernel patch 0009 (ttm_uncached + SNOOPED=1).
+
+  # --- Phase 7h Layer 1: HSA public API (hsa_amd_hdp_flush_wait) ---
+  local _ext_h=runtime/hsa-runtime/inc/hsa_ext_amd.h
+  local _ext_cpp=runtime/hsa-runtime/core/runtime/hsa_ext_amd.cpp
+  local _trace_h=runtime/hsa-runtime/inc/hsa_api_trace.h
+  local _trace_cpp=runtime/hsa-runtime/core/runtime/hsa_api_trace.cpp
+  local _impl_h=runtime/hsa-runtime/core/inc/hsa_ext_amd_impl.h
+  local _table_cpp=runtime/hsa-runtime/core/common/hsa_table_interface.cpp
+
+  # 7h-1a: Add declaration to hsa_ext_amd.h (before closing extern "C")
+  python3 -c "
+with open('$_ext_h') as f: s = f.read()
+# Insert before the last '#ifdef __cplusplus' / '}' / '#endif' block
+decl = '''
+/**
+ * @brief Flush the GPU HDP (Host Data Path) cache and wait for completion.
+ *
+ * On platforms without PCIe atomics, CPU writes to system memory may not
+ * be visible to the GPU until the HDP write path is flushed. This function
+ * triggers a hardware-tracked flush (GPU_HDP_FLUSH_REQ/DONE) via KFD.
+ *
+ * @param[in] agent GPU agent to flush. Must be a GPU agent.
+ *
+ * @param[in] timeout_us Timeout in microseconds. 0 uses default (10000).
+ *
+ * @retval ::HSA_STATUS_SUCCESS The flush completed successfully.
+ *
+ * @retval ::HSA_STATUS_ERROR_NOT_INITIALIZED The HSA runtime has not been
+ * initialized.
+ *
+ * @retval ::HSA_STATUS_ERROR_INVALID_AGENT The agent is not a valid GPU agent.
+ */
+hsa_status_t HSA_API hsa_amd_hdp_flush_wait(hsa_agent_t agent,
+                                             uint32_t timeout_us);
+
+'''
+# Find the last occurrence of '#ifdef __cplusplus' that closes extern \"C\"
+import re
+# Insert before the final closing block
+# Insert before the final extern "C" closing block
+marker = '#ifdef __cplusplus\n}  // end extern \"C\" block\n#endif\n\n#endif  // header guard'
+assert marker in s, 'Could not find extern C closing block'
+s = s.replace(marker, decl + marker, 1)
+with open('$_ext_h', 'w') as f: f.write(s)
+print('OK: hsa_amd_hdp_flush_wait declaration added to hsa_ext_amd.h')
+"
+
+  # 7h-1b: Add implementation to hsa_ext_amd.cpp (inside namespace AMD)
+  python3 -c "
+with open('$_ext_cpp') as f: s = f.read()
+impl = '''
+/* Phase 7h: Completion-tracked HDP flush — HSA vendor extension */
+hsa_status_t hsa_amd_hdp_flush_wait(hsa_agent_t agent_handle,
+                                     uint32_t timeout_us) {
+  TRY;
+  IS_OPEN();
+
+  const core::Agent* agent = core::Agent::Convert(agent_handle);
+  IS_VALID(agent);
+
+  if (agent->device_type() != core::Agent::kAmdGpuDevice) {
+    return HSA_STATUS_ERROR_INVALID_AGENT;
+  }
+
+  const AMD::GpuAgent* gpu_agent = static_cast<const AMD::GpuAgent*>(agent);
+  gpu_agent->HdpFlushWait(timeout_us ? timeout_us : 10000);
+  return HSA_STATUS_SUCCESS;
+  CATCH;
+}
+
+'''
+# Insert before closing of namespace amd (inside namespace rocr::AMD)
+marker = '}   //  namespace amd'
+assert marker in s, 'Could not find namespace amd closing brace'
+s = s.replace(marker, impl + marker, 1)
+with open('$_ext_cpp', 'w') as f: f.write(s)
+print('OK: hsa_amd_hdp_flush_wait impl added (namespace AMD)')
+"
+
+  # 7h-1c: Add to impl header (function pointer declaration)
+  python3 -c "
+with open('$_impl_h') as f: s = f.read()
+old = 'hsa_status_t\n    hsa_amd_memory_fill(void* ptr, uint32_t value, size_t count);'
+new = '''hsa_status_t
+    hsa_amd_hdp_flush_wait(hsa_agent_t agent, uint32_t timeout_us);
+
+hsa_status_t
+    hsa_amd_memory_fill(void* ptr, uint32_t value, size_t count);'''
+assert old in s, 'Could not find hsa_amd_memory_fill in impl header'
+s = s.replace(old, new, 1)
+with open('$_impl_h', 'w') as f: f.write(s)
+print('OK: hsa_amd_hdp_flush_wait added to impl header')
+"
+
+  # 7h-1d: Add function pointer to API trace header
+  sed -i '/hsa_amd_memory_fill_fn/i\  decltype(hsa_amd_hdp_flush_wait)* hsa_amd_hdp_flush_wait_fn;' "$_trace_h"
+
+  # 7h-1e: Register in API trace table
+  sed -i '/hsa_amd_memory_fill_fn/i\  amd_ext_api.hsa_amd_hdp_flush_wait_fn = AMD::hsa_amd_hdp_flush_wait;' "$_trace_cpp"
+
+  # 7h-1f: Add C wrapper in table interface
+  python3 -c "
+with open('$_table_cpp') as f: s = f.read()
+wrapper = '''
+// Phase 7h: HDP flush HSA API wrapper
+hsa_status_t HSA_API
+    hsa_amd_hdp_flush_wait(hsa_agent_t agent, uint32_t timeout_us) {
+  return amdExtTable->hsa_amd_hdp_flush_wait_fn(agent, timeout_us);
+}
+
+'''
+# Insert before hsa_amd_memory_fill wrapper
+marker = '// Mirrors Amd Extension Apis'
+if marker not in s:
+    marker = 'hsa_status_t HSA_API\n    hsa_amd_memory_fill'
+assert marker in s, 'Could not find insertion point in table interface'
+s = s.replace(marker, wrapper + marker, 1)
+with open('$_table_cpp', 'w') as f: f.write(s)
+print('OK: hsa_amd_hdp_flush_wait C wrapper added to table interface')
+"
+
+  # 7h-1g: Bump ABI version for new table entry
+  local _ver_h=runtime/hsa-runtime/inc/hsa_api_trace_version.h
+  sed -i 's/HSA_AMD_EXT_API_TABLE_STEP_VERSION          0x08/HSA_AMD_EXT_API_TABLE_STEP_VERSION          0x09/' "$_ver_h"
+  sed -i 's/expected_amd_ext_table_size = 624/expected_amd_ext_table_size = 632/' "$_trace_cpp"
+  sed -i 's/HSA_AMD_INTERFACE_VERSION_MINOR 15/HSA_AMD_INTERFACE_VERSION_MINOR 16/' "$_ext_h"
+
+  # 7h-1c: Add symbol to export list (hsacore.so.def)
+  local _def=runtime/hsa-runtime/hsacore.so.def
+  sed -i '/^local:/i\	hsa_amd_hdp_flush_wait;' "$_def"
+
+  # --- Phase 7h Layer 5: StoreRelaxed HDP flush before doorbell ---
+  # On no-atomics platforms, flush HDP before writing the doorbell so
+  # the GPU sees fresh kernarg/ring data.  Recursion guard prevents
+  # HdpFlushWait → ioctl → signal wait → StoreRelaxed → HdpFlushWait loop.
+  python3 -c "
+with open('$_aq') as f: s = f.read()
+
+# Find StoreRelaxed and inject HDP flush after ScanNewPackets
+old = 'void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {\n  ScanNewPackets();'
+new = '''void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
+  ScanNewPackets();
+
+  // Phase 7h: HDP flush before doorbell on no-atomics platforms.
+  // Invalidates GPU HDP read cache for system memory.
+  // Thread-local recursion guard prevents infinite loop:
+  //   StoreRelaxed → HdpFlushWait → ioctl → signal → StoreRelaxed
+  if (no_atomics_) {
+    static thread_local bool in_hdp_flush = false;
+    if (!in_hdp_flush) {
+      in_hdp_flush = true;
+      agent_->HdpFlushWait(10000);
+      in_hdp_flush = false;
+    }
+  }'''
+
+assert old in s, 'Could not find StoreRelaxed with ScanNewPackets'
+s = s.replace(old, new, 1)
+with open('$_aq', 'w') as f: f.write(s)
+print('OK: StoreRelaxed HDP flush added to amd_aql_queue.cpp')
+"
 }
 
 build() {
