@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=33
+pkgrel=34
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -238,7 +238,9 @@ static void vi_set_reg_remap(struct amdgpu_device *adev)
 \t\tadev->rmmio_remap.reg_offset = mmHDP_MEM_COHERENCY_FLUSH_CNTL << 2;
 \t\tadev->rmmio_remap.bus_addr = 0;
 \t}
+
 }
+
 
 static void vi_flush_hdp(struct amdgpu_device *adev, struct amdgpu_ring *ring)'''
 assert old in s, 'vi_flush_hdp pattern not found'
@@ -401,6 +403,92 @@ if old in s:
 else:
     print('WARNING: vi_flush_hdp pattern not found')
 with open('$_vi', 'w') as f: f.write(s)
+"
+
+  # Phase 7h: Fix GPU L2 stale reads for MTYPE_UC system memory.
+  #
+  # On VI (gfx8), SH_MEM_CONFIG sets DEFAULT_MTYPE=MTYPE_UC for the
+  # SHARED aperture (system memory) on compute queues.  The hardware
+  # default L2 load policy for MTYPE_UC is MISS_LRU (0x0) — GPU L2
+  # caches system memory reads with normal LRU replacement.
+  #
+  # On platforms without PCIe atomics (e.g. Westmere PCIe 2.0), there
+  # is no coherency protocol to invalidate GPU L2 when the CPU writes
+  # new data to system memory.  L2 serves stale data when addresses
+  # are reused (kernarg pool, AQL ring, staging buffers).
+  #
+  # Fix: Set POLICY_3 (MTYPE_UC) to MISS_EVICT (0x1) in
+  # TC_CFG_L2_LOAD_POLICY0.  MISS_EVICT allocates on L2 miss but marks
+  # the line as lowest-priority for eviction — preserves intra-dispatch
+  # L2 caching but ensures lines are evicted between dispatches.
+  #
+  # Scope: only MTYPE_UC data loads (SHARED aperture = system memory).
+  # VRAM uses PTE-based coherency (SNOOPED bit), not SH_MEM_CONFIG MTYPE.
+  # Instruction fetch unaffected (SQC/CP use CP_CPC_IC_BASE_CNTL MTYPE).
+  # TC_CFG_L2_LOAD_POLICY0 is global (unified L2), not per-SE.
+  #
+  # Must be in gfx_v8_0_hw_init AFTER gfx_v8_0_init_golden_registers
+  # (GCA block must be powered up for TC registers to latch).
+  local _gfx8=drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+  python3 -c "
+with open('$_gfx8') as f: s = f.read()
+old = '\tgfx_v8_0_init_golden_registers(adev);\n\tgfx_v8_0_constants_init(adev);'
+new = '''\tgfx_v8_0_init_golden_registers(adev);
+
+\t/* Phase 7h: Fix GPU L2 stale reads for MTYPE_UC system memory.
+\t * Hardware default TC_CFG_L2_LOAD_POLICY0 = 0x0 (MISS_LRU for all MTYPEs).
+\t * Set POLICY_3 (MTYPE_UC, bits [7:6]) to MISS_EVICT (1).
+\t * Only affects system memory reads (SHARED aperture).  VRAM unaffected.
+\t * Blind write — hardware default is 0x0, no need for read-modify-write.
+\t */
+\tWREG32(mmTC_CFG_L2_LOAD_POLICY0, 0x40);
+
+\tgfx_v8_0_constants_init(adev);'''
+assert old in s, 'gfx_v8_0_hw_init golden+constants pattern not found'
+s = s.replace(old, new, 1)
+with open('$_gfx8', 'w') as f: f.write(s)
+print('OK: TC_CFG_L2_LOAD_POLICY0 MISS_EVICT applied in gfx_v8_0_hw_init')
+"
+
+  # gfx_v8_0.c needs gfx_8_0_d.h for mmTC_CFG_L2_LOAD_POLICY0 (already included)
+  grep -q 'gfx_8_0_d.h' "$_srcname/$_gfx8" && \
+    echo "gfx_8_0_d.h already included in gfx_v8_0.c" || \
+    echo "WARNING: gfx_8_0_d.h not included in gfx_v8_0.c"
+
+  # Phase 7h: Set DISPATCH_CACHE_CNTL=1 in MQD for no-atomics compute queues.
+  #
+  # DISPATCH_CACHE_CNTL (bits [9:7] of COMPUTE_DISPATCH_INITIATOR) controls
+  # per-dispatch L1/L2 cache policy.  Value 1 = "miss/evict for L1, bypass
+  # for L2" (GCN3 ISA §MODE register / DISPATCH_CACHE_CTRL).
+  #
+  # For AQL queues, the CP constructs COMPUTE_DISPATCH_INITIATOR from the
+  # AQL packet + MQD template.  Setting DISPATCH_CACHE_CNTL in the MQD
+  # makes every dispatch from that queue bypass L2 for system memory reads.
+  #
+  # Guard: atc_bit=0 (no ATC = no PCIe atomics on dGPU).  Platforms with
+  # atomics don't need this — their coherency protocol handles L2.
+  #
+  # Combined with TC_CFG_L2_LOAD_POLICY0 MISS_EVICT, this provides two
+  # independent defenses against GPU L2 stale reads on no-atomics platforms.
+  local _mqd_vi=drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+  python3 -c "
+with open('$_mqd_vi') as f: s = f.read()
+old = '\tm = get_mqd(mqd);\n\n\tm->cp_hqd_pq_control ='
+new = '''\tm = get_mqd(mqd);
+
+\t/* Phase 7h: L2 bypass for system memory on no-atomics platforms.
+\t * DISPATCH_CACHE_CNTL=1: miss/evict L1, bypass L2.
+\t * Only set when atc_bit=0 (no PCIe atomics).
+\t */
+\tif (!atc_bit)
+\t\tm->compute_dispatch_initiator =
+\t\t\t1 << COMPUTE_DISPATCH_INITIATOR__DISPATCH_CACHE_CNTL__SHIFT;
+
+\tm->cp_hqd_pq_control ='''
+assert old in s, '__update_mqd get_mqd+cp_hqd_pq_control pattern not found'
+s = s.replace(old, new, 1)
+with open('$_mqd_vi', 'w') as f: f.write(s)
+print('OK: DISPATCH_CACHE_CNTL=1 set for no-atomics compute queues')
 "
 
   echo "Setting config..."
