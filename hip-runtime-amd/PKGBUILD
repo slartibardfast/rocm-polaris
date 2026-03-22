@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=26
+pkgrel=27
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -220,10 +220,22 @@ with open('$_virt') as f: s = f.read()
 s = s.replace(
     'nontemporalMemcpy(argBuffer, parameters, argSize);',
     '''// Phase 7h: Regular memcpy for kernarg on no-atomics.
-    // HDP flush happens in dispatchGenericAqlPacket (covers all paths).
+    // Readback forces Westmere IOH to commit the DRAM write before
+    // the CPU proceeds to write the doorbell (PCIe MMIO).  Without
+    // this, the IOH can deliver the doorbell to the GPU before the
+    // kernarg data reaches DRAM, causing partial-byte visibility.
     if (!roc_device_.info().pcie_atomics_) {
       memcpy(argBuffer, parameters, argSize);
       _mm_sfence();
+      // Readback last dword of kernarg to force IOH DRAM write commit.
+      // Reading byte 0 alone may not drain writes to bytes 8-11 (val field).
+      // Read the last aligned dword to ensure the full write has landed.
+      if (argSize >= 4) {
+        size_t last_dword = (argSize - 4) & ~3u;
+        (void)*(volatile uint32_t*)((char*)argBuffer + last_dword);
+      } else {
+        (void)*(volatile char*)argBuffer;
+      }
     } else {
       nontemporalMemcpy(argBuffer, parameters, argSize);
     }''',

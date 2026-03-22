@@ -487,8 +487,26 @@ new = '''\tm = get_mqd(mqd);
 \tm->cp_hqd_pq_control ='''
 assert old in s, '__update_mqd get_mqd+cp_hqd_pq_control pattern not found'
 s = s.replace(old, new, 1)
+## Also set CP PQ CACHE_POLICY=1 (MISS_EVICT) for no-atomics platforms.
+## CP_HQD_PQ_CONTROL__CACHE_POLICY controls the CP's own cache policy
+## for reading AQL packets from the ring buffer.  Default is 0 (MISS_LRU)
+## which lets the CP cache ring slot data and serve stale packets when
+## slots are reused.  MISS_EVICT marks fetched packets for immediate
+## eviction from the CP's internal buffer.
+##
+## This is the CP-side equivalent of TC_CFG_L2_LOAD_POLICY for shader L2.
+## Without this, the CP reads stale AQL packets (kernarg_address=0) when
+## ring slots wrap.
+if '!atc_bit' not in s:
+    ## Pattern already applied by compute_dispatch_initiator injection above
+    pass
+pq_old = 'CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK;'
+pq_new = 'CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK;\n\tif (!atc_bit)\n\t\tm->cp_hqd_pq_control |= 1 << CP_HQD_PQ_CONTROL__CACHE_POLICY__SHIFT;'
+assert pq_old in s, 'CP_HQD_PQ_CONTROL UNORD_DISPATCH pattern not found'
+s = s.replace(pq_old, pq_new, 1)
+
 with open('$_mqd_vi', 'w') as f: f.write(s)
-print('OK: DISPATCH_CACHE_CNTL=1 set for no-atomics compute queues')
+print('OK: DISPATCH_CACHE_CNTL=1 + PQ CACHE_POLICY=1 set for no-atomics')
 "
 
   echo "Setting config..."
