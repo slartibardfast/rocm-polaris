@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=19
+pkgrel=20
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -189,7 +189,7 @@ print('OK: hsaKmtHdpFlush declaration added to hsakmt.h')
 
   # --- Layer 3: KfdDriver method ---
   local _drv_h=runtime/hsa-runtime/core/inc/amd_kfd_driver.h
-  local _drv_cpp=runtime/hsa-runtime/core/runtime/amd_kfd_driver.cpp
+  local _drv_cpp=runtime/hsa-runtime/core/driver/kfd/amd_kfd_driver.cpp
   local _base_drv=runtime/hsa-runtime/core/inc/driver.h
 
   # Add virtual method to base Driver class
@@ -200,15 +200,25 @@ print('OK: hsaKmtHdpFlush declaration added to hsakmt.h')
   sed -i '/DestroyQueue.*override/a\
   hsa_status_t HdpFlush(HSA_QUEUEID queue_id, uint32_t timeout_us) const override;' "$_drv_h"
 
-  # Add implementation to KfdDriver
-  cat >> "$_drv_cpp" << 'KFD_HDP_FLUSH'
-
-/* Phase 7h: Completion-tracked HDP flush */
+  # Add implementation to KfdDriver (inside namespace, using python)
+  python3 -c "
+with open('$_drv_cpp') as f: s = f.read()
+# Insert before the last function in the file (inside namespace)
+import re
+# Find a late function to insert before
+for marker in ['hsa_status_t KfdDriver::QueryKernelModeDriver', 'hsa_status_t KfdDriver::GetSystemProperties']:
+    if marker in s:
+        s = s.replace(marker, '''/* Phase 7h: Completion-tracked HDP flush */
 hsa_status_t KfdDriver::HdpFlush(HSA_QUEUEID queue_id, uint32_t timeout_us) const {
-    HSAKMT_STATUS status = hsaKmtHdpFlush(node_id(), queue_id, 0, timeout_us, nullptr);
+    HSAKMT_STATUS status = hsaKmtHdpFlush(0, queue_id, 0, timeout_us, nullptr);
     return (status == HSAKMT_STATUS_SUCCESS) ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR;
 }
-KFD_HDP_FLUSH
+
+''' + marker, 1)
+        break
+with open('$_drv_cpp', 'w') as f: f.write(s)
+print('OK: KfdDriver::HdpFlush injected')
+"
 
   # --- Layer 4: GpuAgent public API ---
   local _agent_h=runtime/hsa-runtime/core/inc/amd_gpu_agent.h

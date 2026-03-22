@@ -261,32 +261,47 @@ print('OK: Phase 7h HDP flush after kernarg write applied')
   sed -i '/hsa_agent_t getBackendDevice/a\
   void HdpFlushWait() const;' "$_dev_h"
 
-  # Inject HdpFlushWait into rocdevice.cpp using python (proper namespace)
+  # Inject HdpFlushWait into rocdevice.cpp using python.
+  # Uses direct ioctl to /dev/kfd — thunk is statically linked with
+  # hidden visibility, so we can't call hsaKmtHdpFlush from CLR.
+  # KFD reuses the existing kfd_process for this mm_struct (same process).
   python3 -c "
 with open('$_dev_cpp') as f: s = f.read()
-# Add include at top
-if '#include <hsakmt/hsakmt.h>' not in s:
-    s = s.replace('#include \"device/rocm/rocdevice.hpp\"',
-                  '#include \"device/rocm/rocdevice.hpp\"\n#include <hsakmt/hsakmt.h>', 1)
-# Add method before the last closing brace of the roc namespace
-# Find last '} // namespace roc' or just append before the final '}'
-import re
-# Insert before the very last function in the file
-old = 'void Device::memFree('
-new = '''/* Phase 7h: Completion-tracked HDP flush via KFD ioctl. */
+# Add includes at top of file
+for inc in ['<sys/ioctl.h>', '<fcntl.h>']:
+    if inc not in s:
+        s = '#include ' + inc + '\\n' + s
+# Insert function before a known roc::Device method (inside namespace)
+marker = 'void Device::memFree('
+if marker not in s:
+    # Try alternate markers
+    for alt in ['void* Device::hostAlloc(', 'bool Device::create(']:
+        if alt in s:
+            marker = alt
+            break
+func = '''/* Phase 7h: Completion-tracked HDP flush via KFD ioctl.
+ * Direct ioctl to /dev/kfd — thunk symbols not exported (static link).
+ * KFD reuses existing kfd_process for this mm (same process as ROCR).
+ */
+struct kfd_hdp_flush_args_ {
+    uint32_t gpu_id, flush_mask, queue_id, timeout_us, actual_us, status;
+};
+
 void Device::HdpFlushWait() const {
     if (info().pcie_atomics_) return;
-    HSAuint32 actual_us = 0;
-    hsaKmtHdpFlush(0, 0, 0, 10000, &actual_us);
+    static int kfd_fd_ = -1;
+    if (kfd_fd_ < 0) kfd_fd_ = ::open(\"/dev/kfd\", O_RDWR | O_CLOEXEC);
+    if (kfd_fd_ < 0) return;
+    struct kfd_hdp_flush_args_ args = {};
+    args.flush_mask = 0x3FC;  /* all compute CPs */
+    args.timeout_us = 10000;  /* 10ms */
+    ::ioctl(kfd_fd_, _IOWR('K', 0x27, struct kfd_hdp_flush_args_), &args);
 }
 
-void Device::memFree('''
-if old in s:
-    s = s.replace(old, new, 1)
-    print('OK: Device::HdpFlushWait injected into rocdevice.cpp')
-else:
-    print('WARNING: memFree pattern not found')
+'''
+s = s.replace(marker, func + marker, 1)
 with open('$_dev_cpp', 'w') as f: f.write(s)
+print('OK: Device::HdpFlushWait injected into rocdevice.cpp')
 "
 
   # Phase 7b+7e: UC all host allocations on non-coherent platforms.
