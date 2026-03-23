@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=29
+pkgrel=30
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -235,6 +235,23 @@ s = s.replace(
     1)
 with open('$_virt', 'w') as f: f.write(s)
 print('OK: Phase 7h-fix ResetPool neutered for no-atomics')
+"
+
+  # Phase 7h: Force shader copy path for ALL copies on no-atomics platforms.
+  # The DmaBlitManager path uses ROCR's utility queue (BlitKernel) which has
+  # cross-queue L2 coherency issues — the blit kernel reads stale VRAM data
+  # from a different MEC pipe than the compute kernel that wrote it.
+  # The shader copy path dispatches on the USER's compute queue via
+  # submitKernelInternal — same queue = same L2 = no coherency issue.
+  python3 -c "
+with open('$_blit') as f: s = f.read()
+s = s.replace(
+    'const bool useShaderCopyPath = hwlCopyDisabled || smallSizeWithNonSdmaPreference ||',
+    'const bool useShaderCopyPath = !dev().info().pcie_atomics_ || hwlCopyDisabled || smallSizeWithNonSdmaPreference ||',
+    1)
+with open('$_blit') as f2: pass  # verify
+with open('$_blit', 'w') as f: f.write(s)
+print('OK: Phase 7h force shader copy on no-atomics')
 "
 
   # Phase 7h-debug: Verify AQL packet in ring buffer before doorbell.

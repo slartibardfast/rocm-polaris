@@ -494,7 +494,8 @@ new = '''\tgfx_v8_0_init_golden_registers(adev);
 \t * Only affects system memory reads (SHARED aperture).  VRAM unaffected.
 \t * Blind write — hardware default is 0x0, no need for read-modify-write.
 \t */
-\tWREG32(mmTC_CFG_L2_LOAD_POLICY0, 0x40);
+\t/* REVERTED: MISS_EVICT may cause premature L2 eviction */
+\t/* WREG32(mmTC_CFG_L2_LOAD_POLICY0, 0x40); */
 
 \tgfx_v8_0_constants_init(adev);'''
 assert old in s, 'gfx_v8_0_hw_init golden+constants pattern not found'

@@ -62,11 +62,8 @@ old = '''  if(agent_->profiling_enabled()) {
   }
 
   return HSA_STATUS_SUCCESS;'''
-new = '''  // Phase 7h: L2 flush moved to kernel ioctl (GFX ring).
-  // ExecutePM4 RELEASE_MEM on MEC hangs (EOP not configured for IB).
-  // The L2 flush now happens via HdpFlushWait ioctl which routes
-  // through the GFX ring's emit_fence (proven TC_WB mechanism).
-  // CLR calls HdpFlushWait after blit WaitCurrent in D2H staging path.
+new = '''  // Phase 7h: L1 stale read fix moved to GLC flag on flat_load instructions.
+  // ExecutePM4 ACQUIRE_MEM hangs from within SubmitLinearCopyCommand (lock_).
 
   if(agent_->profiling_enabled()) {
     LogSignalDuration(HSA_AMD_LOG_FLAG_BLIT_KERNEL_PKTS, completion_signal_,
@@ -80,10 +77,26 @@ with open('$_bk', 'w') as f: f.write(s)
 print('OK: Phase 7h L2 scrub after D2H blit')
 "
 
-  # Add l2_scrub_buf_ member to BlitKernel header
-  local _bk_h=runtime/hsa-runtime/core/inc/amd_blit_kernel.h
-  # Add PM4 header include to blit kernel for ACQUIRE_MEM
+  # Add PM4 header include to blit kernel
   sed -i '/#include "core\/inc\/amd_blit_kernel.h"/a\#include "core/inc/amd_gpu_pm4.h"' "$_bk"
+
+  # Phase 7h: Add GLC (globally coherent) flag to ALL blit kernel loads.
+  # The blit kernel's L1 (per-CU) caches VRAM reads from previous iterations.
+  # BUFFER_WBINVL1_VOL (system scope acquire) only invalidates MTYPE SC/GC
+  # lines — VRAM lines are MTYPE NC, so L1 stale lines persist.
+  # Fix: GLC=1 on flat_load bypasses L1, reads from L2 (shared, correct).
+  # Deterministic — no timing dependency, no PM4, no ioctl.
+  python3 -c "
+import re
+with open('$_bk') as f: s = f.read()
+# Add ' glc' to every flat_load line that doesn't already have it
+s = re.sub(r'(flat_load_\w+\s+v[^,]+,\s*v\[[^\]]+\])(?!\s*glc)', r'\1 glc', s)
+with open('$_bk', 'w') as f: f.write(s)
+# Count replacements
+import subprocess
+n = subprocess.run(['grep', '-c', 'flat_load.*glc', '$_bk'], capture_output=True, text=True)
+print(f'OK: GLC added to blit kernel flat_load instructions')
+"
 
   # (RELEASE_MEM TC_WB patch moved below, after _aq is defined)
 
