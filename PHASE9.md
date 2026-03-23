@@ -1,6 +1,6 @@
 # Phase 9: llama.cpp GPU Inference on gfx803
 
-## Status: IN PROGRESS — hang isolated to first compute dispatch
+## Status: IN PROGRESS — ROOT CAUSE: KV cache read faults on 2nd pass
 
 ## Goal
 
@@ -46,12 +46,23 @@ Model loads successfully; hangs during first inference dispatch.
 The GPU kernel dispatch goes into ROCR signal wait and never returns.
 No GPU faults in dmesg — the kernel is accepted but never completes.
 
-### Key Mystery
+### ROOT CAUSE FOUND (2026-03-23)
 
-Every individual GPU operation works when tested standalone or through
-the ggml API. But during llama.cpp inference, the very first compute
-kernel dispatch hangs. The difference must be in the exact sequence of
-operations or some state left over from model loading.
+With debug logging (`-ngl 99`):
+- **First forward pass: ALL 797 GPU nodes complete** (22 layers, every op)
+- **Second pass: HANGS at node 22 `kq-0 MUL_MAT`** — reads K cache from 1st pass
+
+The `kq-0` operation does `MUL_MAT(K_cache, Q)` — it reads from the KV cache
+populated during the first forward pass. VM faults at `0x4103xxx000` (TC read,
+page not present) confirm the KV cache buffer is unmapped between passes.
+
+With `-ngl 1`, the same pattern occurs: all 40 nodes complete, then VM fault.
+
+**Root cause: KV cache buffer becomes unmapped between graph evaluations.**
+This is either:
+1. A ggml buffer reallocation that doesn't properly re-map on gfx803
+2. Our hipMalloc→hipHostMalloc redirect corrupting buffer metadata
+3. ggml's KV cache uses buffer views that lose their GPU mapping
 
 ## Next Steps
 
