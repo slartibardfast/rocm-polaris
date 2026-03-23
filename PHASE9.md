@@ -1,6 +1,6 @@
 # Phase 9: llama.cpp GPU Inference on gfx803
 
-## Status: IN PROGRESS — CP idle stall on 2nd graph evaluation
+## Status: FIX WORKING — GPU inference runs, needs performance testing
 
 ## Goal
 
@@ -72,12 +72,22 @@ First pass dispatches 797 nodes (all complete). Second pass dispatches
 - NOT flash attention (same with -fa off)
 - NOT rocBLAS (same with GGML_HIP_NO_BLAS=1)
 
-**Remaining hypothesis: CP hardware stall after ~800+ dispatches.**
-The CP on gfx8/no-atomics may have a hardware limit on consecutive
-dispatches without a full queue drain. After 797 dispatches + sync +
-6 more, the CP stops processing packets. No barriers, no faults,
-just silent stall. The NOP doorbell kick workaround from Phase 7
-may be needed here.
+**ROOT CAUSE FOUND AND FIXED (2026-03-23):**
+GPU writes RPTR (read pointer) to system memory via PCIe posted writes.
+On Westmere PCIe 2.0, the IOH buffers these writes. CPU reads RPTR
+from UC memory but sees stale value because the IOH hasn't committed.
+ProcessCompletions thinks the dispatch isn't done; signal stays at 1;
+WaitForSignal loops forever.
+
+**Fix:** Read back the doorbell register (MMIO, non-posted) before
+re-reading RPTR. MMIO reads force the IOH to commit all pending
+posted writes. Then UpdateReadDispatchId sees the latest RPTR.
+
+Also: force-advance read_dispatch_id when queue is fully drained
+(RPTR == WPTR) but pending completions remain (last-packet edge case).
+
+Both passes of llama.cpp's 941-node graph (Qwen 0.5B, 24 layers)
+complete. Token generation in progress (slow due to 8 CU GPU).
 
 ## Next Steps
 
