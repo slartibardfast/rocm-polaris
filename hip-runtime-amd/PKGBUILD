@@ -60,7 +60,7 @@ s = s.replace(
 # Add clflush after D2H staging wait (non-pinned path)
 s = s.replace(
     '          // Wait for current signal of previous rocr copy if its not pinned mem\n          gpu().Barriers().WaitCurrent();\n          ClPrint(amd::LOG_DETAIL_DEBUG',
-    '          // Wait for current signal of previous rocr copy if its not pinned mem\n          gpu().Barriers().WaitCurrent();\n#if defined(__x86_64__) || defined(__i386__)\n          if (!dev().info().pcie_atomics_) {\n            for (size_t off = 0; off < copysize; off += 64)\n              _mm_clflush(reinterpret_cast<char*>(stagingBuffer) + off);\n            _mm_mfence();\n          }\n#endif\n          ClPrint(amd::LOG_DETAIL_DEBUG',
+    '          // Wait for current signal of previous rocr copy if its not pinned mem\n          gpu().Barriers().WaitCurrent();\n          // Phase 7h: Flush GPU L2 via GFX ring ioctl.\n          // The blit kernel writes to staging through GPU L2. The L2\n          // dirty lines may not be in DRAM when the CPU reads.\n          // HdpFlushWait triggers the ioctl which flushes HDP AND\n          // emits a GFX ring fence with TC_WB to flush L2.\n          if (!dev().info().pcie_atomics_) {\n            const_cast<Device&>(dev()).HdpFlushWait();\n          }\n          ClPrint(amd::LOG_DETAIL_DEBUG',
     1)
 # Add clflush for pinned D2H path
 s = s.replace(

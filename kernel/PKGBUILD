@@ -318,6 +318,9 @@ print('OK: kfd_ioctl.h updated')
 with open('$_kfd') as f: s = f.read()
 
 handler = '''#include \"asic_reg/bif/bif_5_1_d.h\"
+#include \"vid.h\"
+
+static int kfd_flush_gpu_l2(struct kfd_process_device *pdd);
 
 /* Phase 7h: Completion-tracked HDP flush for no-atomics platforms. */
 static int kfd_ioctl_hdp_flush(struct file *filp,
@@ -350,6 +353,7 @@ static int kfd_ioctl_hdp_flush(struct file *filp,
 \tdo {
 \t\ttmp = RREG32(mmGPU_HDP_FLUSH_DONE);
 \t\tif ((tmp & mask) == mask) {
+\t\t\tkfd_flush_gpu_l2(pdd);
 \t\t\targs->status = 0;
 \t\t\targs->actual_us = (uint32_t)ktime_us_delta(ktime_get(), start);
 \t\t\treturn 0;
@@ -357,8 +361,57 @@ static int kfd_ioctl_hdp_flush(struct file *filp,
 \t\tudelay(1);
 \t} while (ktime_us_delta(ktime_get(), start) < timeout_us);
 
+\t/* Even on HDP timeout, flush L2 via GFX ring */
+\tkfd_flush_gpu_l2(pdd);
+
 \targs->status = 1;
 \targs->actual_us = timeout_us;
+\treturn 0;
+}
+
+/* Phase 7h: GPU L2 writeback via GFX ring fence.
+ * The MEC (compute) ring's TC_WB is unreliable on gfx8.
+ * The GFX ring's TC_WB is proven (used for every kernel fence).
+ * This function submits an EVENT_WRITE_EOP with TC_WB on the GFX ring
+ * and polls for completion. Called after D2H blit to ensure GPU L2
+ * dirty lines (staging buffer) are written back to DRAM.
+ */
+static int kfd_flush_gpu_l2(struct kfd_process_device *pdd)
+{
+\tstruct amdgpu_device *adev = pdd->dev->adev;
+\tstruct amdgpu_ring *ring = &adev->gfx.gfx_ring[0];
+\tint r;
+
+\t/* Use the GFX ring's existing fence mechanism to flush L2.
+\t * amdgpu_ring_emit_fence handles the EVENT_WRITE_EOP with
+\t * TC_WB + TC_ACTION flags. We just need to emit a fence and
+\t * wait for it to complete.
+\t */
+\tmutex_lock(&adev->gfx.gpu_clock_mutex);  /* protect GFX ring */
+
+\tr = amdgpu_ring_alloc(ring, 16);
+\tif (r) {
+\t\tmutex_unlock(&adev->gfx.gpu_clock_mutex);
+\t\treturn r;
+\t}
+
+\t/* Emit fence with cache flush (same as kernel driver's fence emit) */
+\tring->funcs->emit_fence(ring, ring->fence_drv.gpu_addr,
+\t\t\t\t++ring->fence_drv.sync_seq,
+\t\t\t\tAMDGPU_FENCE_FLAG_64BIT);
+\tamdgpu_ring_commit(ring);
+
+\t/* Wait for fence completion (L2 flushed when fence value appears) */
+\t{
+\t\tvolatile uint64_t *fence_ptr = (volatile uint64_t *)
+\t\t\t((char *)adev->wb.wb +
+\t\t\t (ring->fence_drv.gpu_addr - adev->wb.gpu_addr));
+\t\tint timeout = 10000;
+\t\twhile (*fence_ptr < ring->fence_drv.sync_seq && --timeout > 0)
+\t\t\tudelay(1);
+\t}
+
+\tmutex_unlock(&adev->gfx.gpu_clock_mutex);
 \treturn 0;
 }
 
