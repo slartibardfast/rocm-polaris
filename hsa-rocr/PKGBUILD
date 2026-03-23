@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=27
+pkgrel=28
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -521,19 +521,27 @@ new = '''void AqlQueue::ProcessCompletions() {
 
   UpdateReadDispatchId();
 
-  // Phase 9: The last RPTR write from the CP may not have reached DRAM yet
-  // (PCIe posted write latency). When WPTR == RPTR but pending completions
-  // exist, the GPU has finished all work but the RPTR update is delayed.
-  // Resolve: if write_idx matches read_idx (queue drained), force-complete
-  // all pending signals.
-  {
+  // Phase 9: Force IOH to flush pending GPU PCIe posted writes (RPTR updates)
+  // before re-reading rptr_gpu_buf_. On Westmere PCIe 2.0, posted writes from
+  // the GPU can be delayed in the IOH. A read from MMIO (doorbell) forces the
+  // IOH to commit all pending writes before returning.
+  if (rptr_gpu_buf_ && !pending_completions_.empty()) {
     uint64_t ri = atomic::Load(&amd_queue_.read_dispatch_id, std::memory_order_acquire);
-    uint64_t wi = atomic::Load(&amd_queue_.write_dispatch_id, std::memory_order_acquire);
-    if (!pending_completions_.empty() && ri < pending_completions_.back().complete_idx && ri >= wi) {
-      // Queue is drained (RPTR caught up to WPTR) but pending signals remain.
-      // The last RPTR PCIe write hasn't arrived yet. Force-advance read_dispatch_id.
-      atomic::Store(&amd_queue_.read_dispatch_id, wi, std::memory_order_release);
-      last_rptr_dwords_ = static_cast<uint32_t>((wi * 16) & ((amd_queue_.hsa_queue.size * 16) - 1));
+    if (ri < pending_completions_.front().complete_idx) {
+      // RPTR hasn't caught up. Flush IOH with a doorbell readback.
+      if (legacy_doorbell_) {
+        volatile uint32_t dummy = *(volatile uint32_t*)(signal_.hardware_doorbell_ptr);
+        (void)dummy;
+      }
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      UpdateReadDispatchId();
+      // If still stuck after flush, force-advance when queue is drained.
+      ri = atomic::Load(&amd_queue_.read_dispatch_id, std::memory_order_acquire);
+      uint64_t wi = atomic::Load(&amd_queue_.write_dispatch_id, std::memory_order_acquire);
+      if (!pending_completions_.empty() && ri < pending_completions_.back().complete_idx && ri >= wi) {
+        atomic::Store(&amd_queue_.read_dispatch_id, wi, std::memory_order_release);
+        last_rptr_dwords_ = static_cast<uint32_t>((wi * 16) & ((amd_queue_.hsa_queue.size * 16) - 1));
+      }
     }
   }'''
 
