@@ -1,6 +1,6 @@
 # Phase 9: llama.cpp GPU Inference on gfx803
 
-## Status: IN PROGRESS — ROOT CAUSE: KV cache read faults on 2nd pass
+## Status: IN PROGRESS — CP idle stall on 2nd graph evaluation
 
 ## Goal
 
@@ -58,11 +58,26 @@ page not present) confirm the KV cache buffer is unmapped between passes.
 
 With `-ngl 1`, the same pattern occurs: all 40 nodes complete, then VM fault.
 
-**Root cause: KV cache buffer becomes unmapped between graph evaluations.**
-This is either:
-1. A ggml buffer reallocation that doesn't properly re-map on gfx803
-2. Our hipMalloc→hipHostMalloc redirect corrupting buffer metadata
-3. ggml's KV cache uses buffer views that lose their GPU mapping
+**Root cause: CP idle stall between graph evaluations.**
+First pass dispatches 797 nodes (all complete). Second pass dispatches
+6 nodes (complete) then kq-0 MUL_MAT hangs. CP stops processing AQL packets.
+
+**Eliminated causes:**
+- NOT barrier dep_signals (0 barriers with deps during compute)
+- NOT signal pool exhaustion (same with ROC_SIGNAL_POOL_SIZE=2048)
+- NOT hipMalloc redirect (same with GPU_D2H_SAFE_THRESHOLD=0)
+- NOT VM fault (no dmesg entries for ngl=99 run)
+- NOT buffer reallocation (same addresses between passes)
+- NOT individual kernel bug (all ggml ops pass standalone)
+- NOT flash attention (same with -fa off)
+- NOT rocBLAS (same with GGML_HIP_NO_BLAS=1)
+
+**Remaining hypothesis: CP hardware stall after ~800+ dispatches.**
+The CP on gfx8/no-atomics may have a hardware limit on consecutive
+dispatches without a full queue drain. After 797 dispatches + sync +
+6 more, the CP stops processing packets. No barriers, no faults,
+just silent stall. The NOP doorbell kick workaround from Phase 7
+may be needed here.
 
 ## Next Steps
 
