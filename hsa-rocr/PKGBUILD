@@ -101,6 +101,8 @@ print('OK: Phase 7h L2 scrub after D2H blit')
   # Add PM4 header include to blit kernel for ACQUIRE_MEM
   sed -i '/#include "core\/inc\/amd_blit_kernel.h"/a\#include "core/inc/amd_gpu_pm4.h"' "$_bk"
 
+  # (RELEASE_MEM TC_WB patch moved below, after _aq is defined)
+
   # Phase 6a: CPU-wait dep_signals in BlitKernel instead of AQL barriers.
   # On no-atomics platforms, the CP goes idle after an unsatisfied barrier
   # dep and cannot be woken (SLOT_BASED_WPTR=0, no DOORBELL_HIT for same
@@ -147,6 +149,14 @@ INJECT
   sed -i '/CLFLUSH is not ordered/d' "$_aq"
   sed -i '/Fence ensures the invalidation/d' "$_aq"
   sed -i '/_mm_mfence();/d' "$_aq"
+
+  # Phase 7h: Add TC_WB to ExecutePM4's RELEASE_MEM on gfx8.
+  # The RELEASE_MEM that completes ExecutePM4 has NO cache action flags,
+  # so ACQUIRE_MEM L2 flush may still be in-flight when CPU sees completion.
+  # Adding cache action flags makes RELEASE_MEM itself flush L2+L1,
+  # guaranteeing all GPU cache data is written back before CPU reads.
+  # EOP_TC_WB_ACTION_EN (1<<15) | EOP_TCL1_ACTION_EN (1<<16) | EOP_TC_ACTION_EN (1<<17)
+  sed -i 's/rel_mem\[1\] = PM4_RELEASE_MEM_DW1_EVENT_INDEX(PM4_RELEASE_MEM_EVENT_INDEX_AQL);/rel_mem[1] = PM4_RELEASE_MEM_DW1_EVENT_INDEX(PM4_RELEASE_MEM_EVENT_INDEX_AQL) | (1 << 15) | (1 << 16) | (1 << 17);/' "$_aq"
 
   # 7b-3: UC signal pool.  Add AllocateUncached to signal block allocations.
   local _sig=runtime/hsa-runtime/core/runtime/signal.cpp
