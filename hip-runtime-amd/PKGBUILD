@@ -60,7 +60,7 @@ s = s.replace(
 # Add clflush after D2H staging wait (non-pinned path)
 s = s.replace(
     '          // Wait for current signal of previous rocr copy if its not pinned mem\n          gpu().Barriers().WaitCurrent();\n          ClPrint(amd::LOG_DETAIL_DEBUG',
-    '          // Wait for current signal of previous rocr copy if its not pinned mem\n          gpu().Barriers().WaitCurrent();\n          // Phase 7h: Flush GPU L2 via GFX ring ioctl.\n          // The blit kernel writes to staging through GPU L2. The L2\n          // dirty lines may not be in DRAM when the CPU reads.\n          // HdpFlushWait triggers the ioctl which flushes HDP AND\n          // emits a GFX ring fence with TC_WB to flush L2.\n          if (!dev().info().pcie_atomics_) {\n            const_cast<Device&>(dev()).HdpFlushWait();\n          }\n          ClPrint(amd::LOG_DETAIL_DEBUG',
+    '          // Wait for current signal of previous rocr copy if its not pinned mem\n          gpu().Barriers().WaitCurrent();\n          // Phase 7h: Retry-until-match for D2H on no-atomics.\n          // GPU L2 dirty lines may not be written back to VRAM MC\n          // when the blit reads. Read twice and compare — stale reads\n          // return previous iteration data, so two matching reads\n          // confirm correctness. Retry on mismatch.\n          if (!dev().info().pcie_atomics_ && copysize > 0) {\n            memcpy(hostDst + copyOffset, stagingBuffer, copysize);\n            for (int retry = 0; retry < 10; retry++) {\n              rocrCopyBuffer(stagingBuffer, dstAgent, src, srcAgent, copysize, copyMetadata);\n              gpu().Barriers().WaitCurrent();\n              if (memcmp(hostDst + copyOffset, stagingBuffer, copysize) == 0) break;\n              memcpy(hostDst + copyOffset, stagingBuffer, copysize);\n            }\n          }\n          ClPrint(amd::LOG_DETAIL_DEBUG',
     1)
 # Add clflush for pinned D2H path
 s = s.replace(
@@ -245,6 +245,15 @@ print('OK: Phase 7h-fix ResetPool neutered for no-atomics')
   # submitKernelInternal — same queue = same L2 = no coherency issue.
   python3 -c "
 with open('$_blit') as f: s = f.read()
+# Phase 7h: Force shader copy AND skip releaseGpuMemoryFence for D2H.
+# The blit on the utility queue reads stale VRAM because the compute
+# kernel's L2 dirty line was evicted (by bounce buffer/signal processing
+# during releaseGpuMemoryFence). The shader copy on the SAME compute
+# queue reads from L2 before eviction — but ONLY if we don't run
+# releaseGpuMemoryFence first (which generates L2-evicting traffic).
+#
+# Fix: force useShaderCopyPath=true AND skip the releaseGpuMemoryFence
+# in the D2H staging path on no-atomics platforms.
 s = s.replace(
     'const bool useShaderCopyPath = hwlCopyDisabled || smallSizeWithNonSdmaPreference ||',
     'const bool useShaderCopyPath = !dev().info().pcie_atomics_ || hwlCopyDisabled || smallSizeWithNonSdmaPreference ||',
@@ -365,6 +374,54 @@ print('OK: Device::HdpFlushWait injected (proper HSA API)')
     memFlags |= HSA_AMD_MEMORY_POOL_UNCACHED_FLAG;\
   }
   }' "$_dev"
+
+  # Phase 7h: On no-atomics, redirect small hipMalloc to hipHostMalloc.
+  # GPU L2→VRAM MC writeback is unreliable on gfx8 without atomics.
+  # hipMemcpy(D2H) from VRAM reads stale data. hipHostMalloc returns
+  # system memory with proper host+device metadata — hipMemcpy detects
+  # it as host-accessible and does direct memcpy (no blit, no VRAM read).
+  # Threshold configurable via GPU_D2H_SAFE_THRESHOLD env var (default 1MB).
+  local _hipmem=hipamd/src/hip_memory.cpp
+  python3 -c "
+with open('$_hipmem') as f: s = f.read()
+old = '''hipError_t hipMalloc(void** ptr, size_t sizeBytes) {
+  HIP_INIT_API(hipMalloc, ptr, sizeBytes);
+  CHECK_STREAM_CAPTURE_SUPPORTED();
+  HIP_RETURN_DURATION(ihipMalloc(ptr, sizeBytes, 0), ReturnPtrValue(ptr));
+}'''
+new = '''hipError_t hipMalloc(void** ptr, size_t sizeBytes) {
+  HIP_INIT_API(hipMalloc, ptr, sizeBytes);
+  CHECK_STREAM_CAPTURE_SUPPORTED();
+  // Phase 7h: Redirect small allocations to system memory on no-atomics.
+  // GPU L2->VRAM MC writeback is unreliable; hipHostMalloc avoids VRAM.
+  {
+    static size_t d2h_threshold = SIZE_MAX;
+    static bool d2h_init = false;
+    if (!d2h_init) {
+      d2h_init = true;
+      const char* env = getenv(\"GPU_D2H_SAFE_THRESHOLD\");
+      d2h_threshold = env ? strtoull(env, nullptr, 0) : (1024 * 1024);
+      // Check if ANY device lacks atomics
+      for (auto dev : g_devices) {
+        if (dev && dev->devices()[0] &&
+            !dev->devices()[0]->info().pcie_atomics_) {
+          break;  // threshold applies
+        }
+        d2h_threshold = 0;  // all devices have atomics — disable
+      }
+    }
+    if (d2h_threshold > 0 && sizeBytes > 0 && sizeBytes <= d2h_threshold) {
+      HIP_RETURN_DURATION(ihipHostMalloc(ptr, sizeBytes, hipHostMallocDefault),
+                          ReturnPtrValue(ptr));
+    }
+  }
+  HIP_RETURN_DURATION(ihipMalloc(ptr, sizeBytes, 0), ReturnPtrValue(ptr));
+}'''
+assert old in s, 'hipMalloc pattern not found'
+s = s.replace(old, new, 1)
+with open('$_hipmem', 'w') as f: f.write(s)
+print('OK: Phase 7h small hipMalloc redirected to hipHostMalloc')
+"
 
   # Phase 7c: Force synchronous flush in submitMarker on no-atomics platforms.
   # CLR's async signal handler (HsaAmdSignalHandler) relies on GPU writing
