@@ -1,77 +1,87 @@
 # Phase 9: llama.cpp GPU Inference on gfx803
 
-## Status: NOT STARTED
+## Status: IN PROGRESS — hang isolated to first compute dispatch
 
 ## Goal
 
 Get llama.cpp to produce tokens using GPU compute on gfx803 (Polaris 12).
-Model loads successfully; crashes during first inference dispatch.
+Model loads successfully; hangs during first inference dispatch.
 
 ## Known State
 
-- **Model:** Qwen2.5-0.5B-Instruct-Q4_K_M.gguf (469MB, fits in 2GB VRAM)
+- **Model:** TinyLlama-1.1B-Q8_0 (1.1GB), Qwen2.5-0.5B-Q4_K_M (469MB)
 - **Package:** `llama-cpp-rocm-polaris` b7376-1
-- **GPU layers:** All layers load to GPU successfully (no VM fault)
-- **Crash point:** `ggml_backend_sched_synchronize` during first prompt eval
-- **Backtrace:** libamdhip64.so -> libhsa-runtime64.so -> pthread_mutex_lock -> std::terminate
+- **GPU layers:** All layers load to GPU (H2D works, no VM fault)
+- **CPU-only:** Works perfectly (TinyLlama: 15.1 t/s)
+- **Hang point:** `ggml_cuda_mul_mat_vec_q` — quantized matrix-vector multiply
+- **No GPU fault** in dmesg — GPU silently stops processing
 
-## Hypotheses
+## Investigation Results
 
-1. **rocBLAS kernel failure on gfx803** — rocBLAS may emit an unsupported
-   instruction or hit a code object loading failure for gfx803. rocBLAS was
-   rebuilt with gfx803 targets but Tensile-generated kernels may have issues.
+### Hypotheses Eliminated
 
-2. **ggml-hip kernel incompatibility** — ggml's custom HIP kernels may use
-   intrinsics or warp operations that behave differently on gfx8 (64-wide
-   wavefronts, different instruction encoding).
+1. **rocBLAS** — GGML_HIP_NO_BLAS=1 still hangs. hipBLAS SGEMM works standalone.
+2. **Flash attention** — `-fa off` still hangs (different kernel, same pattern).
+3. **Memory pressure** — GPU_D2H_SAFE_THRESHOLD=0 still hangs. Only 19MB VRAM idle.
+4. **Shared memory** — 8KB LDS kernels work (100 dispatches × 2 tests).
+5. **Non-blocking streams** — 1000 dispatches on non-blocking stream pass.
+6. **hipEvents** — 500 event record/wait cycles pass.
+7. **H2D → compute transition** — 200MB H2D + 100 compute dispatches pass.
+8. **hipBLAS + compute** — Full ggml-like pattern (24 layers norm+gemm+add) passes.
+9. **Individual ggml ops** — add, mul_mat, rms_norm, softmax all pass via ggml API.
+10. **Quantized MMVQ** — Q4_K, Q8_0, F32, F16 matrix-vector multiply all pass.
+11. **ggml scheduler** — CPU+GPU backend sched with 50 iterations passes.
+12. **test-backend-ops** — 217+ ops pass (GET_ROWS cross-backend has correctness issues).
 
-3. **CP idle stall on barrier packets** — Phase 8 CPU-managed barriers may
-   not cover all barrier paths exercised by llama.cpp's multi-stream dispatch.
+### Backtrace (HIP_LAUNCH_BLOCKING=1, -fa off, -ngl 1)
 
-4. **Memory pressure** — 2GB VRAM with hipMalloc->hipHostMalloc redirect may
-   leave insufficient device memory for compute scratch/LDS.
-
-## Investigation Plan
-
-### Step 1: Isolate rocBLAS vs ggml-hip kernels
-```bash
-GGML_HIP_NO_BLAS=1 timeout 30 llama-cli \
-  -m /opt/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
-  -p "Hello" -n 4 -ngl 99
 ```
-If this works -> rocBLAS is the problem.
-If this crashes -> ggml-hip kernels are the problem.
-
-### Step 2: Reduce GPU layers
-```bash
-timeout 30 llama-cli \
-  -m /opt/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
-  -p "Hello" -n 4 -ngl 1
-```
-Single GPU layer isolates whether the crash is layer-count dependent.
-
-### Step 3: Enable HIP error reporting
-```bash
-AMD_LOG_LEVEL=3 timeout 15 llama-cli \
-  -m /opt/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
-  -p "Hello" -n 4 -ngl 99
-```
-Check for specific HIP/HSA error codes before the crash.
-
-### Step 4: Check dmesg for GPU faults
-```bash
-sudo dmesg | grep -i 'amdgpu\|kfd\|gfx\|fault\|error'
+#30 ggml_cuda_mul_mat_vec_q
+#29 [ggml-hip dispatch]
+#22-28 [CLR/HIP dispatch path]
+#14-19 [ROCR signal wait — sched_yield polling]
+#13 sched_yield
 ```
 
-### Step 5: Minimal HIP matmul test
-Write a standalone test that dispatches a simple matrix multiply via
-hipBLAS/rocBLAS on gfx803 to isolate whether rocBLAS kernels work at all.
+The GPU kernel dispatch goes into ROCR signal wait and never returns.
+No GPU faults in dmesg — the kernel is accepted but never completes.
+
+### Key Mystery
+
+Every individual GPU operation works when tested standalone or through
+the ggml API. But during llama.cpp inference, the very first compute
+kernel dispatch hangs. The difference must be in the exact sequence of
+operations or some state left over from model loading.
+
+## Next Steps
+
+### Theory: Model loading leaves stale queue state
+
+After H2D copies during model loading, CLR's internal queues may have
+pending barrier deps or stale signal state. The first compute dispatch
+on the same queue encounters this stale state and hangs.
+
+Test: Rebuild llama.cpp with GGML_CUDA_DEBUG to log each operation,
+or add fprintf to CLR's dispatch path to trace the exact AQL packet
+sequence.
+
+### Theory: Kernel resource requirements exceed gfx803 limits
+
+The mmvq kernel for Q4_K with real model dimensions may require more
+VGPRs/SGPRs than available, causing silent failure. Extract the gfx803
+code object from libggml-hip.so and check resource requirements.
+
+### Theory: fastdiv_values or integer division kernel helper
+
+The mmvq kernel uses `init_fastdiv_values` and `fastdiv`/`fastmodulo`
+which may compile to different code on gfx8. A division-by-zero or
+infinite loop in the fast divider could hang the GPU.
 
 ## Success Criteria
 
 - [ ] `llama-cli -p "Hello" -n 8 -ngl 99` produces 8 tokens on GPU
 - [ ] Process exits cleanly (no crash, no hang)
-- [ ] Token generation rate measured (baseline: 13.3 t/s CPU-only)
+- [ ] Token generation rate measured (baseline: 15.1 t/s CPU-only)
 - [ ] 10 consecutive runs pass
 
 ## Packages
