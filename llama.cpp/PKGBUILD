@@ -7,7 +7,7 @@
 pkgname=llama-cpp-rocm-polaris
 _upstream_pkgname=llama.cpp
 pkgver=b7376
-pkgrel=6
+pkgrel=7
 pkgdesc='LLM inference in C/C++ with ROCm GPU support (gfx803)'
 arch=('x86_64')
 url='https://github.com/ggml-org/llama.cpp'
@@ -31,27 +31,7 @@ conflicts=('llama.cpp')
 source=("$_upstream_pkgname-$pkgver::git+$url.git#tag=$pkgver")
 sha256sums=('SKIP')
 
-prepare() {
-  cd "$_upstream_pkgname-$pkgver"
-
-  # Phase 9 debug: Log each GPU kernel dispatch to identify hang point
-  local _cuda_cu=ggml/src/ggml-cuda/ggml-cuda.cu
-  sed -i '/bool ok = ggml_cuda_compute_forward/i\
-                fprintf(stderr, "[GGML-GPU] node %d/%d: %s op=%s src0=%p(%s) src1=%p(%s)\\n", i, cgraph->n_nodes, node->name, ggml_op_name(node->op), node->src[0] ? node->src[0]->data : NULL, node->src[0] ? node->src[0]->name : "", node->src[1] ? node->src[1]->data : NULL, node->src[1] ? node->src[1]->name : "");\
-                fflush(stderr);' "$_cuda_cu"
-
-  # Also log after compute_forward returns to see if it completes
-  sed -i 's/bool ok = ggml_cuda_compute_forward(\*cuda_ctx, node);/bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);\
-                fprintf(stderr, "[GGML-GPU] node %d done ok=%d\\n", i, ok); fflush(stderr);/' "$_cuda_cu"
-
-  # Phase 9 debug: log graph count
-  sed -i '/static enum ggml_status ggml_backend_cuda_graph_compute/,/ggml_cuda_set_device/ {
-    /ggml_cuda_set_device/a\
-    { static int __graph_count = 0; __graph_count++; \
-      fprintf(stderr, "[GGML-GPU] PRE-COMPUTE graph #%d n_nodes=%d\\n", __graph_count, cgraph->n_nodes); fflush(stderr); \
-    }
-  }' "$_cuda_cu"
-}
+## No prepare() — clean production build
 
 build() {
   export HIPCXX=/opt/rocm/lib/llvm/bin/amdclang++

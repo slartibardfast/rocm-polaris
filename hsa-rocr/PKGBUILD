@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=28
+pkgrel=31
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -475,20 +475,6 @@ new = '''void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
   // pending DRAM writes for this address range before the doorbell write.
   // Also flush HDP read cache (separate buffer below L2).
   if (no_atomics_) {
-    // Phase 7h-debug: dump all GPU DMA target addresses on first call
-    { static int d=0; if(d++<5){
-      auto rb = reinterpret_cast<uintptr_t>(amd_queue_.hsa_queue.base_address);
-      auto re = rb + amd_queue_.hsa_queue.size * 64;
-      auto ra = reinterpret_cast<uintptr_t>(rptr_gpu_buf_);
-      auto rp = amd_queue_.read_dispatch_id;
-      auto wp = amd_queue_.write_dispatch_id;
-      fprintf(stderr, \"[ROCR] ring %lx-%lx %u\\\\n\", rb, re, amd_queue_.hsa_queue.size);
-      fprintf(stderr, \"[ROCR] rpt %lx wpoll %lx bounce %lx\\\\n\", rp, wp, ra);
-      if(ra>=rb&&ra<re) fprintf(stderr, \"[ROCR] OVERLAP bounce\\\\n\");
-      if(rp>=rb&&rp<re) fprintf(stderr, \"[ROCR] OVERLAP rpt\\\\n\");
-      if(wp>=rb&&wp<re) fprintf(stderr, \"[ROCR] OVERLAP wpoll\\\\n\");
-    } }
-
     // Readback + HDP flush
     uint64_t slot = value & (amd_queue_.hsa_queue.size - 1);
     volatile uint32_t* pkt = (volatile uint32_t*)(
@@ -521,21 +507,23 @@ new = '''void AqlQueue::ProcessCompletions() {
 
   UpdateReadDispatchId();
 
-  // Phase 9: Force IOH to flush pending GPU PCIe posted writes (RPTR updates)
-  // before re-reading rptr_gpu_buf_. On Westmere PCIe 2.0, posted writes from
-  // the GPU can be delayed in the IOH. A read from MMIO (doorbell) forces the
-  // IOH to commit all pending writes before returning.
+  // Phase 9: Force IOH to flush pending GPU PCIe posted writes (RPTR updates).
+  // Only flush ONCE per stall — avoid repeated MMIO reads in tight poll loops.
   if (rptr_gpu_buf_ && !pending_completions_.empty()) {
     uint64_t ri = atomic::Load(&amd_queue_.read_dispatch_id, std::memory_order_acquire);
     if (ri < pending_completions_.front().complete_idx) {
-      // RPTR hasn't caught up. Flush IOH with a doorbell readback.
-      if (legacy_doorbell_) {
-        volatile uint32_t dummy = *(volatile uint32_t*)(signal_.hardware_doorbell_ptr);
-        (void)dummy;
+      // Flush IOH with doorbell readback, but only if we haven't already.
+      static thread_local uint64_t last_flush_id = 0;
+      if (ri != last_flush_id) {
+        last_flush_id = ri;
+        if (legacy_doorbell_) {
+          volatile uint32_t dummy = *(volatile uint32_t*)(signal_.hardware_doorbell_ptr);
+          (void)dummy;
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        UpdateReadDispatchId();
       }
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      UpdateReadDispatchId();
-      // If still stuck after flush, force-advance when queue is drained.
+      // Force-advance when queue is fully drained but completions remain.
       ri = atomic::Load(&amd_queue_.read_dispatch_id, std::memory_order_acquire);
       uint64_t wi = atomic::Load(&amd_queue_.write_dispatch_id, std::memory_order_acquire);
       if (!pending_completions_.empty() && ri < pending_completions_.back().complete_idx && ri >= wi) {
@@ -550,6 +538,37 @@ s = s.replace(old, new, 1)
 
 with open('$_aq', 'w') as f: f.write(s)
 print('OK: StoreRelaxed HDP flush + ProcessCompletions RPTR retry added')
+"
+
+  # Phase 9b: Add sched_yield to BusyWaitSignal polling loop on non-mwaitx CPUs.
+  # Without this, the loop runs millions of iterations per dispatch burning 100% CPU.
+  # sched_yield gives other threads a chance and reduces poll rate to ~100K/s.
+  local _ds=runtime/hsa-runtime/core/runtime/default_signal.cpp
+  python3 -c "
+with open('$_ds') as f: s = f.read()
+old = '''    if (g_use_mwaitx) {
+      // Use timer-enabled mwaitx for busy waiting
+      timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), 60000, true);
+    }
+  }
+}'''
+new = '''    if (g_use_mwaitx) {
+      // Use timer-enabled mwaitx for busy waiting
+      timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), 60000, true);
+    } else {
+      // Phase 9b: On non-AMD CPUs (no mwaitx), yield to avoid 100% CPU burn.
+      // PCIe posted writes for RPTR take microseconds; tight polling wastes cycles.
+      sched_yield();
+    }
+  }
+}'''
+assert old in s, 'BusyWaitSignal mwaitx pattern not found'
+s = s.replace(old, new, 1)
+# Add sched.h include
+if '#include <sched.h>' not in s:
+    s = '#include <sched.h>\n' + s
+with open('$_ds', 'w') as f: f.write(s)
+print('OK: Phase 9b sched_yield in BusyWaitSignal polling loop added')
 "
 }
 
