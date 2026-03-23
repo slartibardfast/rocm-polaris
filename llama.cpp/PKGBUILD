@@ -7,7 +7,7 @@
 pkgname=llama-cpp-rocm-polaris
 _upstream_pkgname=llama.cpp
 pkgver=b7376
-pkgrel=4
+pkgrel=6
 pkgdesc='LLM inference in C/C++ with ROCm GPU support (gfx803)'
 arch=('x86_64')
 url='https://github.com/ggml-org/llama.cpp'
@@ -44,16 +44,11 @@ prepare() {
   sed -i 's/bool ok = ggml_cuda_compute_forward(\*cuda_ctx, node);/bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);\
                 fprintf(stderr, "[GGML-GPU] node %d done ok=%d\\n", i, ok); fflush(stderr);/' "$_cuda_cu"
 
-  # Log hipDeviceSynchronize result + NOP kick before graph compute
+  # Phase 9 debug: log graph count
   sed -i '/static enum ggml_status ggml_backend_cuda_graph_compute/,/ggml_cuda_set_device/ {
     /ggml_cuda_set_device/a\
-    { hipError_t _err = hipDeviceSynchronize(); fprintf(stderr, "[GGML-GPU] PRE-COMPUTE sync=%d n_nodes=%d\\n", _err, cgraph->n_nodes); fflush(stderr); \
-      /* Phase 9 fix: launch a tiny NOP kernel to wake the CP after sync */ \
-      static bool __once = false; if (!__once) { __once = true; } else { \
-        int __dummy = 0; hipMemsetAsync(&__dummy, 0, 0, cuda_ctx->stream()); \
-        _err = hipStreamSynchronize(cuda_ctx->stream()); \
-        fprintf(stderr, "[GGML-GPU] POST-NOP sync=%d\\n", _err); fflush(stderr); \
-      } \
+    { static int __graph_count = 0; __graph_count++; \
+      fprintf(stderr, "[GGML-GPU] PRE-COMPUTE graph #%d n_nodes=%d\\n", __graph_count, cgraph->n_nodes); fflush(stderr); \
     }
   }' "$_cuda_cu"
 }

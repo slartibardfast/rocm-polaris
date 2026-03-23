@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=25
+pkgrel=27
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -505,8 +505,43 @@ new = '''void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
 
 assert old in s, 'Could not find StoreRelaxed with ScanNewPackets'
 s = s.replace(old, new, 1)
+
+# Phase 9 fix: RPTR read may miss last PCIe posted write from CP.
+# ProcessCompletions checks read_idx >= complete_idx, but the last
+# RPTR write is a PCIe posted write that may not have reached DRAM yet.
+# Fix: when pending completions exist but RPTR hasn't caught up,
+# force a re-read via volatile + memory fence.
+old = '''void AqlQueue::ProcessCompletions() {
+  if (!no_atomics_ || pending_completions_.empty()) return;
+
+  UpdateReadDispatchId();'''
+
+new = '''void AqlQueue::ProcessCompletions() {
+  if (!no_atomics_ || pending_completions_.empty()) return;
+
+  UpdateReadDispatchId();
+
+  // Phase 9: The last RPTR write from the CP may not have reached DRAM yet
+  // (PCIe posted write latency). When WPTR == RPTR but pending completions
+  // exist, the GPU has finished all work but the RPTR update is delayed.
+  // Resolve: if write_idx matches read_idx (queue drained), force-complete
+  // all pending signals.
+  {
+    uint64_t ri = atomic::Load(&amd_queue_.read_dispatch_id, std::memory_order_acquire);
+    uint64_t wi = atomic::Load(&amd_queue_.write_dispatch_id, std::memory_order_acquire);
+    if (!pending_completions_.empty() && ri < pending_completions_.back().complete_idx && ri >= wi) {
+      // Queue is drained (RPTR caught up to WPTR) but pending signals remain.
+      // The last RPTR PCIe write hasn't arrived yet. Force-advance read_dispatch_id.
+      atomic::Store(&amd_queue_.read_dispatch_id, wi, std::memory_order_release);
+      last_rptr_dwords_ = static_cast<uint32_t>((wi * 16) & ((amd_queue_.hsa_queue.size * 16) - 1));
+    }
+  }'''
+
+assert old in s, 'Could not find ProcessCompletions pattern'
+s = s.replace(old, new, 1)
+
 with open('$_aq', 'w') as f: f.write(s)
-print('OK: StoreRelaxed HDP flush added to amd_aql_queue.cpp')
+print('OK: StoreRelaxed HDP flush + ProcessCompletions RPTR retry added')
 "
 }
 
