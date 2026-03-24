@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=35
+pkgrel=36
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -591,6 +591,49 @@ assert old in s, 'small-BAR PUBLIC VRAM rejection not found'
 s = s.replace(old, new, 1)
 with open('$_kfd', 'w') as f: f.write(s)
 print('OK: Phase 13 small-BAR visible VRAM relaxed')
+"
+
+  # Phase 13 Fix 2: Report visible VRAM as a PUBLIC memory bank in topology.
+  # On small-BAR, kfd_crat.c reports ALL VRAM as one PRIVATE bank.
+  # Split into: PUBLIC bank (256MB visible) + PRIVATE bank (1.75GB invisible).
+  # This lets ROCR create a coarsegrain_allocator with HostAccess=1.
+  local _crat=drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+  python3 -c "
+with open('$_crat') as f: s = f.read()
+old = '''\telse
+\t\tret = kfd_fill_gpu_memory_affinity(&avail_size,
+\t\t\t\tkdev, HSA_MEM_HEAP_TYPE_FB_PRIVATE,
+\t\t\t\tlocal_mem_info.local_mem_size_public +
+\t\t\t\tlocal_mem_info.local_mem_size_private,
+\t\t\t\t(struct crat_subtype_memory *)sub_type_hdr,
+\t\t\t\tproximity_domain,
+\t\t\t\t&local_mem_info);'''
+new = '''\telse {
+\t\t/* Phase 13: split visible VRAM as PUBLIC bank so userspace
+\t\t * can allocate CPU-accessible VRAM (AQL ring buffers). */
+\t\tif (local_mem_info.local_mem_size_public > 0) {
+\t\t\tret = kfd_fill_gpu_memory_affinity(&avail_size,
+\t\t\t\t\tkdev, HSA_MEM_HEAP_TYPE_FB_PUBLIC,
+\t\t\t\t\tlocal_mem_info.local_mem_size_public,
+\t\t\t\t\t(struct crat_subtype_memory *)sub_type_hdr,
+\t\t\t\t\tproximity_domain,
+\t\t\t\t\t&local_mem_info);
+\t\t\tif (ret < 0)
+\t\t\t\treturn ret;
+\t\t\tsub_type_hdr = (typeof(sub_type_hdr))((char *)sub_type_hdr +
+\t\t\t\t\tsub_type_hdr->length);
+\t\t}
+\t\tret = kfd_fill_gpu_memory_affinity(&avail_size,
+\t\t\t\tkdev, HSA_MEM_HEAP_TYPE_FB_PRIVATE,
+\t\t\t\tlocal_mem_info.local_mem_size_private,
+\t\t\t\t(struct crat_subtype_memory *)sub_type_hdr,
+\t\t\t\tproximity_domain,
+\t\t\t\t&local_mem_info);
+\t}'''
+assert old in s, 'CRAT PRIVATE-only VRAM bank not found'
+s = s.replace(old, new, 1)
+with open('$_crat', 'w') as f: f.write(s)
+print('OK: Phase 13 visible VRAM reported as PUBLIC bank')
 "
 
   echo "Setting config..."
