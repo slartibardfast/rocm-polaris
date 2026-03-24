@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=36
+pkgrel=37
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -113,40 +113,9 @@ print('OK: Phase 8 barrier CPU-wait applied')
   # ROCR handles everything: creates one shared KFD event, sets event fields
   # on all BusyWaitSignals, and waits on the shared event in WaitRelaxed.
 
-  # Phase 7h-debug: Dump all GPU DMA target addresses on first dispatch.
-  # Check for overlap with AQL ring buffer address range.
-  python3 -c "
-with open('$_virt') as f: s = f.read()
-s = s.replace(
-    'Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);',
-    '''Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);''',
-    2)
-with open('$_virt', 'w') as f: f.write(s)
-print('OK: Phase 7h-debug address map dump added')
-"
-
-  # Phase 7h: HDP flush at entry to submitKernelInternal.
-  # Flushes HDP read cache for previous dispatch's system memory writes.
-  # Belt-and-suspenders with ROCR StoreRelaxed flush (which covers the
-  # current dispatch's writes at doorbell time).
-  python3 -c "
-with open('$_virt') as f: s = f.read()
-s = s.replace(
-    'bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const amd::Kernel& kernel,\n                                      const_address parameters, void* event_handle,\n                                      uint32_t sharedMemBytes, amd::NDRangeKernelCommand* vcmd,\n                                      hsa_kernel_dispatch_packet_t* aql_packet,\n                                      bool attach_signal) {\n  device::Kernel* devKernel',
-    '''bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const amd::Kernel& kernel,
-                                      const_address parameters, void* event_handle,
-                                      uint32_t sharedMemBytes, amd::NDRangeKernelCommand* vcmd,
-                                      hsa_kernel_dispatch_packet_t* aql_packet,
-                                      bool attach_signal) {
-  // Phase 7h: HDP read cache flush before dispatch on no-atomics platforms.
-  if (!roc_device_.info().pcie_atomics_) {
-    roc_device_.HdpFlushWait();
-  }
-  device::Kernel* devKernel''',
-    1)
-with open('$_virt', 'w') as f: f.write(s)
-print('OK: Phase 7h HDP flush in submitKernelInternal')
-"
+  # Phase 11a: HDP flush REMOVED from submitKernelInternal.
+  # Compute kernels read weights from VRAM and kernarg from fine-grain UC pool.
+  # Neither goes through HDP. Blit queues still get HDP flush via StoreRelaxed.
 
   # Phase 7g: CPU-verified drain before resource recycling.
   # On no-atomics, the CP's idle state with SLOT_BASED_WPTR=0 may lose track
@@ -253,35 +222,8 @@ with open('$_blit', 'w') as f: f.write(s)
 print('OK: Phase 7h force shader copy on no-atomics')
 "
 
-  # Phase 7h-debug: Verify AQL packet in ring buffer before doorbell.
-  # Read back the AQL packet from the ring AFTER struct copy + header write,
-  # BEFORE doorbell. If kernarg_address is wrong here, CLR wrote it wrong.
-  # If it's correct here but the kernel sees NULL, the corruption is post-write.
-  python3 -c "
-with open('$_virt') as f: s = f.read()
-s = s.replace(
-    'Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);',
-    '''// Phase 7h-debug: verify AQL packet before doorbell
-  if (!roc_device_.info().pcie_atomics_) {
-    auto* dbg_pkt = reinterpret_cast<hsa_kernel_dispatch_packet_t*>(
-        reinterpret_cast<char*>(gpu_queue_->base_address) + (index & (gpu_queue_->size - 1)) * 64);
-    volatile uint64_t dbg_ka = reinterpret_cast<volatile uint64_t*>(dbg_pkt)[5]; // offset 40 = kernarg_address
-    volatile uint16_t dbg_hdr = reinterpret_cast<volatile uint16_t*>(dbg_pkt)[0]; // offset 0 = header
-    if (dbg_ka == 0 && (dbg_hdr & 0xFF) != 0) {
-      static int dbg_count = 0;
-      if (++dbg_count <= 20)
-        fprintf(stderr, \"[AQL-BUG] slot=%lu hdr=0x%x kernarg_addr=0x%lx (NULL!) signal=0x%lx\\\\n\",
-                (unsigned long)(index & (gpu_queue_->size - 1)),
-                (unsigned)dbg_hdr,
-                (unsigned long)dbg_ka,
-                (unsigned long)reinterpret_cast<volatile uint64_t*>(dbg_pkt)[7]);
-    }
-  }
-  Hsa::signal_store_screlease(gpu_queue_->doorbell_signal, index);''',
-    1)
-with open('$_virt', 'w') as f: f.write(s)
-print('OK: Phase 7h-debug AQL packet verification added')
-"
+  # Phase 11b: AQL packet debug verification REMOVED (was Phase 7h-debug).
+  # Root cause found and fixed in kernel (TC_CFG L2 policy). No longer needed.
 
   # Phase 7h: Regular memcpy for kernarg on no-atomics platforms.
   # Non-temporal stores (NT) bypass CPU cache but have weaker ordering.
