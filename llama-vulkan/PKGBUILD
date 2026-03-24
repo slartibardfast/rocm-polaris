@@ -1,0 +1,55 @@
+# Maintainer: David Connolly <david@connol.ly>
+# Based on extra/llama.cpp PKGBUILD
+#
+# llama.cpp built with Vulkan for AMD GPUs (no ROCm dependency).
+# Best performance path for gfx803/Polaris on Westmere (no PCIe atomics).
+
+pkgname=llama-cpp-vulkan-polaris
+_upstream_pkgname=llama.cpp
+pkgver=b7376
+pkgrel=1
+pkgdesc='LLM inference in C/C++ with Vulkan GPU support'
+arch=('x86_64')
+url='https://github.com/ggml-org/llama.cpp'
+license=('MIT')
+depends=(
+  'curl'
+  'gcc-libs'
+  'glibc'
+  'vulkan-icd-loader'
+)
+makedepends=(
+  'cmake'
+  'git'
+  'vulkan-headers'
+  'shaderc'
+  'glslang'
+)
+provides=("llama.cpp=$pkgver")
+conflicts=('llama.cpp' 'llama-cpp-rocm-polaris')
+source=("$_upstream_pkgname-$pkgver::git+$url.git#tag=$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  local cmake_args=(
+    -Wno-dev
+    -S "$_upstream_pkgname-$pkgver"
+    -B build
+    -D CMAKE_BUILD_TYPE=Release
+    -D CMAKE_INSTALL_PREFIX=/usr
+    -D CMAKE_SKIP_RPATH=ON
+    -D GGML_VULKAN=ON
+    -D BUILD_SHARED_LIBS=ON
+    -D GGML_NATIVE=OFF
+    -D LLAMA_CURL=ON
+  )
+  cmake "${cmake_args[@]}"
+  cmake --build build -j$(nproc)
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+
+  install -Dm644 "$_upstream_pkgname-$pkgver/LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
