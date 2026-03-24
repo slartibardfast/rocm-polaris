@@ -516,14 +516,17 @@ new = '''void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
   if (no_atomics_) {
     uint64_t slot = value & (amd_queue_.hsa_queue.size - 1);
     if (vram_ring_buf_) {
-      // Copy 64-byte AQL packet from system ring to VRAM shadow.
-      // CP reads from VRAM (MQD points there). BAR write ~200ns.
+      // Copy AQL packet from system ring to VRAM shadow (header-last).
+      // CP reads from VRAM (MQD points there). VRAM BAR is WC-mapped,
+      // so writes can reorder within the 64-byte packet. Writing the
+      // header LAST ensures the CP never sees a valid header before
+      // the body is committed (AQL atomicity protocol).
       char* src = (char*)amd_queue_.hsa_queue.base_address + slot * 64;
       char* dst = (char*)vram_ring_buf_ + slot * 64;
-      memcpy(dst, src, 64);
-      // sfence flushes WC buffer (BAR mapped write-combining).
-      // PCIe downstream ordering: packet arrives before doorbell.
-      _mm_sfence();
+      memcpy(dst + 4, src + 4, 60);  // body first (bytes 4-63)
+      _mm_sfence();                    // commit body to VRAM
+      memcpy(dst, src, 4);            // header last (bytes 0-3)
+      _mm_sfence();                    // commit header before doorbell
     } else {
       // System memory only: readback forces IOH to commit DRAM write.
       volatile uint32_t* pkt = (volatile uint32_t*)(
