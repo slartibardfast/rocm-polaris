@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=36
+pkgrel=37
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -456,30 +456,82 @@ print('OK: hsa_amd_hdp_flush_wait C wrapper added to table interface')
   sed -i '/^local:/i\	hsa_amd_hdp_flush_wait;' "$_def"
 
 
-  # --- Phase 7h Layer 5: StoreRelaxed HDP flush before doorbell ---
-  # On no-atomics platforms, flush HDP before writing the doorbell so
-  # the GPU sees fresh kernarg/ring data.  Recursion guard prevents
-  # HdpFlushWait → ioctl → signal wait → StoreRelaxed → HdpFlushWait loop.
+  # --- Phase 13: Double-buffered AQL ring (system memory + VRAM shadow) ---
+  # CP reads from VRAM (fast local GDDR5 ~100ns) instead of system memory
+  # (slow PCIe 2.0 ~500ns).  CPU writes to system memory ring (fast UC),
+  # ScanNewPackets reads from system memory (fast).  StoreRelaxed copies
+  # the 64-byte packet to VRAM shadow via BAR before doorbell.
+  #
+  # Phase 13-1: Initialize vram_ring_buf_ and allocate VRAM shadow.
+  sed -i 's/rptr_gpu_buf_(nullptr),/rptr_gpu_buf_(nullptr),\n      vram_ring_buf_(nullptr),/' "$_aq"
+
   python3 -c "
 with open('$_aq') as f: s = f.read()
 
-# Find StoreRelaxed and inject HDP flush after ScanNewPackets
+# Allocate VRAM shadow ring after system memory ring, wire MQD to VRAM.
+s = s.replace(
+    '  // Zero the amd_queue_ structure to clear RPTR/WPTR before queue attach.',
+    '''  // Phase 13: Allocate VRAM shadow ring for fast GPU-local packet reads.
+  vram_ring_buf_ = nullptr;
+  if (no_atomics_ && agent_->LargeBarEnabled()) {
+    vram_ring_buf_ = agent_->coarsegrain_allocator()(
+        ring_buf_alloc_bytes_,
+        core::MemoryRegion::AllocateExecutable);
+    if (vram_ring_buf_) {
+      for (uint32_t i = 0; i < queue_size_pkts; ++i)
+        (((core::AqlPacket*)vram_ring_buf_)[i]).dispatch.header = HSA_PACKET_TYPE_INVALID;
+    }
+  }
+
+  // Zero the amd_queue_ structure to clear RPTR/WPTR before queue attach.''',
+    1)
+
+# Pass vram_ring_buf_ to CreateQueue (MQD) if available, else system ring.
+# CP reads from MQD ring base. If VRAM, CP reads local memory (fast).
+s = s.replace(
+    'ring_buf_,\n                                    ring_buf_alloc_bytes_, queue_event(), queue_rsrc);',
+    '(vram_ring_buf_ ? vram_ring_buf_ : ring_buf_),\n                                    ring_buf_alloc_bytes_, queue_event(), queue_rsrc);',
+    1)
+s = s.replace(
+    'ring_buf_, ring_buf_alloc_bytes_, NULL, queue_rsrc);',
+    '(vram_ring_buf_ ? vram_ring_buf_ : ring_buf_), ring_buf_alloc_bytes_, NULL, queue_rsrc);',
+    1)
+
+with open('$_aq', 'w') as f: f.write(s)
+print('OK: Phase 13 VRAM shadow ring allocation')
+"
+
+  # Phase 13-2: StoreRelaxed — double-buffer copy + conditional pkt[15].
+  python3 -c "
+with open('$_aq') as f: s = f.read()
+
 old = 'void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {\n  ScanNewPackets();'
 new = '''void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
+  // Phase 13: sfence before ScanNewPackets to flush WC buffer (for VRAM ring)
+  // and drain UC store buffer (for system ring). Harmless on either path.
+  if (no_atomics_) _mm_sfence();
   ScanNewPackets();
 
-  // Phase 10: IOH write ordering + conditional HDP flush for no-atomics.
-  // Readback forces IOH to commit pending DRAM writes before doorbell.
-  // HDP flush only on small (blit/utility) queues where kernels read system
-  // memory. Skip on large compute queues (16K slots) where kernels read VRAM.
+  // Phase 13: Double-buffered AQL ring for no-atomics.
   if (no_atomics_) {
     uint64_t slot = value & (amd_queue_.hsa_queue.size - 1);
-    volatile uint32_t* pkt = (volatile uint32_t*)(
-        (char*)amd_queue_.hsa_queue.base_address + slot * 64);
-    (void)pkt[15];
+    if (vram_ring_buf_) {
+      // Copy 64-byte AQL packet from system ring to VRAM shadow.
+      // CP reads from VRAM (MQD points there). BAR write ~200ns.
+      char* src = (char*)amd_queue_.hsa_queue.base_address + slot * 64;
+      char* dst = (char*)vram_ring_buf_ + slot * 64;
+      memcpy(dst, src, 64);
+      // sfence flushes WC buffer (BAR mapped write-combining).
+      // PCIe downstream ordering: packet arrives before doorbell.
+      _mm_sfence();
+    } else {
+      // System memory only: readback forces IOH to commit DRAM write.
+      volatile uint32_t* pkt = (volatile uint32_t*)(
+          (char*)amd_queue_.hsa_queue.base_address + slot * 64);
+      (void)pkt[15];
+    }
 
-    // Blit/utility queues are small (64 slots). Compute queues are large (16K).
-    // Only flush HDP for blit queues where the kernel reads from system memory.
+    // Blit/utility queues (<=256 slots): HDP flush for system memory reads.
     if (amd_queue_.hsa_queue.size <= 256) {
       static thread_local bool in_hdp_flush = false;
       if (!in_hdp_flush) {
@@ -610,7 +662,10 @@ old = '  static void ProcessAllBounceBuffers();'
 new = '''  static void ProcessAllBounceBuffers();
 
   /// Phase 10: Shared EOP event for interrupt-driven completion.
-  static void* GetSharedEopEvent();'''
+  static void* GetSharedEopEvent();
+
+  /// Phase 13: VRAM shadow of AQL ring for fast GPU-local packet reads.
+  void* vram_ring_buf_;'''
 assert old in s, 'ProcessAllBounceBuffers declaration not found'
 s = s.replace(old, new, 1)
 with open('$_aqh', 'w') as f: f.write(s)

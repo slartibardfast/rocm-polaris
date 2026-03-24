@@ -1,0 +1,35 @@
+# KFD: allow CPU-visible VRAM allocations on small-BAR systems
+#
+# KFD rejects PUBLIC|VRAM allocations on small-BAR systems as a safety
+# guard.  But small allocations (like AQL ring buffers, ~1MB) easily fit
+# in the visible window (256MB BAR on Polaris 12).  Relax the check to
+# allow PUBLIC VRAM when the allocation fits within visible_vram_size.
+#
+# This enables VRAM-based AQL ring buffers on gfx803 without PCIe atomics,
+# letting the CP read packets from local GDDR5 (~100ns) instead of system
+# memory via PCIe 2.0 (~500ns).
+#
+# Signed-off-by: David Connolly <david@connol.ly>
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1203,8 +1203,14 @@
+ 	if ((flags & KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC) &&
+ 		(flags & KFD_IOC_ALLOC_MEM_FLAGS_VRAM) &&
+ 		!kfd_dev_is_large_bar(dev)) {
+-		pr_err("Alloc host visible vram on small bar is not allowed\n");
+-		err = -EINVAL;
+-		goto err_large_bar;
++		/* Allow if allocation fits in the visible VRAM window.
++		 * CPU_ACCESS_REQUIRED (set by PUBLIC flag) ensures the BO
++		 * is placed within the BAR aperture by amdgpu_bo_create.
++		 */
++		if (args->size > dev->local_mem_info.local_mem_size_public) {
++			pr_err("Alloc host visible vram (%llu) exceeds visible window (%llu)\n",
++				args->size, dev->local_mem_info.local_mem_size_public);
++			err = -EINVAL;
++			goto err_large_bar;
++		}
+ 	}
+
+ 	pdd = kfd_bind_process_to_device(dev, p);
