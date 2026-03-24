@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=36
+pkgrel=37
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -560,6 +560,18 @@ s = s.replace(pq_old, pq_new, 1)
 with open('$_mqd_vi', 'w') as f: f.write(s)
 print('OK: DISPATCH_CACHE_CNTL=1 + PQ CACHE_POLICY=1 set for no-atomics')
 "
+
+  # Phase 13: DOORBELL_BIF_DROP — GPU BIF deduplicates repeated doorbell writes.
+  # Reduces PCIe write contention on slow PCIe 2.0 link. Zero risk.
+  sed -i '/CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT;/{
+    a\
+\tm->cp_hqd_pq_doorbell_control |=\
+\t\t1 << CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_BIF_DROP__SHIFT;
+  }' "$_mqd_vi"
+
+  # Phase 13: IQ_TIMER WAIT_TIME — CP sleeps ~128 cycles between packet checks
+  # instead of busy-waiting. Reduces power and dispatch latency jitter.
+  sed -i '/mtype << CP_HQD_IQ_TIMER__MTYPE__SHIFT;/s/;/\n\t\t\t| 0x80;/' "$_mqd_vi"
 
   # Phase 13: Allow CPU-visible VRAM allocations on small-BAR systems.
   # KFD rejects PUBLIC|VRAM on small BAR as a safety guard, but small
