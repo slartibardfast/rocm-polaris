@@ -8,7 +8,7 @@
 pkgname=hip-runtime-amd-polaris
 _pkgname=hip-runtime-amd
 pkgver=7.2.0
-pkgrel=35
+pkgrel=36
 pkgdesc='HIP runtime (AMD) with non-coherent platform D2H fix'
 arch=('x86_64')
 url='https://github.com/ROCm/clr'
@@ -89,14 +89,14 @@ with open('$_virt') as f: s = f.read()
 old = 'void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,\n                                       hsa_signal_t signal) {\n  const uint32_t queueSize = gpu_queue_->size;'
 new = '''void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
                                        hsa_signal_t signal) {
-  // Phase 8: CPU-wait all barrier dep signals on no-atomics platforms.
-  // Without this, the CP stalls permanently on unsatisfied deps.
+  // Phase 8/10: CPU-wait all barrier dep signals on no-atomics platforms.
+  // Must use hsa_signal_wait (not raw load+yield) so ROCR's
+  // ProcessAllBounceBuffers runs and decrements the signal.
   if (!dev().info().pcie_atomics_) {
     for (int j = 0; j < 5; j++) {
       if (barrier_packet_.dep_signal[j].handle != 0) {
-        while (hsa_signal_load_relaxed(barrier_packet_.dep_signal[j]) > 0) {
-          amd::Os::yield();
-        }
+        hsa_signal_wait_scacquire(barrier_packet_.dep_signal[j],
+            HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
         hsa_signal_t zero_sig; zero_sig.handle = 0;
         barrier_packet_.dep_signal[j] = zero_sig;
       }
@@ -109,51 +109,9 @@ with open('$_virt', 'w') as f: f.write(s)
 print('OK: Phase 8 barrier CPU-wait applied')
 "
 
-  # Phase 10: Create InterruptSignal (not BusyWaitSignal) on no-atomics platforms.
-  # InterruptSignal has a KFD event that fires on EOP interrupt from the CP.
-  # This replaces the entire polling loop with interrupt-driven wakeup.
-  # The key: pass num_consumers=1 so ROCR creates InterruptSignal, not DefaultSignal.
-  python3 -c "
-with open('$_virt') as f: s = f.read()
-# In the interrupt path of CreateSignal, change signal_create to pass
-# num_consumers=1 with the GPU agent when on no-atomics platforms.
-# This forces ROCR to create InterruptSignal instead of BusyWaitSignal.
-old = '''  if (interrupt && settings.system_scope_signal_) {
-    if (HSA_STATUS_SUCCESS != Hsa::signal_create(0, 0, nullptr, &signal->signal_)) {
-      return false;
-    }'''
-new = '''  if (interrupt && settings.system_scope_signal_) {
-    // Phase 10: Pass num_consumers=1 with GPU agent to create InterruptSignal.
-    // With num_consumers=0, ROCR creates BusyWaitSignal (tight polling loop).
-    // With num_consumers=1, ROCR creates InterruptSignal (KFD event + EOP interrupt).
-    hsa_agent_t gpu_agent = gpu_.dev().getBackendDevice();
-    if (HSA_STATUS_SUCCESS != Hsa::signal_create(0, 1, &gpu_agent, &signal->signal_)) {
-      return false;
-    }'''
-assert old in s, 'CreateSignal interrupt path not found'
-s = s.replace(old, new, 1)
-with open('$_virt', 'w') as f: f.write(s)
-print('OK: Phase 10 InterruptSignal with num_consumers=1 applied')
-"
-
-  # Phase 10 (cont): Force interrupt=true for all signals on no-atomics platforms.
-  # This ensures CreateSignal takes the InterruptSignal path (not GPU_ONLY path).
-  python3 -c "
-with open('$_virt') as f: s = f.read()
-old = '''    if ((signal == nullptr) || !CreateSignal(signal.get())) {
-      return false;
-    }
-    signal_list_[i] = signal.release();'''
-new = '''    bool use_irq = !gpu_.dev().info().pcie_atomics_;
-    if ((signal == nullptr) || !CreateSignal(signal.get(), use_irq)) {
-      return false;
-    }
-    signal_list_[i] = signal.release();'''
-assert old in s, 'HwQueueTracker::Create CreateSignal pattern not found'
-s = s.replace(old, new, 1)
-with open('$_virt', 'w') as f: f.write(s)
-print('OK: Phase 10 interrupt=true for no-atomics signal pool applied')
-"
+  # Phase 10: Shared EOP event approach — no CLR changes needed.
+  # ROCR handles everything: creates one shared KFD event, sets event fields
+  # on all BusyWaitSignals, and waits on the shared event in WaitRelaxed.
 
   # Phase 7h-debug: Dump all GPU DMA target addresses on first dispatch.
   # Check for overlap with AQL ring buffer address range.

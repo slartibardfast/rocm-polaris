@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=32
+pkgrel=34
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -123,9 +123,9 @@ INJECT
     r /tmp/_blit_cpuwait.c
   }' "$_blit"
 
-  # Phase 6c: Re-enable interrupt-based signal wait.
-  local _rt=runtime/hsa-runtime/core/runtime/runtime.cpp
-  sed -i '/g_use_interrupt_wait = false;/d' "$_rt"
+  # Phase 6c: Keep g_use_interrupt_wait=false for no-atomics (patch 0004).
+  # Phase 10 injects shared EOP event wait into BusyWaitSignal::WaitRelaxed,
+  # so all signals remain BusyWaitSignal (no InterruptSignal event pool pressure).
   local _isig=runtime/hsa-runtime/core/runtime/interrupt_signal.cpp
   sed -i '/#include "core\/inc\/interrupt_signal.h"/a\
 #include "core/inc/amd_aql_queue.h"' "$_isig"
@@ -505,22 +505,19 @@ new = '''void AqlQueue::ProcessCompletions() {
 
   UpdateReadDispatchId();
 
-  // Phase 9: Force IOH to flush pending GPU PCIe posted writes (RPTR updates).
-  // Only flush ONCE per stall — avoid repeated MMIO reads in tight poll loops.
+  // Phase 9/10: Force IOH to flush pending GPU PCIe posted writes (RPTR updates).
+  // Phase 10 uses event-based sleep, so ProcessCompletions is called infrequently
+  // (~1/ms on timeout, or once per dispatch on interrupt). Unconditional readback is safe.
   if (rptr_gpu_buf_ && !pending_completions_.empty()) {
     uint64_t ri = atomic::Load(&amd_queue_.read_dispatch_id, std::memory_order_acquire);
     if (ri < pending_completions_.front().complete_idx) {
-      // Flush IOH with doorbell readback, but only if we haven't already.
-      static thread_local uint64_t last_flush_id = 0;
-      if (ri != last_flush_id) {
-        last_flush_id = ri;
-        if (legacy_doorbell_) {
-          volatile uint32_t dummy = *(volatile uint32_t*)(signal_.hardware_doorbell_ptr);
-          (void)dummy;
-        }
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        UpdateReadDispatchId();
+      if (legacy_doorbell_) {
+        volatile uint32_t dummy = *(volatile uint32_t*)(signal_.hardware_doorbell_ptr);
+        (void)dummy;
       }
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      UpdateReadDispatchId();
+
       // Force-advance when queue is fully drained but completions remain.
       ri = atomic::Load(&amd_queue_.read_dispatch_id, std::memory_order_acquire);
       uint64_t wi = atomic::Load(&amd_queue_.write_dispatch_id, std::memory_order_acquire);
@@ -538,8 +535,111 @@ with open('$_aq', 'w') as f: f.write(s)
 print('OK: StoreRelaxed HDP flush + ProcessCompletions RPTR retry added')
 "
 
-  # Phase 10: sched_yield removed — with HDP flush gone, polling is fast enough.
-  # EOP interrupt-driven completion (Step 1-3) will be added here when ready.
+  # Phase 10: Interrupt-driven signal completion for no-atomics platforms.
+  # ONE shared KFD event per process. Sentinel signal carries the event's ID.
+  # ScanNewPackets replaces each AQL packet's completion_signal with the sentinel.
+  # CP fires EOP interrupt (IH ring DMA) on ANY dispatch completion.
+  # BusyWaitSignal::WaitRelaxed sleeps on the shared event instead of tight polling.
+  local _aqh=runtime/hsa-runtime/core/inc/amd_aql_queue.h
+  local _ds=runtime/hsa-runtime/core/runtime/default_signal.cpp
+
+  # 10a: Shared EOP event infrastructure in AqlQueue (statics, init, sentinel).
+  python3 -c "
+with open('$_aq') as f: s = f.read()
+
+# Add includes for DefaultSignal and InterruptSignal::CreateEvent
+s = s.replace(
+    '#include \"core/inc/amd_aql_queue.h\"',
+    '#include \"core/inc/amd_aql_queue.h\"\n#include \"core/inc/default_signal.h\"\n#include \"core/inc/interrupt_signal.h\"',
+    1)
+
+# Add static shared event + sentinel after bounce_queues_
+old = 'std::vector<AqlQueue*> AqlQueue::bounce_queues_;'
+new = '''std::vector<AqlQueue*> AqlQueue::bounce_queues_;
+
+// Phase 10: Shared KFD event for interrupt-driven signal completion.
+// One event per process. Any dispatch completion fires it via EOP interrupt.
+static HsaEvent* shared_eop_event = nullptr;
+static hsa_signal_t sentinel_signal = {0};
+
+void* AqlQueue::GetSharedEopEvent() { return shared_eop_event; }'''
+assert old in s, 'bounce_queues_ static not found'
+s = s.replace(old, new, 1)
+
+# Initialize shared event in constructor (inside bounce_list_lock_ scope)
+old2 = 'bounce_queues_.push_back(this);'
+new2 = '''bounce_queues_.push_back(this);
+    // Phase 10: Create shared EOP event + sentinel on first no-atomics queue.
+    if (!shared_eop_event) {
+      shared_eop_event = core::InterruptSignal::CreateEvent(HSA_EVENTTYPE_SIGNAL, false);
+      if (shared_eop_event) {
+        core::Signal* sentinel = new core::DefaultSignal(INT64_MAX, false);
+        sentinel_signal = core::Signal::Convert(sentinel);
+        amd_signal_t* abi = reinterpret_cast<amd_signal_t*>(sentinel_signal.handle);
+        abi->event_id = shared_eop_event->EventId;
+        abi->event_mailbox_ptr = (uint64_t)shared_eop_event->EventData.HWData2;
+      }
+    }'''
+assert old2 in s, 'bounce_queues_.push_back not found'
+s = s.replace(old2, new2, 1)
+
+# Replace completion_signal with sentinel in ScanNewPackets
+old3 = '      pending_completions_.push_back({idx + 1, sig});\n    }'
+new3 = '''      pending_completions_.push_back({idx + 1, sig});
+      // Phase 10: Replace with sentinel so CP fires shared EOP event.
+      if (sentinel_signal.handle != 0) {
+        hsa_signal_t* sig_slot = reinterpret_cast<hsa_signal_t*>(
+            const_cast<char*>(ring_base) + slot * 64 + 56);
+        *sig_slot = sentinel_signal;
+      }
+    }'''
+assert old3 in s, 'pending_completions_.push_back pattern not found'
+s = s.replace(old3, new3, 1)
+
+with open('$_aq', 'w') as f: f.write(s)
+print('OK: Phase 10 shared EOP event in amd_aql_queue.cpp')
+"
+
+  # 10b: Add GetSharedEopEvent declaration to AqlQueue header.
+  python3 -c "
+with open('$_aqh') as f: s = f.read()
+old = '  static void ProcessAllBounceBuffers();'
+new = '''  static void ProcessAllBounceBuffers();
+
+  /// Phase 10: Shared EOP event for interrupt-driven completion.
+  static void* GetSharedEopEvent();'''
+assert old in s, 'ProcessAllBounceBuffers declaration not found'
+s = s.replace(old, new, 1)
+with open('$_aqh', 'w') as f: f.write(s)
+print('OK: Phase 10 GetSharedEopEvent declaration added')
+"
+
+  # 10c: Add thunk include + shared event wait to BusyWaitSignal::WaitRelaxed.
+  sed -i '/#include "core\/inc\/default_signal.h"/a\
+#include "hsakmt\/hsakmt.h"' "$_ds"
+
+  python3 -c "
+with open('$_ds') as f: s = f.read()
+old = '''    if (g_use_mwaitx) {
+      // Use timer-enabled mwaitx for busy waiting
+      timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), 60000, true);
+    }'''
+new = '''    // Phase 10: Sleep on shared EOP event instead of tight polling.
+    // When any dispatch completes, CP fires the shared event via IH ring.
+    {
+      HsaEvent* eop = static_cast<HsaEvent*>(AMD::AqlQueue::GetSharedEopEvent());
+      if (eop) {
+        uint64_t ev_age = 0;
+        (void)hsaKmtWaitOnEvent_Ext(eop, 1, &ev_age);
+      } else if (g_use_mwaitx) {
+        timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), 60000, true);
+      }
+    }'''
+assert old in s, 'mwaitx polling pattern not found in WaitRelaxed'
+s = s.replace(old, new, 1)
+with open('$_ds', 'w') as f: f.write(s)
+print('OK: Phase 10 shared event wait in BusyWaitSignal::WaitRelaxed')
+"
 }
 
 build() {
