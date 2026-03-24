@@ -471,15 +471,29 @@ with open('$_aq') as f: s = f.read()
 # Allocate VRAM shadow ring after system memory ring, wire MQD to VRAM.
 s = s.replace(
     '  // Zero the amd_queue_ structure to clear RPTR/WPTR before queue attach.',
-    '''  // Phase 13: Allocate VRAM shadow ring for fast GPU-local packet reads.
+    '''  // Phase 13: Allocate VRAM shadow from PUBLIC VRAM region (visible BAR).
+  // coarsegrain_allocator() picks the PRIVATE pool (last enumerated).
+  // Explicitly find the PUBLIC coarse-grain VRAM region with HostAccess.
   vram_ring_buf_ = nullptr;
-  if (no_atomics_ && agent_->LargeBarEnabled()) {
-    vram_ring_buf_ = agent_->coarsegrain_allocator()(
-        ring_buf_alloc_bytes_,
-        core::MemoryRegion::AllocateExecutable);
-    if (vram_ring_buf_) {
-      for (uint32_t i = 0; i < queue_size_pkts; ++i)
-        (((core::AqlPacket*)vram_ring_buf_)[i]).dispatch.header = HSA_PACKET_TYPE_INVALID;
+  if (no_atomics_ && queue_size_pkts > 256) {
+    // Only for large compute queues. Blit queues (64 slots) need system
+    // memory ring for HDP flush coherency during weight copies.
+    for (auto region : agent_->regions()) {
+      const AMD::MemoryRegion* amd_r = static_cast<const AMD::MemoryRegion*>(region);
+      if (amd_r->IsLocalMemory() &&
+          !amd_r->fine_grain() && !amd_r->extended_scope_fine_grain() &&
+          amd_r->mem_flags().ui32.HostAccess) {
+        void* ptr = nullptr;
+        if (HSA_STATUS_SUCCESS == core::Runtime::runtime_singleton_->AllocateMemory(
+                region, ring_buf_alloc_bytes_,
+                core::MemoryRegion::AllocateExecutable, &ptr) && ptr) {
+          vram_ring_buf_ = ptr;
+          for (uint32_t i = 0; i < queue_size_pkts; ++i)
+            (((core::AqlPacket*)vram_ring_buf_)[i]).dispatch.header = HSA_PACKET_TYPE_INVALID;
+          _mm_sfence();
+        }
+        break;
+      }
     }
   }
 
