@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=34
+pkgrel=35
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -559,6 +559,38 @@ s = s.replace(pq_old, pq_new, 1)
 
 with open('$_mqd_vi', 'w') as f: f.write(s)
 print('OK: DISPATCH_CACHE_CNTL=1 + PQ CACHE_POLICY=1 set for no-atomics')
+"
+
+  # Phase 13: Allow CPU-visible VRAM allocations on small-BAR systems.
+  # KFD rejects PUBLIC|VRAM on small BAR as a safety guard, but small
+  # allocations (AQL ring ~1MB) easily fit in the 256MB visible window.
+  # Relax to a size check: allow if it fits in visible_vram_size.
+  python3 -c "
+with open('$_kfd') as f: s = f.read()
+old = '''if ((flags & KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC) &&
+\t\t(flags & KFD_IOC_ALLOC_MEM_FLAGS_VRAM) &&
+\t\t!kfd_dev_is_large_bar(dev)) {
+\t\tpr_err(\"Alloc host visible vram on small bar is not allowed\\\n\");
+\t\terr = -EINVAL;
+\t\tgoto err_large_bar;
+\t}'''
+new = '''if ((flags & KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC) &&
+\t\t(flags & KFD_IOC_ALLOC_MEM_FLAGS_VRAM) &&
+\t\t!kfd_dev_is_large_bar(dev)) {
+\t\t/* Phase 13: allow if allocation fits in visible VRAM window.
+\t\t * CPU_ACCESS_REQUIRED (set by PUBLIC) ensures BO placement
+\t\t * within BAR aperture via amdgpu_bo_create. */
+\t\tif (args->size > dev->local_mem_info.local_mem_size_public) {
+\t\t\tpr_err(\"Alloc host visible vram (%llu) exceeds visible window (%llu)\\\n\",
+\t\t\t\targs->size, dev->local_mem_info.local_mem_size_public);
+\t\t\terr = -EINVAL;
+\t\t\tgoto err_large_bar;
+\t\t}
+\t}'''
+assert old in s, 'small-BAR PUBLIC VRAM rejection not found'
+s = s.replace(old, new, 1)
+with open('$_kfd', 'w') as f: f.write(s)
+print('OK: Phase 13 small-BAR visible VRAM relaxed')
 "
 
   echo "Setting config..."
