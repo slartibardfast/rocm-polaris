@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=31
+pkgrel=32
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -465,27 +465,25 @@ old = 'void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {\n  ScanNewPackets
 new = '''void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
   ScanNewPackets();
 
-  // Phase 7h: Drain IOH + flush HDP before doorbell on no-atomics platforms.
-  //
-  // On Westmere (PCIe 2.0), the IOH can deliver the doorbell write (PCIe
-  // MMIO) to the GPU before prior DRAM writes (kernarg, AQL packet) have
-  // committed.  The GPU starts the dispatch and reads partial data.
-  //
-  // Fix: readback from the AQL ring slot to force the IOH to commit ALL
-  // pending DRAM writes for this address range before the doorbell write.
-  // Also flush HDP read cache (separate buffer below L2).
+  // Phase 10: IOH write ordering + conditional HDP flush for no-atomics.
+  // Readback forces IOH to commit pending DRAM writes before doorbell.
+  // HDP flush only on small (blit/utility) queues where kernels read system
+  // memory. Skip on large compute queues (16K slots) where kernels read VRAM.
   if (no_atomics_) {
-    // Readback + HDP flush
     uint64_t slot = value & (amd_queue_.hsa_queue.size - 1);
     volatile uint32_t* pkt = (volatile uint32_t*)(
         (char*)amd_queue_.hsa_queue.base_address + slot * 64);
     (void)pkt[15];
 
-    static thread_local bool in_hdp_flush = false;
-    if (!in_hdp_flush) {
-      in_hdp_flush = true;
-      agent_->HdpFlushWait(10000);
-      in_hdp_flush = false;
+    // Blit/utility queues are small (64 slots). Compute queues are large (16K).
+    // Only flush HDP for blit queues where the kernel reads from system memory.
+    if (amd_queue_.hsa_queue.size <= 256) {
+      static thread_local bool in_hdp_flush = false;
+      if (!in_hdp_flush) {
+        in_hdp_flush = true;
+        agent_->HdpFlushWait(10000);
+        in_hdp_flush = false;
+      }
     }
   }'''
 
@@ -540,36 +538,8 @@ with open('$_aq', 'w') as f: f.write(s)
 print('OK: StoreRelaxed HDP flush + ProcessCompletions RPTR retry added')
 "
 
-  # Phase 9b: Add sched_yield to BusyWaitSignal polling loop on non-mwaitx CPUs.
-  # Without this, the loop runs millions of iterations per dispatch burning 100% CPU.
-  # sched_yield gives other threads a chance and reduces poll rate to ~100K/s.
-  local _ds=runtime/hsa-runtime/core/runtime/default_signal.cpp
-  python3 -c "
-with open('$_ds') as f: s = f.read()
-old = '''    if (g_use_mwaitx) {
-      // Use timer-enabled mwaitx for busy waiting
-      timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), 60000, true);
-    }
-  }
-}'''
-new = '''    if (g_use_mwaitx) {
-      // Use timer-enabled mwaitx for busy waiting
-      timer::DoMwaitx(const_cast<int64_t*>(&signal_.value), 60000, true);
-    } else {
-      // Phase 9b: On non-AMD CPUs (no mwaitx), yield to avoid 100% CPU burn.
-      // PCIe posted writes for RPTR take microseconds; tight polling wastes cycles.
-      sched_yield();
-    }
-  }
-}'''
-assert old in s, 'BusyWaitSignal mwaitx pattern not found'
-s = s.replace(old, new, 1)
-# Add sched.h include
-if '#include <sched.h>' not in s:
-    s = '#include <sched.h>\n' + s
-with open('$_ds', 'w') as f: f.write(s)
-print('OK: Phase 9b sched_yield in BusyWaitSignal polling loop added')
-"
+  # Phase 10: sched_yield removed — with HDP flush gone, polling is fast enough.
+  # EOP interrupt-driven completion (Step 1-3) will be added here when ready.
 }
 
 build() {
