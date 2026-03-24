@@ -7,7 +7,7 @@
 pkgname=hsa-rocr-polaris
 _pkgname=hsa-rocr
 pkgver=7.2.0
-pkgrel=34
+pkgrel=36
 pkgdesc='HSA Runtime API and runtime for ROCm (with GCN 1.2/gfx8 support)'
 arch=('x86_64')
 url='https://github.com/ROCm/rocm-systems'
@@ -123,9 +123,12 @@ INJECT
     r /tmp/_blit_cpuwait.c
   }' "$_blit"
 
-  # Phase 6c: Keep g_use_interrupt_wait=false for no-atomics (patch 0004).
-  # Phase 10 injects shared EOP event wait into BusyWaitSignal::WaitRelaxed,
-  # so all signals remain BusyWaitSignal (no InterruptSignal event pool pressure).
+  # Phase 12: Prevent async event threads from burning CPU in tight polling.
+  # On no-atomics, queue error signals are BusyWaitSignal (no EOP event).
+  # ROCR's async event loop falls back to tight polling, burning 2 cores.
+  # Fix: add usleep(1000) to the polling fallback path.
+  local _rt=runtime/hsa-runtime/core/runtime/runtime.cpp
+  sed -i '/if (interrupt_wait) {/{n;s/WaitForInterrupt();/WaitForInterrupt();\n        } else {\n          usleep(1000);/}' "$_rt"
   local _isig=runtime/hsa-runtime/core/runtime/interrupt_signal.cpp
   sed -i '/#include "core\/inc\/interrupt_signal.h"/a\
 #include "core/inc/amd_aql_queue.h"' "$_isig"
