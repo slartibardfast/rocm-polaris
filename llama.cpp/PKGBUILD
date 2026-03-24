@@ -6,8 +6,8 @@
 
 pkgname=llama-cpp-rocm-polaris
 _upstream_pkgname=llama.cpp
-pkgver=b7376
-pkgrel=7
+pkgver=b8508
+pkgrel=1
 pkgdesc='LLM inference in C/C++ with ROCm GPU support (gfx803)'
 arch=('x86_64')
 url='https://github.com/ggml-org/llama.cpp'

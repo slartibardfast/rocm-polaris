@@ -6,7 +6,7 @@
 
 pkgname=llama-cpp-vulkan-polaris
 _upstream_pkgname=llama.cpp
-pkgver=b7376
+pkgver=b8508
 pkgrel=1
 pkgdesc='LLM inference in C/C++ with Vulkan GPU support'
 arch=('x86_64')
