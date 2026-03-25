@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=37
+pkgrel=38
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -569,9 +569,9 @@ print('OK: DISPATCH_CACHE_CNTL=1 + PQ CACHE_POLICY=1 set for no-atomics')
 \t\t1 << CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_BIF_DROP__SHIFT;
   }' "$_mqd_vi"
 
-  # Phase 13: IQ_TIMER WAIT_TIME — CP sleeps ~128 cycles between packet checks
-  # instead of busy-waiting. Reduces power and dispatch latency jitter.
-  sed -i '/mtype << CP_HQD_IQ_TIMER__MTYPE__SHIFT;/s/;/\n\t\t\t| 0x80;/' "$_mqd_vi"
+  # Phase 13: IQ_TIMER WAIT_TIME — REVERTED. Setting WAIT_TIME=0x80 caused
+  # CP to stall on gfx8/no-atomics (dispatch hangs). CP busy-wait (default 0)
+  # is required for timely packet processing on this hardware.
 
   # Phase 13: Allow CPU-visible VRAM allocations on small-BAR systems.
   # KFD rejects PUBLIC|VRAM on small BAR as a safety guard, but small
