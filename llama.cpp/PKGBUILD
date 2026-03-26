@@ -7,7 +7,7 @@
 pkgname=llama-cpp-rocm-polaris
 _upstream_pkgname=llama.cpp
 pkgver=b8508
-pkgrel=1
+pkgrel=2
 pkgdesc='LLM inference in C/C++ with ROCm GPU support (gfx803)'
 arch=('x86_64')
 url='https://github.com/ggml-org/llama.cpp'
@@ -37,6 +37,12 @@ build() {
   export HIPCXX=/opt/rocm/lib/llvm/bin/amdclang++
   export HIP_PATH=/opt/rocm
 
+  # Phase 15: Override Arch's -march=x86-64 with native Westmere.
+  # Enables SSE4.2 + SSSE3 for CPU-side ops (sampling, graph sched).
+  # -ffast-math enables auto-vectorization of reduction loops.
+  export CFLAGS="${CFLAGS//-march=x86-64/-march=native} -ffast-math"
+  export CXXFLAGS="${CXXFLAGS//-march=x86-64/-march=native} -ffast-math"
+
   local cmake_args=(
     -Wno-dev
     -S "$_upstream_pkgname-$pkgver"
@@ -47,7 +53,7 @@ build() {
     -D GGML_HIP=ON
     -D AMDGPU_TARGETS=gfx803
     -D BUILD_SHARED_LIBS=ON
-    -D GGML_NATIVE=OFF
+    -D GGML_NATIVE=ON
     -D LLAMA_CURL=ON
   )
   cmake "${cmake_args[@]}"
