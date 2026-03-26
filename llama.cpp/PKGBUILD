@@ -40,8 +40,8 @@ build() {
   # Phase 15: Override Arch's -march=x86-64 with native Westmere.
   # Enables SSE4.2 + SSSE3 for CPU-side ops (sampling, graph sched).
   # -ffast-math enables auto-vectorization of reduction loops.
-  export CFLAGS="${CFLAGS//-march=x86-64/-march=native} -ffast-math"
-  export CXXFLAGS="${CXXFLAGS//-march=x86-64/-march=native} -ffast-math"
+  export CFLAGS="${CFLAGS//-march=x86-64/-march=native} -ffast-math -fno-finite-math-only"
+  export CXXFLAGS="${CXXFLAGS//-march=x86-64/-march=native} -ffast-math -fno-finite-math-only"
 
   local cmake_args=(
     -Wno-dev
