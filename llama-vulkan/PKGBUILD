@@ -66,39 +66,15 @@ with open('$_vk', 'w') as f: f.write(s)
 print('OK: Phase 15 Vulkan memory type selection fixed')
 "
 
-  # Phase 15: Pad past VRAM slow band BEFORE compute allocation.
-  # RADV has a ~13MB window near the invisible/visible VRAM boundary
-  # where compute placement degrades (23→13 t/s). Pad BEFORE compute
-  # buffers are allocated so they land on the right side.
-  python3 -c "
-with open('$_vk') as f: s = f.read()
-old = '    if (ctx->prealloc_x == nullptr || (ctx->prealloc_size_x > 0 && ctx->prealloc_x->size < ctx->prealloc_size_x)) {'
-new = '''    // Phase 15: Pad past VRAM slow band on small-BAR GPUs.
-    // Must happen BEFORE compute buffers to shift the heap boundary.
-    {
-        static vk_buffer vram_pad;
-        if (!vram_pad) {
-            size_t total = 0, free = 0;
-            ggml_backend_vk_get_device_memory(ctx->device->idx, &free, &total);
-            // Predict free AFTER compute (~493MB) is allocated.
-            // Danger zone: 260-285 MB post-compute free on a ~2GB GPU.
-            size_t compute_est = 500*1024*1024;  // ~493MB typical
-            size_t post_free = (free > compute_est) ? free - compute_est : 0;
-            if (total < (1ULL << 32) && post_free > 255*1024*1024 && post_free < 290*1024*1024) {
-                size_t pad_size = post_free - 250*1024*1024;
-                try {
-                    vram_pad = ggml_vk_create_buffer_device(ctx->device, pad_size);
-                } catch (...) {}
-            }
-        }
-    }
-
-    if (ctx->prealloc_x == nullptr || (ctx->prealloc_size_x > 0 && ctx->prealloc_x->size < ctx->prealloc_size_x)) {'''
-assert old in s, 'prealloc_x pattern not found'
-s = s.replace(old, new, 1)
-with open('$_vk', 'w') as f: f.write(s)
-print('OK: Phase 15 VRAM pad before compute alloc')
-"
+  # Phase 15: RADV slow band — UNRESOLVED at driver level.
+  # When invisible VRAM has 11-24MB free (total allocated 1768-1781MB),
+  # inference drops 2x. Exhaustive testing confirmed:
+  # - Not allocation pattern (pad from 0-50MB: no effect)
+  # - Not visible VRAM spill (memory type skip: no effect)
+  # - Not overallocation behavior (AMD_VK extension: no effect)
+  # - Affects both F16 and Q8_0 KV at different contexts (same total)
+  # - Root cause: likely internal RADV shader tile dispatch heuristic
+  # Workaround: use F16 KV (default) for ctx 5120-24576. All fast.
 
   # Phase 15: Enable SSSE3 quant kernels for pre-AVX CPUs (Westmere).
   # SSE4.2 implies SSSE3, but the compiler doesn't define __SSSE3__
