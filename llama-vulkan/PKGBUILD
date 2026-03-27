@@ -314,7 +314,7 @@ static inline float ggml_fast_expf(float x) {
     if (x > 88.0f) return INFINITY;
     float k = roundf(x * 1.4426950408889634f);
     float r = x - k * 0.6931471805599453f;
-    float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666667f + r * 0.041666668f)));
+    float p = 1.f + r*(1.f + r*(0.5f + r*(0.16666667f + r*(0.041666668f + r*(0.0083333338f + r*0.0013888889f)))));
     union { float f; int32_t i; } u; u.f = p;
     u.i += ((int32_t)k) << 23;
     return u.f;
