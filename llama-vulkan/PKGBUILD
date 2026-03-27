@@ -7,7 +7,7 @@
 pkgname=llama-cpp-vulkan-polaris
 _upstream_pkgname=llama.cpp
 pkgver=b8508
-pkgrel=6
+pkgrel=7
 pkgdesc='LLM inference in C/C++ with Vulkan GPU support'
 arch=('x86_64')
 url='https://github.com/ggml-org/llama.cpp'
@@ -79,7 +79,7 @@ new = '''    // Phase 15: Pad past VRAM slow band on small-BAR GPUs.
         static vk_buffer vram_pad;
         if (!vram_pad) {
             size_t total = 0, free = 0;
-            ggml_backend_vk_get_device_memory(ctx->device->idx, &total, &free);
+            ggml_backend_vk_get_device_memory(ctx->device->idx, &free, &total);
             // Predict free AFTER compute (~493MB) is allocated.
             // Danger zone: 260-285 MB post-compute free on a ~2GB GPU.
             size_t compute_est = 500*1024*1024;  // ~493MB typical
