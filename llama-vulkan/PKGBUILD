@@ -33,48 +33,8 @@ sha256sums=('SKIP')
 prepare() {
   cd "$_upstream_pkgname-$pkgver"
 
-  # Phase 15: Fix Vulkan memory type selection on small-BAR GPUs.
-  # When DEVICE_LOCAL is requested without HOST_VISIBLE, skip memory
-  # types on small heaps (visible VRAM via BAR). Prefer invisible VRAM
-  # (Heap 0, 1.75GB, fast local) over visible VRAM (Heap 2, 256MB, slow
-  # BAR access). Without this, near the 1792MB boundary RADV spills
-  # compute buffers to visible VRAM causing 2x slowdown.
-  local _vk=ggml/src/ggml-vulkan/ggml-vulkan.cpp
-  python3 -c "
-with open('$_vk') as f: s = f.read()
-old = '''        if ((mem_req->memoryTypeBits & ((uint64_t)1 << i)) &&
-            (flags & memory_type.propertyFlags) == flags &&
-            mem_props->memoryHeaps[memory_type.heapIndex].size >= mem_req->size) {
-            indices.push_back(i);
-        }'''
-new = '''        if ((mem_req->memoryTypeBits & ((uint64_t)1 << i)) &&
-            (flags & memory_type.propertyFlags) == flags &&
-            mem_props->memoryHeaps[memory_type.heapIndex].size >= mem_req->size) {
-            // Phase 15: On small-BAR GPUs, skip visible VRAM (small DEVICE_LOCAL +
-            // HOST_VISIBLE heap) when only DEVICE_LOCAL was requested. Visible VRAM
-            // is accessed via PCIe BAR — much slower than invisible local VRAM.
-            if (!(flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
-                (memory_type.propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible) &&
-                mem_props->memoryHeaps[memory_type.heapIndex].size < (1ULL << 30)) {
-                continue;  // skip small visible VRAM heap
-            }
-            indices.push_back(i);
-        }'''
-assert old in s, 'find_memory_properties pattern not found'
-s = s.replace(old, new, 1)
-with open('$_vk', 'w') as f: f.write(s)
-print('OK: Phase 15 Vulkan memory type selection fixed')
-"
-
-  # Phase 15: RADV slow band — UNRESOLVED at driver level.
-  # When invisible VRAM has 11-24MB free (total allocated 1768-1781MB),
-  # inference drops 2x. Exhaustive testing confirmed:
-  # - Not allocation pattern (pad from 0-50MB: no effect)
-  # - Not visible VRAM spill (memory type skip: no effect)
-  # - Not overallocation behavior (AMD_VK extension: no effect)
-  # - Affects both F16 and Q8_0 KV at different contexts (same total)
-  # - Root cause: likely internal RADV shader tile dispatch heuristic
-  # Workaround: use F16 KV (default) for ctx 5120-24576. All fast.
+  # Phase 15: RADV slow band fixed at kernel level (TTM contiguous-or-GTT
+  # in linux-lts-rocm-polaris 6.18.16-40). No Vulkan-side workarounds needed.
 
   # Phase 15: Enable SSSE3 quant kernels for pre-AVX CPUs (Westmere).
   # SSE4.2 implies SSSE3, but the compiler doesn't define __SSSE3__
