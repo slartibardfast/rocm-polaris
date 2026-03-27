@@ -329,12 +329,10 @@ print('OK: Phase 15 SSE4.1 vec_argmax_f32 injected')
   python3 -c "
 with open('$_ops') as f: s = f.read()
 # Add fast_expf at the top of the file (after includes)
-marker = 'namespace {'
-fast_exp = '''namespace {
+marker = '#include <cmath>'
+fast_exp = '''#include <cmath>
 
 // Phase 15: Inline fast exp approximation for CPU softmax.
-// Range reduction to [-0.5*ln2, 0.5*ln2] + 4th-order minimax polynomial.
-// ~23-bit accuracy, no library call, compiler can inline and optimize.
 static inline float ggml_fast_expf(float x) {
     if (x < -88.0f) return 0.0f;
     if (x > 88.0f) return INFINITY;
@@ -345,9 +343,8 @@ static inline float ggml_fast_expf(float x) {
     u.i += ((int32_t)k) << 23;
     return u.f;
 }
-
 '''
-assert marker in s, 'namespace { not found in ops.cpp'
+assert marker in s, '#include <cmath> not found in ops.cpp'
 s = s.replace(marker, fast_exp, 1)
 
 # Replace expf() in softmax hot loop with ggml_fast_expf()
