@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=39
+pkgrel=40
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -640,6 +640,15 @@ s = s.replace(old, new, 1)
 with open('$_crat', 'w') as f: f.write(s)
 print('OK: Phase 13 visible VRAM reported as PUBLIC bank')
 "
+
+  # Phase 15: Reserve 24MB VRAM headroom to prevent buddy allocator fragmentation.
+  # The DRM buddy allocator has a fallback path (amdgpu_vram_mgr.c:546-553)
+  # that scatters BOs across 2MB blocks when contiguous allocation fails.
+  # These fragmented BOs have terrible GPU access performance.
+  # By triggering the early-bail check 24MB sooner, large allocations go
+  # cleanly to GTT instead of fragmenting in the last 24MB of VRAM.
+  sed -i 's/if (ttm_resource_manager_usage(man) > max_bytes)/if (ttm_resource_manager_usage(man) + (24ULL << 20) > max_bytes)/' \
+    drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
 
   echo "Setting config..."
   cp ../config .config
