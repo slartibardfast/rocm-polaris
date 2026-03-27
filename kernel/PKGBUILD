@@ -641,14 +641,20 @@ with open('$_crat', 'w') as f: f.write(s)
 print('OK: Phase 13 visible VRAM reported as PUBLIC bank')
 "
 
-  # Phase 15: Reserve 24MB VRAM headroom to prevent buddy allocator fragmentation.
-  # The DRM buddy allocator has a fallback path (amdgpu_vram_mgr.c:546-553)
-  # that scatters BOs across 2MB blocks when contiguous allocation fails.
-  # These fragmented BOs have terrible GPU access performance.
-  # By triggering the early-bail check 24MB sooner, large allocations go
-  # cleanly to GTT instead of fragmenting in the last 24MB of VRAM.
-  sed -i 's/if (ttm_resource_manager_usage(man) > max_bytes)/if (ttm_resource_manager_usage(man) + (24ULL << 20) > max_bytes)/' \
-    drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+  # Phase 15: Reject fragmented VRAM allocations — contiguous or GTT.
+  # The DRM buddy allocator (amdgpu_vram_mgr.c:546-553) retries failed
+  # contiguous allocations with scattered 2MB blocks. These fragmented
+  # BOs cause 2x GPU slowdown (multiple TLB lookups per block).
+  # Fix: skip the retry — if contiguous fails, let TTM send to GTT.
+  # Contiguous GTT (PCIe DMA) is faster than fragmented VRAM.
+  # No VRAM wasted — all contiguous allocations still work normally.
+  # The retry path at lines 546-553 does:
+  #   if (ENOSPC && first_try) { drop_contiguous; set 2MB blocks; continue; }
+  # We replace `continue` with empty block so it falls through to
+  #   if (unlikely(r)) goto error_free_blocks;  (line 555)
+  # which propagates -ENOSPC to TTM, sending the BO to GTT.
+  local _vram_mgr=drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+  sed -i 's/\(pages_per_block == ~0ul\)/0 \/* Phase 15: disabled fragmented retry *\//' "$_vram_mgr"
 
   echo "Setting config..."
   cp ../config .config
