@@ -127,8 +127,8 @@ print('OK: Phase 16 fence busy-wait replaced with vkWaitForFences')
   # --- Steps 9-11: Pipeline selection, graph handler, op support ---
   # Use unique anchors to avoid duplicate insertions.
 
-  # Step 9: Pipeline selection — unique anchor is "pipeline_ssm_conv_f32;"
-  sed -i '/pipeline_ssm_conv_f32;$/a\        case GGML_OP_FUSED_GATE_PREP:\n            return ctx->device->pipeline_fused_gate_prep_f32;\n        case GGML_OP_FUSED_GATED_NORM:\n            return ctx->device->pipeline_fused_gated_norm_f32;\n        case GGML_OP_FUSED_DUAL_L2_NORM:\n            return ctx->device->pipeline_fused_dual_l2_norm_f32;' "$_vk"
+  # Step 9: Pipeline selection — anchor on "return" + pipeline name
+  sed -i '/return ctx->device->pipeline_ssm_conv_f32;/a\        case GGML_OP_FUSED_GATE_PREP:\n            return ctx->device->pipeline_fused_gate_prep_f32;\n        case GGML_OP_FUSED_GATED_NORM:\n            return ctx->device->pipeline_fused_gated_norm_f32;\n        case GGML_OP_FUSED_DUAL_L2_NORM:\n            return ctx->device->pipeline_fused_dual_l2_norm_f32;' "$_vk"
 
   # Step 10: Graph handler — unique anchor is "ggml_vk_ssm_conv(ctx"
   sed -i '/ggml_vk_ssm_conv(ctx, compute_ctx, node);$/a\            break;\n        case GGML_OP_FUSED_GATE_PREP:\n            ggml_vk_fused_gate_prep(ctx, compute_ctx, node);\n            break;\n        case GGML_OP_FUSED_GATED_NORM:\n            ggml_vk_fused_gated_norm(ctx, compute_ctx, node);\n            break;\n        case GGML_OP_FUSED_DUAL_L2_NORM:\n            ggml_vk_fused_dual_l2_norm(ctx, compute_ctx, node);' "$_vk"
