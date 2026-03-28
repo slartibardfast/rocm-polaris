@@ -7,7 +7,7 @@
 pkgname=llama-cpp-vulkan-polaris
 _upstream_pkgname=llama.cpp
 pkgver=b8508
-pkgrel=10
+pkgrel=11
 pkgdesc='LLM inference in C/C++ with Vulkan GPU support'
 arch=('x86_64')
 url='https://github.com/ggml-org/llama.cpp'
@@ -82,11 +82,19 @@ print('OK: Phase 16 fence busy-wait replaced with vkWaitForFences')
   sed -i 's/dst\[dst_idx\] = sum;/float s = sum; dst[dst_idx] = s \/ (1.0 + exp(-s));/' "$_ssm_conv"
 
   # Remove the separate SILU dispatch after SSM_CONV.
-  # In qwen35.cpp, ggml_silu(conv_output) becomes a no-op because
-  # the conv output already has SiLU applied. We modify the model
-  # graph to skip the SILU op after SSM_CONV.
   local _q35=src/models/qwen35.cpp
   sed -i 's/ggml_tensor \* conv_output_silu = ggml_silu(ctx0, conv_output_proper);/ggml_tensor * conv_output_silu = conv_output_proper; \/\/ Phase 16: SiLU fused into ssm_conv/' "$_q35"
+
+  # Phase 16 Fusion 2: Fuse sigmoid(beta) into gated_delta_net.comp.
+  # Skip sigmoid in model graph, apply inside the GDN shader.
+  # Saves 18 dispatches × 500µs = 9ms per token.
+  local _gdn=ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+  sed -i 's/const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta\[gb_off\]);/const FLOAT_TYPE beta_val = FLOAT_TYPE(1.0) \/ (FLOAT_TYPE(1.0) + exp(-FLOAT_TYPE(data_beta[gb_off]))); \/\/ Phase 16: sigmoid fused/' "$_gdn"
+  sed -i 's/beta = ggml_sigmoid(ctx0, beta);/\/\/ beta = ggml_sigmoid(ctx0, beta); \/\/ Phase 16: fused into gated_delta_net/' "$_q35"
+
+  # Phase 16 Fusion 3: add+softplus+mul — DEFERRED.
+  # ssm_a is a per-head tensor (not scalar). Can't pass via push constant.
+  # Needs a new shader with additional buffer binding. Future work.
 
   # Phase 15: Enable SSSE3 quant kernels for pre-AVX CPUs (Westmere).
   # SSE4.2 implies SSSE3, but the compiler doesn't define __SSSE3__
