@@ -7,7 +7,7 @@
 
 pkgbase=linux-lts-rocm-polaris
 pkgver=6.18.16
-pkgrel=40
+pkgrel=41
 pkgdesc='LTS Linux with KFD fixes for GCN 1.2 GPUs'
 url='https://github.com/slartibardfast/rocm-polaris'
 arch=(x86_64)
@@ -641,20 +641,11 @@ with open('$_crat', 'w') as f: f.write(s)
 print('OK: Phase 13 visible VRAM reported as PUBLIC bank')
 "
 
-  # Phase 15: Reject fragmented VRAM allocations — contiguous or GTT.
-  # The DRM buddy allocator (amdgpu_vram_mgr.c:546-553) retries failed
-  # contiguous allocations with scattered 2MB blocks. These fragmented
-  # BOs cause 2x GPU slowdown (multiple TLB lookups per block).
-  # Fix: skip the retry — if contiguous fails, let TTM send to GTT.
-  # Contiguous GTT (PCIe DMA) is faster than fragmented VRAM.
-  # No VRAM wasted — all contiguous allocations still work normally.
-  # The retry path at lines 546-553 does:
-  #   if (ENOSPC && first_try) { drop_contiguous; set 2MB blocks; continue; }
-  # We replace `continue` with empty block so it falls through to
-  #   if (unlikely(r)) goto error_free_blocks;  (line 555)
-  # which propagates -ENOSPC to TTM, sending the BO to GTT.
-  local _vram_mgr=drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
-  sed -i 's/\(pages_per_block == ~0ul\)/0 \/* Phase 15: disabled fragmented retry *\//' "$_vram_mgr"
+  # Phase 15: VRAM slow band — root cause is NOT buddy fragmentation.
+  # Tested: disabling fragmented retry made the band WIDER (4096 became slow).
+  # The 2MB fragmented blocks actually work fine for small allocations.
+  # Root cause remains unknown — likely internal to RADV shader dispatch.
+  # Workaround: choose context sizes outside 1748-1767MB total GPU usage.
 
   echo "Setting config..."
   cp ../config .config
