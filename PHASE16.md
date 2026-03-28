@@ -1,100 +1,150 @@
 # Phase 16: Close the GPU Efficiency Gap
 
-## Status: IN PROGRESS — profiling complete, fused SSM shader needed
+## Status: IN PROGRESS — first fusion proved, big bang fusion next
 
-## GPU Profiling Results (Qwen3.5-2B, per token)
+## Root Cause: GCN3 Inter-Dispatch Pipeline Stall
 
-Total eval: 85ms (23 t/s). GPU time: 67ms. CPU overhead: 18ms.
+Each Vulkan dispatch boundary on GCN3 (Polaris 12, 5 CUs) costs ~500µs
+of hardware pipeline stall: `BUFFER_WBINVL1_VOL` L1 invalidation + L2
+writeback before the next dispatch can read. This is NOT idle time from
+poor batching — it persists even with all dispatches in one command buffer.
 
-### Where 67ms of GPU Time Goes
+Proof:
+- `vkQueueSubmit + fence`: 53µs (measured with test harness)
+- Pipeline barriers: 0.2µs (negligible in recording)
+- But GPU profiler shows 500µs PER DISPATCH for tiny ops (SCALE, CPY)
+- Actual compute: 0.3µs (2048 elements × 4 bytes at 48 GB/s)
+- **99.9% of each dispatch is GCN3 cache flush overhead**
 
-| Category | Dispatches | Total µs | % GPU | Per-dispatch µs |
-|----------|-----------|----------|-------|-----------------|
-| **SCALE** | **36** | **20,800** | **31%** | **578** |
-| **CPY** | **37** | **17,500** | **26%** | **473** |
-| Output logits (q6_K 248K) | 1 | 10,100 | 15% | 10,100 |
-| MUL_MAT_VEC (FFN/attn) | ~150 | 30,000 | 45% | 200 |
-| GET_ROWS | 38 | 8,100 | 12% | 214 |
-| GATED_DELTA_NET (fused SSM) | 18 | 2,000 | 3% | 111 |
-| SILU | 36 | 1,500 | 2% | 42 |
-| Flash attention | 6 | 1,200 | 2% | 200 |
-| SIGMOID/SOFTPLUS/L2_NORM/etc | 96 | 1,500 | 2% | 16 |
+The ONLY fix: eliminate dispatch boundaries by fusing operations.
 
-### The Problem: 267 Tiny Dispatches
+## GPU Profiling (67ms GPU, 85ms eval per token)
 
-The fused SSM kernel (gated_delta_net.comp) is FAST — 2ms for 18 layers.
-But 267 surrounding dispatches (SCALE, CPY, GET_ROWS, SIGMOID, SOFTPLUS,
-SILU, L2_NORM, MUL) cost 38ms in GCN wave launch overhead.
+| Op | Count | Per-op µs | Total ms | Fuseable? |
+|----|-------|----------|---------|-----------|
+| SCALE | 36 | 536 | 19.3 | YES → fuse into matmul/norm |
+| CPY | 37 | 439 | 16.2 | YES → eliminate with in-place ops |
+| MUL_MAT_VEC (output 248K) | 1 | 10,083 | 10.1 | NO (bandwidth) |
+| MUL_MAT_VEC (FFN q4_K) | 48 | 230 | 11.0 | NO (bandwidth) |
+| MUL_MAT_VEC (FFN q5_K) | 18 | 483 | 8.7 | NO (bandwidth) |
+| GET_ROWS | 38 | 210 | 8.0 | MAYBE → batch |
+| MUL_MAT_ADD (q6_K/q4_K) | ~40 | 250 | 10.0 | NO (bandwidth) |
+| GATED_DELTA_NET | 18 | 113 | 2.0 | Already fused |
+| SILU (FFN only, after fusion) | 18 | 78 | 1.4 | YES → fuse into FFN |
+| RMS_NORM_MUL | ~80 | 15-68 | 3.4 | YES → fuse into adjacent |
+| Flash attention | 6 | 200 | 1.2 | NO (already fused) |
+| Everything else | ~60 | various | 3.0 | SOME |
 
-Each dispatch on 5-CU Polaris 12 costs ~500µs regardless of tensor size.
-A 2048-element SCALE takes 0.3µs of compute but 500µs of launch overhead.
-**99.9% overhead, 0.1% compute.**
+## First Fusion: SSM_CONV + SILU (DONE)
 
-### CPU Overhead: 18ms
+Fused SiLU activation into `ssm_conv.comp`: `dst = sum/(1+exp(-sum))`.
+Eliminated 18 SILU dispatches. Saved 1.4ms (18 × 78µs actual compute).
 
-`perf` profiling revealed 40% of CPU time is a PAUSE spin loop polling
-`getFenceStatus()`. Replaced with `vkWaitForFences` (kernel futex).
-No speed improvement (GPU-bound) but frees CPU cycles.
+The savings were smaller than the estimated 9ms because the 500µs
+"per-dispatch" time in the profiler includes the stall from the NEXT
+dispatch boundary, not just this one. Eliminating one dispatch removes
+one stall but the adjacent dispatches still have their own stalls.
 
-The remaining CPU overhead is command buffer recording + descriptor
-updates — happens serially before GPU starts.
+**Key insight: savings are CUMULATIVE. Eliminating N consecutive
+dispatch boundaries saves N × 500µs because the stalls don't overlap.**
 
-## Fix: Extended Fused SSM Shader
+## Big Bang Fusion Plan
 
-### Current Architecture (per SSM layer)
+### Target: Fuse the Entire SSM Pre/Post Chain
+
+Per SSM layer, the current dispatch sequence:
+
 ```
-dispatch: sigmoid(beta)           ~3µs compute, ~500µs launch
-dispatch: softplus(alpha)         ~6µs compute, ~500µs launch
-dispatch: mul(gate)               ~8µs compute, ~500µs launch
-dispatch: ssm_conv                ~50µs compute, ~500µs launch
-dispatch: silu(conv_output)       ~40µs compute, ~500µs launch
-dispatch: l2_norm(q)              ~3µs compute, ~500µs launch
-dispatch: l2_norm(k)              ~3µs compute, ~500µs launch
-dispatch: GATED_DELTA_NET         ~111µs (fused, efficient)
-dispatch: cpy(conv_state)         ~470µs (state copy)
-dispatch: cpy(ssm_state)          ~470µs (state copy)
-dispatch: rms_norm_mul            ~65µs compute, ~500µs launch
-dispatch: silu(z)                 ~40µs compute, ~500µs launch
-dispatch: mul(gated_output)       ~8µs compute, ~500µs launch
-dispatch: scale(?)                ~5µs compute, ~500µs launch
-... ≈ 15 dispatches per SSM layer × 18 layers = 270 dispatches
+1.  MUL_MAT (beta projection)     — keep (bandwidth-bound matmul)
+2.  SIGMOID(beta)                  — FUSE into #18
+3.  MUL_MAT (alpha projection)    — keep
+4.  ADD(alpha, dt_bias)            — FUSE →
+5.  SOFTPLUS(alpha_biased)         — FUSE → single "gate_prep" dispatch
+6.  MUL(softplus, ssm_a)          — FUSE →
+7.  GET_ROWS (conv state)          — keep (state fetch)
+8.  CONCAT (conv_states, qkv)      — FUSE into #9
+9.  SSM_CONV + SILU (fused)        — DONE
+10. L2_NORM(q)                     — FUSE →
+11. L2_NORM(k)                     — FUSE → single "qk_norm" dispatch
+12. GATED_DELTA_NET                — keep (already fused)
+13. CPY (conv state update)        — FUSE →
+14. CPY (ssm state update)         — FUSE → single "state_update" dispatch
+15. RMS_NORM(output)               — FUSE →
+16. SILU(z)                        — FUSE → single "gated_norm" dispatch
+17. MUL(normed, silu_z)            — FUSE →
+18. MUL_MAT (output projection)   — keep
 ```
 
-### Proposed: Single Fused SSM Layer Dispatch
-```
-dispatch: FUSED_SSM_LAYER         ~300µs (all ops combined)
-... × 18 layers = 18 dispatches
-```
+### Fused Shaders to Write
 
-**Savings: 252 dispatches eliminated. At 500µs each = 126ms saved.**
-Even conservatively (some ops can't fuse): 150 dispatches eliminated =
-75ms saved → eval drops from 85ms to ~30ms → **33 t/s**.
+**1. `fused_gate_prep.comp`** — sigmoid(beta) + add + softplus + mul
+- Input: beta (after matmul), alpha (after matmul), dt_bias, ssm_a
+- Output: gate, beta_sigmoid
+- Eliminates: 4 dispatches × 18 layers = 72 dispatches → 18
+- Savings: ~36ms → ~9ms (saves 27ms)
 
-### Implementation Path
+**2. `fused_qk_norm.comp`** — l2_norm(q) + l2_norm(k)
+- Input: q_conv, k_conv (from SSM_CONV output views)
+- Output: q_normed, k_normed
+- Eliminates: 2 dispatches × 18 layers = 36 dispatches → 18
+- Savings: ~3ms → ~1ms (saves 2ms)
 
-1. Write `fused_ssm_layer.comp` that combines:
-   - sigmoid + softplus + gate_mul
-   - ssm_conv + silu
-   - l2_norm (q, k)
-   - state copy (conv + ssm)
-   - rms_norm_mul + silu + output_mul
+**3. `fused_state_update.comp`** — cpy(conv_state) + cpy(ssm_state)
+- Input: last_conv_states, new_ssm_state, state buffers
+- Output: updated state cache (in-place write)
+- Eliminates: 2 dispatches × 18 layers = 36 dispatches → 18
+- Savings: ~16ms → ~8ms (saves 8ms)
 
-2. Register the fused shader in ggml-vulkan dispatch logic
+**4. `fused_gated_norm.comp`** — rms_norm + silu + mul
+- Input: delta_net output, z (gate), norm weights
+- Output: gated normalized output
+- Eliminates: 3 dispatches × 18 layers = 54 dispatches → 18
+- Savings: ~5ms → ~2ms (saves 3ms)
 
-3. Modify qwen35.cpp to emit a single FUSED_SSM_LAYER op instead
-   of 15 individual ops per SSM layer
+### Total Expected Savings
 
-4. Test harness: compare output of fused vs unfused (bit-exact)
+| Fusion | Dispatches eliminated | Estimated savings |
+|--------|----------------------|-------------------|
+| SSM_CONV+SILU (done) | 18 | 1.4ms |
+| gate_prep | 54 | 27ms |
+| qk_norm | 18 | 2ms |
+| state_update | 18 | 8ms |
+| gated_norm | 36 | 3ms |
+| **TOTAL** | **144** | **~41ms** |
 
-5. A/B benchmark: measure dispatch count + eval time
+From 67ms GPU → ~26ms GPU. Eval: 85ms → ~44ms. **23 t/s → 45 t/s.**
+
+Conservative (50% of estimate): **23 t/s → 34 t/s.**
+
+### Implementation
+
+Each fused shader is a standalone `.comp` file injected via PKGBUILD.
+The model graph (qwen35.cpp) is modified to emit fused ops instead of
+individual ones. The dispatch logic (ggml-vulkan.cpp) routes fused ops
+to the new shaders.
+
+Approach: implement ALL four fused shaders together ("big bang"),
+test correctness against unfused output, then benchmark.
 
 ### Files to Modify
 
-- New: `vulkan-shaders/fused_ssm_layer.comp`
-- Modify: `ggml-vulkan.cpp` (dispatch logic for fused op)
-- Modify: `src/models/qwen35.cpp` (emit fused op)
-- Modify: `ggml.h` / `ggml.c` (add GGML_OP_FUSED_SSM_LAYER)
+- New shaders in `vulkan-shaders/`:
+  - `fused_gate_prep.comp`
+  - `fused_qk_norm.comp`
+  - `fused_state_update.comp`
+  - `fused_gated_norm.comp`
+- `ggml-vulkan.cpp`: pipeline creation + dispatch for fused ops
+- `src/models/qwen35.cpp`: emit fused op sequences
+- `ggml.h` / `ggml.c`: new GGML_OP types (or use existing fusion framework)
 
-### Packages
+### Verification
 
-- `llama-cpp-vulkan-polaris` b8508-9 (fence fix + nodes_per_submit)
+1. Generate 100 tokens with fused build, compare text quality
+2. `GGML_VK_PERF_LOGGER=1` — verify dispatch count drops by ~144
+3. 3-run benchmark: target 30+ t/s
+4. Stability: 500-token generation
+5. No regression on SmolLM2 (uses different architecture, unaffected)
+
+## Packages
+
+- `llama-cpp-vulkan-polaris` b8508-10 (SSM_CONV+SILU fusion + fence fix)
