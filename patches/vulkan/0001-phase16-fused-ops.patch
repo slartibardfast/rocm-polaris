@@ -1,0 +1,442 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 669f66b650..ad3b31cc1f 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -559,6 +559,9 @@ extern "C" {
+         GGML_OP_RWKV_WKV7,
+         GGML_OP_SOLVE_TRI,
+         GGML_OP_GATED_DELTA_NET,
++        GGML_OP_FUSED_GATE_PREP,
++        GGML_OP_FUSED_GATED_NORM,
++        GGML_OP_FUSED_DUAL_L2_NORM,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2361,6 +2364,18 @@ extern "C" {
+             struct ggml_tensor  * sx,
+             struct ggml_tensor  * c);
+ 
++    GGML_API struct ggml_tensor * ggml_fused_gate_prep(
++            struct ggml_context * ctx, struct ggml_tensor * alpha,
++            struct ggml_tensor * dt_bias, struct ggml_tensor * ssm_a);
++
++    GGML_API struct ggml_tensor * ggml_fused_gated_norm(
++            struct ggml_context * ctx, struct ggml_tensor * input,
++            struct ggml_tensor * norm_weights, struct ggml_tensor * gate);
++
++    GGML_API struct ggml_tensor * ggml_fused_dual_l2_norm(
++            struct ggml_context * ctx, struct ggml_tensor * q,
++            struct ggml_tensor * k);
++
+     GGML_API struct ggml_tensor * ggml_ssm_scan(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * s,
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index b1a52fa64a..0f40b57ed4 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -831,6 +831,9 @@ struct vk_device_struct {
+     vk_pipeline pipeline_ssm_scan_f32_d128;
+     vk_pipeline pipeline_ssm_scan_f32_d256;
+     vk_pipeline pipeline_ssm_conv_f32;
++    vk_pipeline pipeline_fused_gate_prep_f32;
++    vk_pipeline pipeline_fused_gated_norm_f32;
++    vk_pipeline pipeline_fused_dual_l2_norm_f32;
+     vk_pipeline pipeline_opt_step_adamw_f32;
+     vk_pipeline pipeline_opt_step_sgd_f32;
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
+@@ -1478,6 +1481,23 @@ struct vk_op_ssm_scan_push_constants {
+     uint32_t nb02, nb03, nb12, nb13;
+     uint32_t nb21, nb22, nb31;
+     uint32_t nb42, nb43, nb52, nb53;
++struct vk_op_fused_gate_prep_push_constants {
++    uint32_t ne;
++    uint32_t num_v_heads;
++};
++
++struct vk_op_fused_gated_norm_push_constants {
++    uint32_t ne;
++    uint32_t head_dim;
++    float eps;
++};
++
++struct vk_op_fused_dual_l2_norm_push_constants {
++    uint32_t ne;
++    uint32_t vec_dim;
++    float eps;
++};
++
+     uint32_t s_off;
+     uint32_t n_head, d_head, n_group, n_tok;
+ };
+@@ -4638,6 +4658,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
+     }
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_fused_gate_prep_f32, "fused_gate_prep_f32", fused_gate_prep_f32_len, fused_gate_prep_f32_data, "main", 4, sizeof(vk_op_fused_gate_prep_push_constants), {256, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_fused_gated_norm_f32, "fused_gated_norm_f32", fused_gated_norm_f32_len, fused_gated_norm_f32_data, "main", 4, sizeof(vk_op_fused_gated_norm_push_constants), {128, 1, 1}, {128}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_fused_dual_l2_norm_f32, "fused_dual_l2_norm_f32", fused_dual_l2_norm_f32_len, fused_dual_l2_norm_f32_data, "main", 4, sizeof(vk_op_fused_dual_l2_norm_push_constants), {128, 1, 1}, {128}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+ 
+@@ -9586,6 +9609,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+     case GGML_OP_SSM_CONV:
+         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+             return ctx->device->pipeline_ssm_conv_f32;
++        case GGML_OP_FUSED_GATE_PREP:
++            return ctx->device->pipeline_fused_gate_prep_f32;
++        case GGML_OP_FUSED_GATED_NORM:
++            return ctx->device->pipeline_fused_gated_norm_f32;
++        case GGML_OP_FUSED_DUAL_L2_NORM:
++            return ctx->device->pipeline_fused_dual_l2_norm_f32;
+         }
+         return nullptr;
+     case GGML_OP_OPT_STEP_ADAMW:
+@@ -10512,6 +10541,26 @@ static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx,
+         pc, elements);
+ }
+ 
++static void ggml_vk_fused_gate_prep(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const uint32_t ne = (uint32_t)ggml_nelements(dst);
++    const uint32_t num_v_heads = (uint32_t)dst->src[1]->ne[0];
++    ggml_vk_op_f32<vk_op_fused_gate_prep_push_constants>(ctx, subctx, dst->src[0], dst->src[1], dst->src[2], nullptr, dst, GGML_OP_FUSED_GATE_PREP, { ne, num_v_heads });
++}
++
++static void ggml_vk_fused_gated_norm(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const uint32_t ne = (uint32_t)ggml_nelements(dst);
++    const uint32_t head_dim = (uint32_t)dst->src[1]->ne[0];
++    const float eps = 1e-6f;
++    ggml_vk_op_f32<vk_op_fused_gated_norm_push_constants>(ctx, subctx, dst->src[0], dst->src[1], dst->src[2], nullptr, dst, GGML_OP_FUSED_GATED_NORM, { ne, head_dim, eps });
++}
++
++static void ggml_vk_fused_dual_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const uint32_t ne = (uint32_t)ggml_nelements(dst->src[0]);
++    const uint32_t vec_dim = (uint32_t)dst->src[0]->ne[0];
++    const float eps = 1e-6f;
++    ggml_vk_op_f32<vk_op_fused_dual_l2_norm_push_constants>(ctx, subctx, dst->src[0], dst->src[1], nullptr, nullptr, dst, GGML_OP_FUSED_DUAL_L2_NORM, { ne, vec_dim, eps });
++}
++
+ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+@@ -13184,6 +13233,15 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+     case GGML_OP_SSM_CONV:
+         ggml_vk_ssm_conv(ctx, compute_ctx, node);
++            break;
++        case GGML_OP_FUSED_GATE_PREP:
++            ggml_vk_fused_gate_prep(ctx, compute_ctx, node);
++            break;
++        case GGML_OP_FUSED_GATED_NORM:
++            ggml_vk_fused_gated_norm(ctx, compute_ctx, node);
++            break;
++        case GGML_OP_FUSED_DUAL_L2_NORM:
++            ggml_vk_fused_dual_l2_norm(ctx, compute_ctx, node);
+ 
+         break;
+ 
+@@ -15655,6 +15713,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 return true;
+             }
+         case GGML_OP_SSM_CONV:
++        case GGML_OP_FUSED_GATE_PREP:
++        case GGML_OP_FUSED_GATED_NORM:
++        case GGML_OP_FUSED_DUAL_L2_NORM:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fused_dual_l2_norm.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fused_dual_l2_norm.comp
+new file mode 100644
+index 0000000000..609a94e6de
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fused_dual_l2_norm.comp
+@@ -0,0 +1,70 @@
++// Phase 16: Fused dual L2 normalization for Qwen3.5 SSM layers.
++// Combines: l2_norm(q) + l2_norm(k) into one dispatch.
++// Eliminates 1 dispatch boundary per SSM layer (36 total → 18).
++//
++// Both q and k have the same dimensions and are L2-normalized
++// independently. Fusing avoids an inter-dispatch cache flush.
++//
++// Inputs:
++//   binding 0: q [head_k_dim, num_heads, n_seq_tokens, n_seqs]
++//   binding 1: k [head_k_dim, num_heads, n_seq_tokens, n_seqs]
++//   binding 2: q_out (same shape)
++//   binding 3: k_out (same shape)
++//
++// Compute: q_out = q / ||q||, k_out = k / ||k|| (per-vector L2 norm)
++
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++
++layout(constant_id = 0) const uint VEC_DIM = 128;
++
++layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++layout(binding = 0) readonly  buffer QIn  { float data_q_in[];  };
++layout(binding = 1) readonly  buffer KIn  { float data_k_in[];  };
++layout(binding = 2) writeonly buffer QOut { float data_q_out[]; };
++layout(binding = 3) writeonly buffer KOut { float data_k_out[]; };
++
++layout(push_constant) uniform PushConstants {
++    uint ne;       // total elements per tensor
++    uint vec_dim;  // elements per L2 norm group
++    float eps;     // epsilon for numerical stability
++};
++
++shared float sq[256];
++shared float sk[256];
++
++void main() {
++    const uint tid = gl_LocalInvocationID.x;
++    const uint group_id = gl_WorkGroupID.x;
++    const uint base = group_id * vec_dim;
++
++    if (base >= ne) return;
++
++    // Compute sum of squares for both q and k
++    float sum_q = 0.0, sum_k = 0.0;
++    for (uint i = tid; i < vec_dim; i += gl_WorkGroupSize.x) {
++        float qv = data_q_in[base + i];
++        float kv = data_k_in[base + i];
++        sum_q += qv * qv;
++        sum_k += kv * kv;
++    }
++    sq[tid] = sum_q;
++    sk[tid] = sum_k;
++    barrier();
++
++    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
++        if (tid < s) { sq[tid] += sq[tid + s]; sk[tid] += sk[tid + s]; }
++        barrier();
++    }
++
++    float inv_norm_q = 1.0 / sqrt(sq[0] + eps);
++    float inv_norm_k = 1.0 / sqrt(sk[0] + eps);
++
++    // Normalize both vectors
++    for (uint i = tid; i < vec_dim; i += gl_WorkGroupSize.x) {
++        data_q_out[base + i] = data_q_in[base + i] * inv_norm_q;
++        data_k_out[base + i] = data_k_in[base + i] * inv_norm_k;
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fused_gate_prep.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fused_gate_prep.comp
+new file mode 100644
+index 0000000000..ca739131e4
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fused_gate_prep.comp
+@@ -0,0 +1,38 @@
++// Phase 16: Fused gate preparation for Qwen3.5 SSM layers.
++// Combines: add(alpha, dt_bias) + softplus + mul(ssm_a) into one dispatch.
++// Eliminates 2 dispatch boundaries per SSM layer (54 total → 18).
++//
++// Inputs:
++//   binding 0: alpha [num_v_heads, n_seq_tokens, n_seqs] — from matmul
++//   binding 1: dt_bias [num_v_heads] — per-head bias (model weight)
++//   binding 2: ssm_a [num_v_heads] — per-head scale (model weight, typically negative)
++//   binding 3: output [num_v_heads, n_seq_tokens, n_seqs]
++//
++// Compute: output[i] = softplus(alpha[i] + dt_bias[i % num_v_heads]) * ssm_a[i % num_v_heads]
++// Where softplus(x) = x > 20 ? x : log(1 + exp(x))
++
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout(binding = 0) readonly  buffer Alpha  { float data_alpha[]; };
++layout(binding = 1) readonly  buffer DtBias { float data_dt[];    };
++layout(binding = 2) readonly  buffer SsmA   { float data_a[];     };
++layout(binding = 3) writeonly buffer Dst    { float data_dst[];   };
++
++layout(push_constant) uniform PushConstants {
++    uint ne;           // total elements
++    uint num_v_heads;  // head count for bias/scale indexing
++};
++
++void main() {
++    const uint i = gl_GlobalInvocationID.x;
++    if (i >= ne) return;
++
++    const uint head_idx = i % num_v_heads;
++    const float x = data_alpha[i] + data_dt[head_idx];
++    const float sp = (x > 20.0) ? x : log(1.0 + exp(x));
++    data_dst[i] = sp * data_a[head_idx];
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fused_gated_norm.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fused_gated_norm.comp
+new file mode 100644
+index 0000000000..5d29e6a1aa
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fused_gated_norm.comp
+@@ -0,0 +1,71 @@
++// Phase 16: Fused gated normalization for Qwen3.5 SSM layers.
++// Combines: rms_norm(input, weights) * silu(gate) into one dispatch.
++// Eliminates 2 dispatch boundaries per SSM layer (54 total → 18).
++//
++// Inputs:
++//   binding 0: input [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
++//   binding 1: norm_weights [head_v_dim] — RMS norm scale
++//   binding 2: gate [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
++//   binding 3: output [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
++//
++// Compute: output[i] = rms_norm(input, weights)[i] * silu(gate[i])
++// Where rms_norm(x) = x / sqrt(mean(x^2) + eps) * weight
++//       silu(x) = x / (1 + exp(-x))
++//
++// Each workgroup handles one [head_v_dim] vector — computes the RMS
++// reduction, normalizes, and multiplies by silu(gate) in one pass.
++
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++
++layout(constant_id = 0) const uint HEAD_DIM = 128;
++
++layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++layout(binding = 0) readonly  buffer Input   { float data_in[];   };
++layout(binding = 1) readonly  buffer Weights { float data_w[];    };
++layout(binding = 2) readonly  buffer Gate    { float data_gate[]; };
++layout(binding = 3) writeonly buffer Dst     { float data_dst[];  };
++
++layout(push_constant) uniform PushConstants {
++    uint ne;        // total elements
++    uint head_dim;  // elements per norm group
++    float eps;      // RMS norm epsilon
++};
++
++shared float sdata[256];  // for reduction
++
++void main() {
++    const uint tid = gl_LocalInvocationID.x;
++    const uint group_id = gl_WorkGroupID.x;
++    const uint base = group_id * head_dim;
++
++    if (base >= ne) return;
++
++    // Step 1: Compute sum of squares for RMS norm
++    float sum_sq = 0.0;
++    for (uint i = tid; i < head_dim; i += gl_WorkGroupSize.x) {
++        float v = data_in[base + i];
++        sum_sq += v * v;
++    }
++    sdata[tid] = sum_sq;
++    barrier();
++
++    // Tree reduction
++    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
++        if (tid < s) sdata[tid] += sdata[tid + s];
++        barrier();
++    }
++
++    float rms = sqrt(sdata[0] / float(head_dim) + eps);
++    float inv_rms = 1.0 / rms;
++
++    // Step 2: Normalize, scale by weight, multiply by silu(gate)
++    for (uint i = tid; i < head_dim; i += gl_WorkGroupSize.x) {
++        float normed = data_in[base + i] * inv_rms * data_w[i % head_dim];
++        float g = data_gate[base + i];
++        float silu_g = g / (1.0 + exp(-g));
++        data_dst[base + i] = normed * silu_g;
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 8186dba36f..95bc9c9a40 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1033,6 +1033,9 @@ void process_shaders() {
+     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
+ 
+     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
++    string_to_spv("fused_gate_prep_f32", "fused_gate_prep.comp", {});
++    string_to_spv("fused_gated_norm_f32", "fused_gated_norm.comp", {});
++    string_to_spv("fused_dual_l2_norm_f32", "fused_dual_l2_norm.comp", {});
+ 
+     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 4c0764a0ac..1d757ecad2 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1040,6 +1040,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "RWKV_WKV7",
+     "SOLVE_TRI",
+     "GATED_DELTA_NET",
++    "FUSED_GATE_PREP",
++    "FUSED_GATED_NORM",
++    "FUSED_DUAL_L2_NORM",
+ 
+     "UNARY",
+ 
+@@ -1057,7 +1060,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
++static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1167,7 +1170,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
++static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5470,6 +5473,33 @@ struct ggml_tensor * ggml_ssm_conv(
+ 
+ // ggml_ssm_scan
+ 
++
++struct ggml_tensor * ggml_fused_gate_prep(struct ggml_context * ctx, struct ggml_tensor * alpha, struct ggml_tensor * dt_bias, struct ggml_tensor * ssm_a) {
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, alpha->ne);
++    result->op = GGML_OP_FUSED_GATE_PREP;
++    result->src[0] = alpha;
++    result->src[1] = dt_bias;
++    result->src[2] = ssm_a;
++    return result;
++}
++
++struct ggml_tensor * ggml_fused_gated_norm(struct ggml_context * ctx, struct ggml_tensor * input, struct ggml_tensor * norm_weights, struct ggml_tensor * gate) {
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, input->ne);
++    result->op = GGML_OP_FUSED_GATED_NORM;
++    result->src[0] = input;
++    result->src[1] = norm_weights;
++    result->src[2] = gate;
++    return result;
++}
++
++struct ggml_tensor * ggml_fused_dual_l2_norm(struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k) {
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, q->ne);
++    result->op = GGML_OP_FUSED_DUAL_L2_NORM;
++    result->src[0] = q;
++    result->src[1] = k;
++    return result;
++}
++
+ struct ggml_tensor * ggml_ssm_scan(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * s,
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 09faf41ec3..4dc1fa6cc6 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -230,11 +230,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
+     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+     cb(alpha, "alpha", il);
+ 
+-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+-    cb(alpha_softplus, "a_softplus", il);
+-
+-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
++    // Phase 16: fused gate prep (add+softplus+mul → 1 dispatch)
++    ggml_tensor * gate = ggml_fused_gate_prep(ctx0, alpha, model.layers[il].ssm_dt, model.layers[il].ssm_a);
+     cb(gate, "gate", il);
+ 
+     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
