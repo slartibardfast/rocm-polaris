@@ -7,7 +7,7 @@
 pkgname=llama-cpp-vulkan-polaris
 _upstream_pkgname=llama.cpp
 pkgver=b8508
-pkgrel=7
+pkgrel=8
 pkgdesc='LLM inference in C/C++ with Vulkan GPU support'
 arch=('x86_64')
 url='https://github.com/ggml-org/llama.cpp'
@@ -33,8 +33,13 @@ sha256sums=('SKIP')
 prepare() {
   cd "$_upstream_pkgname-$pkgver"
 
-  # Phase 15: RADV slow band fixed at kernel level (TTM contiguous-or-GTT
-  # in linux-lts-rocm-polaris 6.18.16-40). No Vulkan-side workarounds needed.
+  # Phase 16: Increase nodes_per_submit from 100 to 2000.
+  # On 5-CU Polaris 12, each vkQueueSubmit + fence wait costs ~1ms.
+  # With 1377 graph nodes and batches of 100, that's ~14 submits = ~14ms
+  # of pure synchronization overhead per token. Batching the entire graph
+  # into 1 submit eliminates this.
+  local _vk=ggml/src/ggml-vulkan/ggml-vulkan.cpp
+  sed -i 's/int nodes_per_submit = 100;/int nodes_per_submit = 2000;/' "$_vk"
 
   # Phase 15: Enable SSSE3 quant kernels for pre-AVX CPUs (Westmere).
   # SSE4.2 implies SSSE3, but the compiler doesn't define __SSSE3__
