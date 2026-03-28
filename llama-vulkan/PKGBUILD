@@ -150,12 +150,10 @@ print('OK: Phase 16 fence busy-wait replaced with vkWaitForFences')
   sed -i '/^struct ggml_tensor \* ggml_ssm_scan/i\struct ggml_tensor * ggml_fused_gate_prep(struct ggml_context * ctx, struct ggml_tensor * alpha, struct ggml_tensor * dt_bias, struct ggml_tensor * ssm_a) {\n    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, alpha->ne);\n    result->op = GGML_OP_FUSED_GATE_PREP;\n    result->src[0] = alpha;\n    result->src[1] = dt_bias;\n    result->src[2] = ssm_a;\n    return result;\n}\n\nstruct ggml_tensor * ggml_fused_gated_norm(struct ggml_context * ctx, struct ggml_tensor * input, struct ggml_tensor * norm_weights, struct ggml_tensor * gate) {\n    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, input->ne);\n    result->op = GGML_OP_FUSED_GATED_NORM;\n    result->src[0] = input;\n    result->src[1] = norm_weights;\n    result->src[2] = gate;\n    return result;\n}\n\nstruct ggml_tensor * ggml_fused_dual_l2_norm(struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k) {\n    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, q->ne);\n    result->op = GGML_OP_FUSED_DUAL_L2_NORM;\n    result->src[0] = q;\n    result->src[1] = k;\n    return result;\n}\n' "$_ggml_c"
 
   # --- Step 14: Modify qwen35.cpp to use fused ops ---
-  # Replace add+softplus+mul with fused_gate_prep
-  sed -i '/ggml_tensor \* alpha_biased.*= ggml_add.*alpha.*ssm_dt/,/ggml_tensor \* gate.*= ggml_mul.*alpha_softplus.*ssm_a/{
-    /alpha_biased/c\    \/\/ Phase 16: fused gate prep (add+softplus+mul → 1 dispatch)
-    /alpha_softplus/c\    ggml_tensor * gate = ggml_fused_gate_prep(ctx0, alpha, model.layers[il].ssm_dt, model.layers[il].ssm_a);
-    /ggml_tensor \* gate.*= ggml_mul/d
-  }' "$_q35"
+  # gate_prep: DISABLED — crashes during dispatch. Need to debug
+  # tensor shape/offset handling in ggml_vk_op_f32 for 3-src ops
+  # with differently-shaped inputs (alpha=3D, dt_bias=1D, ssm_a=1D).
+  echo "NOTE: fused_gate_prep graph wiring disabled (crash in dispatch)"
 
   # Phase 15: Enable SSSE3 quant kernels for pre-AVX CPUs (Westmere).
   # SSE4.2 implies SSSE3, but the compiler doesn't define __SSSE3__
