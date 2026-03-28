@@ -7,7 +7,7 @@
 pkgname=llama-cpp-vulkan-polaris
 _upstream_pkgname=llama.cpp
 pkgver=b8508
-pkgrel=9
+pkgrel=10
 pkgdesc='LLM inference in C/C++ with Vulkan GPU support'
 arch=('x86_64')
 url='https://github.com/ggml-org/llama.cpp'
@@ -73,6 +73,20 @@ print('OK: Phase 16 fence busy-wait replaced with vkWaitForFences')
 
   # Phase 16: Increase nodes_per_submit to reduce fence wait count.
   sed -i 's/int nodes_per_submit = 100;/int nodes_per_submit = 2000;/' "$_vk"
+
+  # Phase 16: Fuse SiLU into SSM_CONV shader.
+  # ssm_conv output is always followed by silu in Qwen3.5.
+  # Fusing eliminates 18 SILU dispatches per token (18 SSM layers).
+  # Each dispatch costs ~500µs of GPU pipeline stall → saves ~9ms.
+  local _ssm_conv=ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv.comp
+  sed -i 's/dst\[dst_idx\] = sum;/float s = sum; dst[dst_idx] = s \/ (1.0 + exp(-s));/' "$_ssm_conv"
+
+  # Remove the separate SILU dispatch after SSM_CONV.
+  # In qwen35.cpp, ggml_silu(conv_output) becomes a no-op because
+  # the conv output already has SiLU applied. We modify the model
+  # graph to skip the SILU op after SSM_CONV.
+  local _q35=src/models/qwen35.cpp
+  sed -i 's/ggml_tensor \* conv_output_silu = ggml_silu(ctx0, conv_output_proper);/ggml_tensor * conv_output_silu = conv_output_proper; \/\/ Phase 16: SiLU fused into ssm_conv/' "$_q35"
 
   # Phase 15: Enable SSSE3 quant kernels for pre-AVX CPUs (Westmere).
   # SSE4.2 implies SSSE3, but the compiler doesn't define __SSSE3__
