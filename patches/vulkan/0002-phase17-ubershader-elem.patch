@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 221e6fa04e..895ada85ed 100644
+index 221e6fa04e..7a4cb55522 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -833,6 +833,13 @@ struct vk_device_struct {
@@ -7,16 +7,16 @@ index 221e6fa04e..895ada85ed 100644
      vk_pipeline pipeline_opt_step_adamw_f32;
      vk_pipeline pipeline_opt_step_sgd_f32;
 +
-+    // Phase 17: Ubershader for batched elementwise ops
++    // Phase 17: Ubershader
 +    vk_pipeline pipeline_ubershader_elem;
-+    vk_buffer uber_cmd_buf;         // GPU-side command buffer (MegaCmd array)
-+    vk_buffer uber_barrier_buf;     // GPU-side barrier counters (uint array)
++    vk_buffer uber_cmd_buf;
++    vk_buffer uber_barrier_buf;
 +    bool uber_enabled = false;
 +
      std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
      std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
      std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f32[CONV_SHAPE_COUNT];
-@@ -1920,6 +1927,20 @@ struct ggml_backend_vk_context {
+@@ -1920,6 +1927,18 @@ struct ggml_backend_vk_context {
      topk_moe_mode fused_topk_moe_mode {};
      bool fused_topk_moe_scale {};
  
@@ -29,21 +29,19 @@ index 221e6fa04e..895ada85ed 100644
 +        uint64_t src2_addr;
 +        uint64_t dst_addr;
 +        uint32_t params[2];
-+    };  // 48 bytes
-+    static_assert(sizeof(UberCmd) == 48, "UberCmd size mismatch");
++    };
 +    std::vector<UberCmd> uber_cmds;
-+    uint32_t uber_max_cmds = 512;
 +
      // for GGML_VK_PERF_LOGGER
      std::unique_ptr<vk_perf_logger> perf_logger;
      vk::QueryPool query_pool;
-@@ -4654,6 +4675,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
+@@ -4654,6 +4673,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
  
      ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
  
-+    // Phase 17: Ubershader pipeline (2 SSBOs: cmd buffer + barrier counters, push constants: num_cmds + num_wgs)
++    // Phase 17: Ubershader pipeline
 +    if (device->uber_enabled) {
-+        struct { uint32_t num_cmds; uint32_t num_wgs; } uber_pc;
++        struct { uint32_t a; uint32_t b; } uber_pc;
 +        ggml_vk_create_pipeline(device, device->pipeline_ubershader_elem, "ubershader_qwen35_elem",
 +            ubershader_qwen35_elem_len, ubershader_qwen35_elem_data, "main",
 +            2, sizeof(uber_pc), {1, 1, 1}, {}, 1);
@@ -52,11 +50,11 @@ index 221e6fa04e..895ada85ed 100644
      ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
  
      ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
-@@ -5191,6 +5220,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
+@@ -5191,6 +5218,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
          device->buffer_device_address = vk12_features.bufferDeviceAddress;
          device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
  
-+        // Phase 17: Enable ubershader if requested and BDA is available
++        // Phase 17: Ubershader
 +        if (getenv("GGML_VK_UBERSHADER_QWEN35") && device->buffer_device_address && device->shader_int64) {
 +            device->uber_enabled = true;
 +            GGML_LOG_INFO("ggml_vulkan: ubershader enabled for %s\n", device->name.c_str());
@@ -65,37 +63,49 @@ index 221e6fa04e..895ada85ed 100644
          if (device->subgroup_size_control) {
              device->subgroup_min_size = subgroup_size_control_props.minSubgroupSize;
              device->subgroup_max_size = subgroup_size_control_props.maxSubgroupSize;
-@@ -14291,6 +14326,89 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14291,6 +14324,102 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
      ctx->do_add_rms_partials = false;
      ctx->do_add_rms_partials_offset_calculation = false;
  
-+    // Phase 17: Ubershader state
++    // Phase 17: Ubershader helpers
 +    ctx->uber_cmds.clear();
 +    auto uber_get_bda = [&](const ggml_tensor * t) -> uint64_t {
-+        if (!t) return 0;
++        if (!t || !t->buffer) return 0;
 +        auto sub = ggml_vk_tensor_subbuffer(ctx, t, true);
++        if (!sub.buffer) return 0;
 +        return sub.buffer->bda_addr + sub.offset;
 +    };
-+    auto uber_is_batchable = [](const ggml_tensor * node) -> bool {
-+        // Only batch f32→f32 ops
++    auto uber_is_batchable = [&](const ggml_tensor * node) -> bool {
 +        if (node->type != GGML_TYPE_F32) return false;
-+        if (node->src[0] && node->src[0]->type != GGML_TYPE_F32) return false;
-+        if (node->src[1] && node->src[1]->type != GGML_TYPE_F32) return false;
++        if (!node->src[0] || node->src[0]->type != GGML_TYPE_F32) return false;
++        if (uber_get_bda(node) == 0 || uber_get_bda(node->src[0]) == 0) return false;
 +        switch (node->op) {
-+            case GGML_OP_ADD:
-+            case GGML_OP_MUL:
 +            case GGML_OP_SCALE:
 +            case GGML_OP_CPY:
 +            case GGML_OP_CONT:
 +                return true;
++            case GGML_OP_ADD:
++            case GGML_OP_MUL:
++                if (!node->src[1] || node->src[1]->type != GGML_TYPE_F32) return false;
++                if (uber_get_bda(node->src[1]) == 0) return false;
++                return ggml_nelements(node->src[0]) == ggml_nelements(node->src[1]);
++            case GGML_OP_UNARY:
++                switch (ggml_get_unary_op(node)) {
++                    case GGML_UNARY_OP_SILU:
++                    case GGML_UNARY_OP_SIGMOID:
++                        return true;
++                    default: return false;
++                }
++            case GGML_OP_GLU:
++                if (ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU) return false;
++                return !node->src[1];
 +            default:
 +                return false;
 +        }
 +    };
 +    auto uber_add_cmd = [&](const ggml_tensor * node) {
 +        ggml_backend_vk_context::UberCmd cmd = {};
-+        uint32_t ne = (uint32_t)ggml_nelements(node);
-+        cmd.ne = ne;
++        cmd.ne = (uint32_t)ggml_nelements(node);
 +        cmd.dst_addr = uber_get_bda(node);
 +        cmd.src0_addr = uber_get_bda(node->src[0]);
 +        cmd.src1_addr = node->src[1] ? uber_get_bda(node->src[1]) : 0;
@@ -105,16 +115,22 @@ index 221e6fa04e..895ada85ed 100644
 +            case GGML_OP_MUL:   cmd.op_type = 1; break;
 +            case GGML_OP_SCALE: cmd.op_type = 2;
 +                memcpy(&cmd.params[0], node->op_params, sizeof(float)); break;
++            case GGML_OP_UNARY:
++                switch (ggml_get_unary_op(node)) {
++                    case GGML_UNARY_OP_SILU:    cmd.op_type = 3; break;
++                    case GGML_UNARY_OP_SIGMOID: cmd.op_type = 4; break;
++                    default: return;
++                }
++                break;
 +            case GGML_OP_CPY:
 +            case GGML_OP_CONT:  cmd.op_type = 5; break;
++            case GGML_OP_GLU:   cmd.op_type = 7; break;
 +            default: return;
 +        }
 +        ctx->uber_cmds.push_back(cmd);
 +    };
 +    auto uber_flush = [&](vk_context& compute_ctx) {
 +        if (ctx->uber_cmds.empty() || !ctx->device->uber_enabled) return;
-+
-+        // Upload commands to GPU buffer
 +        uint32_t cmd_bytes = (uint32_t)(ctx->uber_cmds.size() * sizeof(ggml_backend_vk_context::UberCmd));
 +        if (!ctx->device->uber_cmd_buf || ctx->device->uber_cmd_buf->size < cmd_bytes) {
 +            ctx->device->uber_cmd_buf = ggml_vk_create_buffer_check(ctx->device,
@@ -129,17 +145,13 @@ index 221e6fa04e..895ada85ed 100644
 +                vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
 +                vk::MemoryPropertyFlagBits::eHostCoherent);
 +        }
-+
-+        // Copy commands and zero barrier counters
 +        memcpy(ctx->device->uber_cmd_buf->ptr, ctx->uber_cmds.data(), cmd_bytes);
 +        memset(ctx->device->uber_barrier_buf->ptr, 0, barrier_bytes);
-+
-+        // Dispatch ubershader: 5 workgroups (1 per CU)
 +        const uint32_t num_wgs = 5;
 +        struct { uint32_t num_cmds; uint32_t num_wgs; } pc = {
 +            (uint32_t)ctx->uber_cmds.size(), num_wgs
 +        };
-+
++        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_ubershader_elem, 1);
 +        ggml_vk_sync_buffers(ctx, compute_ctx);
 +        ggml_vk_dispatch_pipeline(ctx, compute_ctx,
 +            ctx->device->pipeline_ubershader_elem,
@@ -148,23 +160,21 @@ index 221e6fa04e..895ada85ed 100644
 +                vk::DescriptorBufferInfo{ctx->device->uber_barrier_buf->buffer, 0, barrier_bytes},
 +            },
 +            pc, { num_wgs, 1, 1 });
-+
 +        ctx->uber_cmds.clear();
 +    };
 +
      int last_node = cgraph->n_nodes - 1;
  
      // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
-@@ -14368,6 +14486,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14368,6 +14497,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
              total_mul_mat_bytes += bytes;
          }
  
-+        // Phase 17: Ubershader batching — accumulate simple elementwise ops
++        // Phase 17: Ubershader batching
 +        if (ctx->device->uber_enabled && uber_is_batchable(cgraph->nodes[i])) {
 +            uber_add_cmd(cgraph->nodes[i]);
-+            continue;  // Skip normal dispatch path
++            continue;
 +        }
-+        // Flush accumulated ubershader commands before non-batchable op
 +        if (ctx->device->uber_enabled && !ctx->uber_cmds.empty()) {
 +            compute_ctx = ggml_vk_get_compute_ctx(ctx);
 +            uber_flush(compute_ctx);
@@ -173,11 +183,11 @@ index 221e6fa04e..895ada85ed 100644
          // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
          // the fused result in an elementwise-way. This affects whether the memory for
          // the src is allowed to overlap the memory for the destination.
-@@ -14601,6 +14730,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14601,6 +14740,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
          ctx->fused_ops_write_mask = 0;
      }
  
-+    // Phase 17: Flush any remaining ubershader commands after graph walk
++    // Phase 17: Final ubershader flush
 +    if (ctx->device->uber_enabled && !ctx->uber_cmds.empty()) {
 +        compute_ctx = ggml_vk_get_compute_ctx(ctx);
 +        uber_flush(compute_ctx);
@@ -188,10 +198,10 @@ index 221e6fa04e..895ada85ed 100644
      if (vk_perf_logger_enabled) {
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/ubershader_qwen35_elem.comp b/ggml/src/ggml-vulkan/vulkan-shaders/ubershader_qwen35_elem.comp
 new file mode 100644
-index 0000000000..866d935176
+index 0000000000..686fa78a80
 --- /dev/null
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/ubershader_qwen35_elem.comp
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,175 @@
 +// Phase 17: GCN3 Ubershader for elementwise ops (Qwen3.5 SSM layers)
 +//
 +// Replaces ~100 individual Vulkan dispatches per token with a single
@@ -333,14 +343,13 @@ index 0000000000..866d935176
 +        } break;
 +
 +        case OP_SWIGLU: {
-+            // swiglu(gate, up) = silu(gate) * up
-+            FloatBuf gate = FloatBuf(cmd.src0_addr);
-+            FloatBuf up = FloatBuf(cmd.src1_addr);
++            // swiglu single-input: src0=[gate;up] concat, ne=output (half)
++            FloatBuf s0 = FloatBuf(cmd.src0_addr);
 +            FloatBuf dst = FloatBuf(cmd.dst_addr);
 +            for (uint i = global_start; i < ne; i += global_stride) {
-+                float g = gate.d[i];
++                float g = s0.d[i];
 +                float silu_g = g / (1.0 + exp(-g));
-+                dst.d[i] = silu_g * up.d[i];
++                dst.d[i] = silu_g * s0.d[ne + i];
 +            }
 +        } break;
 +
@@ -369,15 +378,14 @@ index 0000000000..866d935176
 +    }
 +}
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index 8186dba36f..b8e48b34a0 100644
+index 8186dba36f..2ff59a73df 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-@@ -1034,6 +1034,8 @@ void process_shaders() {
+@@ -1033,6 +1033,7 @@ void process_shaders() {
+     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
  
      string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
- 
 +    string_to_spv("ubershader_qwen35_elem", "ubershader_qwen35_elem.comp", {});
-+
+ 
      string_to_spv("topk_moe_f32", "topk_moe.comp", {});
  
-     for (auto &c : compiles) {
