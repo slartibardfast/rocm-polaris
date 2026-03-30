@@ -1,22 +1,327 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 669f66b650..737c6d25b7 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -559,6 +559,9 @@ extern "C" {
+         GGML_OP_RWKV_WKV7,
+         GGML_OP_SOLVE_TRI,
+         GGML_OP_GATED_DELTA_NET,
++        GGML_OP_FUSED_GATE_PREP,
++        GGML_OP_FUSED_GATED_NORM,
++        GGML_OP_FUSED_DUAL_L2_NORM,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2361,6 +2364,23 @@ extern "C" {
+             struct ggml_tensor  * sx,
+             struct ggml_tensor  * c);
+ 
++    GGML_API struct ggml_tensor * ggml_fused_gate_prep(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * alpha,
++            struct ggml_tensor  * dt_bias,
++            struct ggml_tensor  * ssm_a);
++
++    GGML_API struct ggml_tensor * ggml_fused_gated_norm(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * input,
++            struct ggml_tensor  * norm_weights,
++            struct ggml_tensor  * gate);
++
++    GGML_API struct ggml_tensor * ggml_fused_dual_l2_norm(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k);
++
+     GGML_API struct ggml_tensor * ggml_ssm_scan(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * s,
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index 1a1bbc9f2b..05e144c53d 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -315,6 +315,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+             else ()
+                 if (GGML_SSE42)
+                     list(APPEND ARCH_FLAGS -msse4.2)
++        list(APPEND ARCH_FLAGS -mssse3)
+                     list(APPEND ARCH_DEFINITIONS GGML_SSE42)
+                 endif()
+                 if (GGML_F16C)
+diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
+index 74d699f633..8fe540638f 100644
+--- a/ggml/src/ggml-cpu/arch/x86/quants.c
++++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+@@ -1905,6 +1905,89 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+ 
+     *s = hsum_float_8(acc) + _mm_cvtss_f32(acc_m);
+ 
++#elif defined(__SSSE3__)
++    // Phase 15: SSSE3 path — same as AVX but with paired __m128 accumulators.
++    const __m128i m4 = _mm_set1_epi8(0xF);
++    const __m128i m2 = _mm_set1_epi8(0x2);
++
++    __m128 acc_lo = _mm_setzero_ps();
++    __m128 acc_hi = _mm_setzero_ps();
++    __m128 acc_m = _mm_setzero_ps();
++
++   for (int i = 0; i < nb; ++i) {
++
++        const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
++        const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
++
++        const uint8_t * GGML_RESTRICT q4 = x[i].qs;
++        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
++
++        memcpy(utmp, x[i].scales, 12);
++        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
++        const uint32_t uaux = utmp[1] & kmask1;
++        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
++        utmp[2] = uaux;
++        utmp[0] &= kmask1;
++
++        const __m128i utmps = _mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]);
++        const __m128i scales = _mm_cvtepu8_epi16(utmps);
++        const __m128i mins = _mm_cvtepu8_epi16(_mm_unpackhi_epi64(utmps, utmps));
++
++        const __m128i q8sums_0 = _mm_loadu_si128((const __m128i*)&y[i].bsums[0]);
++        const __m128i q8sums_1 = _mm_loadu_si128((const __m128i*)&y[i].bsums[8]);
++        const __m128i q8s = _mm_hadd_epi16(q8sums_0, q8sums_1);
++        const __m128i prod = _mm_madd_epi16(mins, q8s);
++        acc_m = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod)), acc_m);
++
++        __m128i sumi_0 = _mm_setzero_si128();
++        __m128i sumi_1 = _mm_setzero_si128();
++
++        __m128i shuffle = _mm_set1_epi16(0x0100);
++        for (int j = 0; j < QK_K/64; ++j) {
++
++            const __m128i scale_l = _mm_shuffle_epi8(scales, shuffle);
++            shuffle = _mm_add_epi16(shuffle, m2);
++            const __m128i scale_h = _mm_shuffle_epi8(scales, shuffle);
++            shuffle = _mm_add_epi16(shuffle, m2);
++
++            __m128i q4bits = _mm_loadu_si128((const __m128i*)q4); q4 += 16;
++            const __m128i q4l_0 = _mm_and_si128(q4bits, m4);
++            const __m128i q4h_0 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4);
++            q4bits = _mm_loadu_si128((const __m128i*)q4); q4 += 16;
++            const __m128i q4l_1 = _mm_and_si128(q4bits, m4);
++            const __m128i q4h_1 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4);
++
++            const __m128i q8l_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
++            __m128i p16l = _mm_maddubs_epi16(q4l_0, q8l_0);
++            p16l = _mm_madd_epi16(scale_l, p16l);
++            sumi_0 = _mm_add_epi32(sumi_0, p16l);
++            const __m128i q8l_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
++            p16l = _mm_maddubs_epi16(q4l_1, q8l_1);
++            p16l = _mm_madd_epi16(scale_l, p16l);
++            sumi_1 = _mm_add_epi32(sumi_1, p16l);
++
++            const __m128i q8h_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
++            __m128i p16h = _mm_maddubs_epi16(q4h_0, q8h_0);
++            p16h = _mm_madd_epi16(scale_h, p16h);
++            sumi_0 = _mm_add_epi32(sumi_0, p16h);
++            const __m128i q8h_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
++            p16h = _mm_maddubs_epi16(q4h_1, q8h_1);
++            p16h = _mm_madd_epi16(scale_h, p16h);
++            sumi_1 = _mm_add_epi32(sumi_1, p16h);
++        }
++
++        __m128 vd = _mm_set1_ps(d);
++        acc_lo = _mm_add_ps(_mm_mul_ps(vd, _mm_cvtepi32_ps(sumi_0)), acc_lo);
++        acc_hi = _mm_add_ps(_mm_mul_ps(vd, _mm_cvtepi32_ps(sumi_1)), acc_hi);
++    }
++
++    __m128 acc_sum = _mm_add_ps(acc_lo, acc_hi);
++    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
++    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
++    acc_sum = _mm_add_ps(acc_sum, _mm_movehl_ps(acc_sum, acc_sum));
++    acc_sum = _mm_add_ss(acc_sum, _mm_movehdup_ps(acc_sum));
++    *s = _mm_cvtss_f32(acc_sum) + _mm_cvtss_f32(acc_m);
++
+ #else
+     UNUSED(x);
+     UNUSED(y);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 8b323bd9b0..ad673e11fb 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2031,6 +2031,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_gated_delta_net(params, tensor);
+             } break;
++        case GGML_OP_FUSED_GATE_PREP:
++        case GGML_OP_FUSED_GATED_NORM:
++        case GGML_OP_FUSED_DUAL_L2_NORM:
++            {
++                GGML_ABORT("GPU-only fused op scheduled on CPU");
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2214,6 +2220,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = n_threads;
+             } break;
++        case GGML_OP_FUSED_GATE_PREP:
++        case GGML_OP_FUSED_GATED_NORM:
++        case GGML_OP_FUSED_DUAL_L2_NORM:
++            {
++                n_tasks = 1;
++            } break;
+         case GGML_OP_REPEAT:
+         case GGML_OP_REPEAT_BACK:
+         case GGML_OP_LEAKY_RELU:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 3f85e531da..75a9361c53 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12,6 +12,19 @@
+ #include <cfloat>
+ #include <cmath>
+ 
++// Phase 15: Inline fast exp approximation for CPU softmax.
++static inline float ggml_fast_expf(float x) {
++    if (x < -88.0f) return 0.0f;
++    if (x > 88.0f) return INFINITY;
++    float k = roundf(x * 1.4426950408889634f);
++    float r = x - k * 0.6931471805599453f;
++    float p = 1.f + r*(1.f + r*(0.5f + r*(0.16666667f + r*(0.041666668f + r*(0.0083333338f + r*0.0013888889f)))));
++    union { float f; int32_t i; } u; u.f = p;
++    u.i += ((int32_t)k) << 23;
++    return u.f;
++}
++
++
+ // ggml_compute_forward_dup
+ 
+ static void ggml_compute_forward_dup_same_cont(
+@@ -5323,7 +5336,7 @@ static void ggml_compute_forward_soft_max_f32(
+                 assert(sum > 0.0);
+ 
+                 if (sk) {
+-                    sum += (ggml_float) expf(sk[i02] - max);
++                    sum += (ggml_float) ggml_fast_expf(sk[i02] - max);
+                 }
+ 
+                 sum = 1.0/sum;
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 3198b33b50..ad422f8d4e 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -1554,7 +1554,25 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
+ }
+ 
+ inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
+-#ifndef GGML_USE_ACCELERATE
++#if defined(__SSE__)
++    // Phase 15: SSE vectorized max — 4 floats per cycle.
++    __m128 vmax = _mm_set1_ps(-INFINITY);
++    int i = 0;
++    for (; i + 15 < n; i += 16) {
++        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i));
++        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i + 4));
++        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i + 8));
++        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i + 12));
++    }
++    for (; i + 3 < n; i += 4) {
++        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i));
++    }
++    vmax = _mm_max_ps(vmax, _mm_shuffle_ps(vmax, vmax, _MM_SHUFFLE(2,3,0,1)));
++    vmax = _mm_max_ps(vmax, _mm_movehl_ps(vmax, vmax));
++    float max = _mm_cvtss_f32(vmax);
++    for (; i < n; ++i) { if (x[i] > max) max = x[i]; }
++    *s = max;
++#elif !defined(GGML_USE_ACCELERATE)
+     float max = -INFINITY;
+     for (int i = 0; i < n; ++i) {
+         max = MAX(max, x[i]);
+@@ -1571,6 +1589,29 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
+ }
+ 
+ inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
++#if defined(__SSE4_1__)
++    // Phase 15: SSE4.1 vectorized argmax — branch-free via blendv.
++    __m128 vmax = _mm_set1_ps(-INFINITY);
++    __m128i vidx = _mm_setzero_si128();
++    __m128i vcur = _mm_setr_epi32(0, 1, 2, 3);
++    const __m128i vstep = _mm_set1_epi32(4);
++    int i = 0;
++    for (; i + 3 < n; i += 4) {
++        __m128 v = _mm_loadu_ps(x + i);
++        __m128 mask = _mm_cmpgt_ps(v, vmax);
++        vmax = _mm_blendv_ps(vmax, v, mask);
++        vidx = (__m128i)_mm_blendv_ps((__m128)vidx, (__m128)vcur, mask);
++        vcur = _mm_add_epi32(vcur, vstep);
++    }
++    // Horizontal reduction: find lane with max
++    float tmp[4]; int tmpi[4];
++    _mm_storeu_ps(tmp, vmax);
++    _mm_storeu_si128((__m128i*)tmpi, vidx);
++    float max = tmp[0]; int idx = tmpi[0];
++    for (int j = 1; j < 4; j++) { if (tmp[j] > max) { max = tmp[j]; idx = tmpi[j]; } }
++    for (; i < n; ++i) { if (x[i] > max) { max = x[i]; idx = i; } }
++    *s = idx;
++#else
+     float max = -INFINITY;
+     int idx = 0;
+     for (int i = 0; i < n; ++i) {
+@@ -1578,6 +1619,7 @@ inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
+         if (max == x[i]) { idx = i; }
+     }
+     *s = idx;
++#endif
+ }
+ 
+ #ifdef __cplusplus
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 221e6fa04e..7a4cb55522 100644
+index 221e6fa04e..fa4713bb5e 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -833,6 +833,13 @@ struct vk_device_struct {
+@@ -831,8 +831,18 @@ struct vk_device_struct {
+     vk_pipeline pipeline_ssm_scan_f32_d128;
+     vk_pipeline pipeline_ssm_scan_f32_d256;
      vk_pipeline pipeline_ssm_conv_f32;
++    vk_pipeline pipeline_fused_gate_prep_f32;
++    vk_pipeline pipeline_fused_gated_norm_f32;
++    vk_pipeline pipeline_fused_dual_l2_norm_f32;
      vk_pipeline pipeline_opt_step_adamw_f32;
      vk_pipeline pipeline_opt_step_sgd_f32;
 +
-+    // Phase 17: Ubershader
++    // Phase 17: Ubershader for batched elementwise ops
 +    vk_pipeline pipeline_ubershader_elem;
-+    vk_buffer uber_cmd_buf;
-+    vk_buffer uber_barrier_buf;
-+    bool uber_enabled = false;
++    vk_buffer uber_cmd_buf;         // GPU-side command buffer (MegaCmd array)
++    vk_buffer uber_barrier_buf;     // GPU-side barrier counters (uint array)
++    uint32_t uber_op_mask = 0;
 +
      std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
      std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
      std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f32[CONV_SHAPE_COUNT];
-@@ -1920,6 +1927,18 @@ struct ggml_backend_vk_context {
+@@ -1488,6 +1498,23 @@ struct vk_op_ssm_conv_push_constants {
+     uint32_t nc, ncs, nr, n_t, n_s;
+ };
+ 
++struct vk_op_fused_gate_prep_push_constants {
++    uint32_t ne;
++    uint32_t num_v_heads;
++};
++
++struct vk_op_fused_gated_norm_push_constants {
++    uint32_t ne;
++    uint32_t head_dim;
++    float eps;
++};
++
++struct vk_op_fused_dual_l2_norm_push_constants {
++    uint32_t ne;
++    uint32_t vec_dim;
++    float eps;
++};
++
+ struct vk_op_conv2d_push_constants {
+     uint32_t Cout;
+     uint32_t Cin;
+@@ -1920,6 +1947,20 @@ struct ggml_backend_vk_context {
      topk_moe_mode fused_topk_moe_mode {};
      bool fused_topk_moe_scale {};
  
@@ -29,19 +334,66 @@ index 221e6fa04e..7a4cb55522 100644
 +        uint64_t src2_addr;
 +        uint64_t dst_addr;
 +        uint32_t params[2];
-+    };
++    };  // 48 bytes
++    static_assert(sizeof(UberCmd) == 48, "UberCmd size mismatch");
 +    std::vector<UberCmd> uber_cmds;
++    uint32_t uber_max_cmds = 512;
 +
      // for GGML_VK_PERF_LOGGER
      std::unique_ptr<vk_perf_logger> perf_logger;
      vk::QueryPool query_pool;
-@@ -4654,6 +4673,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
+@@ -2082,26 +2123,11 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+         ctx->almost_ready_fence_pending = false;
+     }
+ 
+-    // Spin (w/pause) waiting for the graph to finish executing.
+-    vk::Result result;
+-    while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
+-        if (result != vk::Result::eNotReady) {
+-            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
+-            exit(1);
+-        }
+-        for (uint32_t i = 0; i < 100; ++i) {
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-        }
+-    }
++    // Phase 16: Block efficiently instead of busy-wait spinning.
++    // The PAUSE loop burned 40% of CPU time. vkWaitForFences uses
++    // kernel futex/sleep, freeing the CPU for other work.
++    VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX),
++             "ggml_vk_sync_buffers waitForFences");
+     ctx->device->device.resetFences({ ctx->fence });
+ }
+ 
+@@ -4001,7 +4027,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
+     }
+     uint32_t rm_iq = 2 * rm_kq;
+ 
+-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
++    const bool use_subgroups = device->subgroup_arithmetic; // Phase 16: enable subgroupAdd on GCN
+     // Ensure a subgroup size >= 16 is available
+     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
+ 
+@@ -4654,6 +4680,18 @@ static void ggml_vk_load_shaders(vk_device& device) {
  
      ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
  
-+    // Phase 17: Ubershader pipeline
-+    if (device->uber_enabled) {
-+        struct { uint32_t a; uint32_t b; } uber_pc;
++    ggml_vk_create_pipeline(device, device->pipeline_fused_gate_prep_f32, "fused_gate_prep_f32", fused_gate_prep_f32_len, fused_gate_prep_f32_data, "main", 4, sizeof(vk_op_fused_gate_prep_push_constants), {256, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_fused_gated_norm_f32, "fused_gated_norm_f32", fused_gated_norm_f32_len, fused_gated_norm_f32_data, "main", 4, sizeof(vk_op_fused_gated_norm_push_constants), {128, 1, 1}, {128}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_fused_dual_l2_norm_f32, "fused_dual_l2_norm_f32", fused_dual_l2_norm_f32_len, fused_dual_l2_norm_f32_data, "main", 3, sizeof(vk_op_fused_dual_l2_norm_push_constants), {128, 1, 1}, {128}, 1);
++
++    // Phase 17: Ubershader pipeline (2 SSBOs: cmd buffer + barrier counters, push constants: num_cmds + num_wgs)
++    if (device->uber_op_mask) {
++        struct { uint32_t num_cmds; uint32_t num_wgs; } uber_pc;
 +        ggml_vk_create_pipeline(device, device->pipeline_ubershader_elem, "ubershader_qwen35_elem",
 +            ubershader_qwen35_elem_len, ubershader_qwen35_elem_data, "main",
 +            2, sizeof(uber_pc), {1, 1, 1}, {}, 1);
@@ -50,62 +402,137 @@ index 221e6fa04e..7a4cb55522 100644
      ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
  
      ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
-@@ -5191,6 +5218,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
+@@ -5191,6 +5229,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
          device->buffer_device_address = vk12_features.bufferDeviceAddress;
          device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
  
-+        // Phase 17: Ubershader
-+        if (getenv("GGML_VK_UBERSHADER_QWEN35") && device->buffer_device_address && device->shader_int64) {
-+            device->uber_enabled = true;
++        // Phase 17: Enable ubershader if requested and BDA is available
++        const char * uber_env = getenv("GGML_VK_UBERSHADER_QWEN35");
++        if (uber_env && device->buffer_device_address && device->shader_int64) {
++            device->uber_op_mask = (uint32_t)strtoul(uber_env, nullptr, 0);
 +            GGML_LOG_INFO("ggml_vulkan: ubershader enabled for %s\n", device->name.c_str());
 +        }
 +
          if (device->subgroup_size_control) {
              device->subgroup_min_size = subgroup_size_control_props.minSubgroupSize;
              device->subgroup_max_size = subgroup_size_control_props.maxSubgroupSize;
-@@ -14291,6 +14324,102 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -9603,6 +9648,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             return ctx->device->pipeline_ssm_conv_f32;
+         }
+         return nullptr;
++    case GGML_OP_FUSED_GATE_PREP:
++        return ctx->device->pipeline_fused_gate_prep_f32;
++    case GGML_OP_FUSED_GATED_NORM:
++        return ctx->device->pipeline_fused_gated_norm_f32;
++    case GGML_OP_FUSED_DUAL_L2_NORM:
++        return ctx->device->pipeline_fused_dual_l2_norm_f32;
+     case GGML_OP_OPT_STEP_ADAMW:
+         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+             return ctx->device->pipeline_opt_step_adamw_f32;
+@@ -10543,6 +10594,26 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx,
+     });
+ }
+ 
++static void ggml_vk_fused_gate_prep(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const uint32_t ne = (uint32_t)ggml_nelements(dst);
++    const uint32_t num_v_heads = (uint32_t)dst->src[1]->ne[0];
++    ggml_vk_op_f32<vk_op_fused_gate_prep_push_constants>(ctx, subctx, dst->src[0], dst->src[1], dst->src[2], nullptr, dst, GGML_OP_FUSED_GATE_PREP, { ne, num_v_heads });
++}
++
++static void ggml_vk_fused_gated_norm(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const uint32_t ne = (uint32_t)ggml_nelements(dst);
++    const uint32_t head_dim = (uint32_t)dst->src[1]->ne[0];
++    const float eps = 1e-6f;
++    ggml_vk_op_f32<vk_op_fused_gated_norm_push_constants>(ctx, subctx, dst->src[0], dst->src[1], dst->src[2], nullptr, dst, GGML_OP_FUSED_GATED_NORM, { ne, head_dim, eps });
++}
++
++static void ggml_vk_fused_dual_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const uint32_t ne = (uint32_t)ggml_nelements(dst->src[0]);
++    const uint32_t vec_dim = (uint32_t)dst->src[0]->ne[0];
++    const float eps = 1e-6f;
++    ggml_vk_op_f32<vk_op_fused_dual_l2_norm_push_constants>(ctx, subctx, dst->src[0], dst->src[1], nullptr, nullptr, dst, GGML_OP_FUSED_DUAL_L2_NORM, { ne, vec_dim, eps });
++}
++
+ static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
+     const ggml_tensor * x = dst->src[0];
+     const ggml_tensor * g = dst->src[1];
+@@ -12806,7 +12877,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+                     if ((o_base <= n_base && n_base < o_base + o_size) ||
+                         (n_base <= o_base && o_base < n_base + n_size)) {
+-                        return true;
++                        return false;
+                     }
+                 }
+             }
+@@ -13202,6 +13273,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+         break;
+ 
++    case GGML_OP_FUSED_GATE_PREP:
++        ggml_vk_fused_gate_prep(ctx, compute_ctx, node);
++
++        break;
++
++    case GGML_OP_FUSED_GATED_NORM:
++        ggml_vk_fused_gated_norm(ctx, compute_ctx, node);
++
++        break;
++
++    case GGML_OP_FUSED_DUAL_L2_NORM:
++        ggml_vk_fused_dual_l2_norm(ctx, compute_ctx, node);
++
++        break;
++
+     case GGML_OP_OPT_STEP_ADAMW:
+         ggml_vk_opt_step_adamw(ctx, compute_ctx, node);
+ 
+@@ -14291,6 +14377,115 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
      ctx->do_add_rms_partials = false;
      ctx->do_add_rms_partials_offset_calculation = false;
  
-+    // Phase 17: Ubershader helpers
++    // Phase 17: Ubershader state
 +    ctx->uber_cmds.clear();
 +    auto uber_get_bda = [&](const ggml_tensor * t) -> uint64_t {
-+        if (!t || !t->buffer) return 0;
++        if (!t) return 0;
 +        auto sub = ggml_vk_tensor_subbuffer(ctx, t, true);
-+        if (!sub.buffer) return 0;
 +        return sub.buffer->bda_addr + sub.offset;
 +    };
-+    auto uber_is_batchable = [&](const ggml_tensor * node) -> bool {
++    const uint32_t uber_mask = ctx->device->uber_op_mask;
++    auto uber_is_batchable = [uber_mask](const ggml_tensor * node) -> bool {
 +        if (node->type != GGML_TYPE_F32) return false;
-+        if (!node->src[0] || node->src[0]->type != GGML_TYPE_F32) return false;
-+        if (uber_get_bda(node) == 0 || uber_get_bda(node->src[0]) == 0) return false;
++        if (node->src[0] && node->src[0]->type != GGML_TYPE_F32) return false;
++        uint32_t bit = 0;
 +        switch (node->op) {
-+            case GGML_OP_SCALE:
-+            case GGML_OP_CPY:
-+            case GGML_OP_CONT:
-+                return true;
-+            case GGML_OP_ADD:
-+            case GGML_OP_MUL:
-+                if (!node->src[1] || node->src[1]->type != GGML_TYPE_F32) return false;
-+                if (uber_get_bda(node->src[1]) == 0) return false;
-+                return ggml_nelements(node->src[0]) == ggml_nelements(node->src[1]);
++            case GGML_OP_ADD:   bit = 0x01;
++                if (node->src[1] && node->src[1]->type != GGML_TYPE_F32) return false;
++                break;
++            case GGML_OP_MUL:   bit = 0x02;
++                if (node->src[1] && node->src[1]->type != GGML_TYPE_F32) return false;
++                if (node->src[1] && ggml_nelements(node->src[0]) != ggml_nelements(node->src[1])) return false;
++                break;
++            case GGML_OP_SCALE: bit = 0x04; break;
 +            case GGML_OP_UNARY:
 +                switch (ggml_get_unary_op(node)) {
-+                    case GGML_UNARY_OP_SILU:
-+                    case GGML_UNARY_OP_SIGMOID:
-+                        return true;
++                    case GGML_UNARY_OP_SILU:    bit = 0x08; break;
++                    case GGML_UNARY_OP_SIGMOID: bit = 0x10; break;
 +                    default: return false;
 +                }
++                break;
++            case GGML_OP_CPY:
++            case GGML_OP_CONT:  bit = 0x20; break;
 +            case GGML_OP_GLU:
-+                if (ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU) return false;
-+                return !node->src[1];
-+            default:
-+                return false;
++                if (ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU || node->src[1]) return false;
++                bit = 0x40; break;
++            case GGML_OP_FUSED_GATE_PREP: bit = 0x80; break;
++            default: return false;
 +        }
++        return !!(uber_mask & bit);
 +    };
 +    auto uber_add_cmd = [&](const ggml_tensor * node) {
 +        ggml_backend_vk_context::UberCmd cmd = {};
-+        cmd.ne = (uint32_t)ggml_nelements(node);
++        uint32_t ne = (uint32_t)ggml_nelements(node);
++        cmd.ne = ne;
 +        cmd.dst_addr = uber_get_bda(node);
 +        cmd.src0_addr = uber_get_bda(node->src[0]);
 +        cmd.src1_addr = node->src[1] ? uber_get_bda(node->src[1]) : 0;
@@ -125,12 +552,16 @@ index 221e6fa04e..7a4cb55522 100644
 +            case GGML_OP_CPY:
 +            case GGML_OP_CONT:  cmd.op_type = 5; break;
 +            case GGML_OP_GLU:   cmd.op_type = 7; break;
++            case GGML_OP_FUSED_GATE_PREP: cmd.op_type = 8;
++                cmd.params[0] = (uint32_t)node->src[1]->ne[0]; break;
 +            default: return;
 +        }
 +        ctx->uber_cmds.push_back(cmd);
 +    };
 +    auto uber_flush = [&](vk_context& compute_ctx) {
-+        if (ctx->uber_cmds.empty() || !ctx->device->uber_enabled) return;
++        if (ctx->uber_cmds.empty() || !ctx->device->uber_op_mask) return;
++
++        // Upload commands to GPU buffer
 +        uint32_t cmd_bytes = (uint32_t)(ctx->uber_cmds.size() * sizeof(ggml_backend_vk_context::UberCmd));
 +        if (!ctx->device->uber_cmd_buf || ctx->device->uber_cmd_buf->size < cmd_bytes) {
 +            ctx->device->uber_cmd_buf = ggml_vk_create_buffer_check(ctx->device,
@@ -145,12 +576,17 @@ index 221e6fa04e..7a4cb55522 100644
 +                vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
 +                vk::MemoryPropertyFlagBits::eHostCoherent);
 +        }
++
++        // Copy commands and zero barrier counters
 +        memcpy(ctx->device->uber_cmd_buf->ptr, ctx->uber_cmds.data(), cmd_bytes);
 +        memset(ctx->device->uber_barrier_buf->ptr, 0, barrier_bytes);
++
++        // Dispatch ubershader: 5 workgroups (1 per CU)
 +        const uint32_t num_wgs = 5;
 +        struct { uint32_t num_cmds; uint32_t num_wgs; } pc = {
 +            (uint32_t)ctx->uber_cmds.size(), num_wgs
 +        };
++
 +        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_ubershader_elem, 1);
 +        ggml_vk_sync_buffers(ctx, compute_ctx);
 +        ggml_vk_dispatch_pipeline(ctx, compute_ctx,
@@ -160,22 +596,33 @@ index 221e6fa04e..7a4cb55522 100644
 +                vk::DescriptorBufferInfo{ctx->device->uber_barrier_buf->buffer, 0, barrier_bytes},
 +            },
 +            pc, { num_wgs, 1, 1 });
++
 +        ctx->uber_cmds.clear();
 +    };
 +
      int last_node = cgraph->n_nodes - 1;
  
      // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
-@@ -14368,6 +14497,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14351,7 +14546,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
+     // (and scaled down based on model size, so smaller models submit earlier).
+     // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
+-    int nodes_per_submit = 100;
++    int nodes_per_submit = 2000;
+     int submitted_nodes = 0;
+     int submit_count = 0;
+     uint64_t mul_mat_bytes = 0;
+@@ -14368,6 +14563,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
              total_mul_mat_bytes += bytes;
          }
  
-+        // Phase 17: Ubershader batching
-+        if (ctx->device->uber_enabled && uber_is_batchable(cgraph->nodes[i])) {
++        // Phase 17: Ubershader batching — accumulate simple elementwise ops
++        if (ctx->device->uber_op_mask && uber_is_batchable(cgraph->nodes[i])) {
 +            uber_add_cmd(cgraph->nodes[i]);
-+            continue;
++            continue;  // Skip normal dispatch path
 +        }
-+        if (ctx->device->uber_enabled && !ctx->uber_cmds.empty()) {
++        // Flush accumulated ubershader commands before non-batchable op
++        if (ctx->device->uber_op_mask && !ctx->uber_cmds.empty()) {
 +            compute_ctx = ggml_vk_get_compute_ctx(ctx);
 +            uber_flush(compute_ctx);
 +        }
@@ -183,12 +630,12 @@ index 221e6fa04e..7a4cb55522 100644
          // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
          // the fused result in an elementwise-way. This affects whether the memory for
          // the src is allowed to overlap the memory for the destination.
-@@ -14601,6 +14740,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14601,6 +14807,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
          ctx->fused_ops_write_mask = 0;
      }
  
-+    // Phase 17: Final ubershader flush
-+    if (ctx->device->uber_enabled && !ctx->uber_cmds.empty()) {
++    // Phase 17: Flush any remaining ubershader commands after graph walk
++    if (ctx->device->uber_op_mask && !ctx->uber_cmds.empty()) {
 +        compute_ctx = ggml_vk_get_compute_ctx(ctx);
 +        uber_flush(compute_ctx);
 +    }
@@ -196,9 +643,122 @@ index 221e6fa04e..7a4cb55522 100644
      ctx->last_total_mul_mat_bytes = total_mul_mat_bytes;
  
      if (vk_perf_logger_enabled) {
+@@ -15514,7 +15726,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 }
+                 // pipeline_argsort_large_f32 requires vulkan memory model.
+                 if (device->vulkan_memory_model) {
+-                    return true;
++                    return false;
+                 } else {
+                     return op->ne[0] <= (1 << device->max_workgroup_size_log2);
+                 }
+@@ -15532,7 +15744,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     return false;
+                 }
+             }
+-            return true;
++            return false;
+         case GGML_OP_UPSCALE:
+             if (op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS) {
+                 if ((op->op_params[0] & 0xFF) != GGML_SCALE_MODE_BILINEAR) {
+@@ -15594,7 +15806,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 if (batch_N == 0) {
+                     return false;
+                 }
+-                return true;
++                return false;
+             }
+         case GGML_OP_ARGMAX:
+             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+@@ -15617,7 +15829,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_RWKV_WKV6:
+         case GGML_OP_RWKV_WKV7:
+-            return true; // all inputs are contiguous, see ggml.c
++            return false; // all inputs are contiguous, see ggml.c
+         case GGML_OP_GATED_DELTA_NET:
+             {
+                 const uint32_t S_v = op->src[2]->ne[0];
+@@ -15667,9 +15879,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     return false;
+                 }
+ 
+-                return true;
++                return false;
+             }
+         case GGML_OP_SSM_CONV:
++        case GGML_OP_FUSED_GATE_PREP:
++        case GGML_OP_FUSED_GATED_NORM:
++        case GGML_OP_FUSED_DUAL_L2_NORM:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+@@ -15942,7 +16157,7 @@ static bool ggml_vk_instance_layer_settings_available() {
+         if (layer_name == layer.layerName.data()) {
+             for (const auto& ext : vk::enumerateInstanceExtensionProperties(layer_name)) {
+                 if (strcmp("VK_EXT_layer_settings", ext.extensionName.data()) == 0) {
+-                    return true;
++                    return false;
+                 }
+             }
+         }
+@@ -15957,7 +16172,7 @@ static bool ggml_vk_instance_portability_enumeration_ext_available(const std::ve
+     // Check for portability enumeration extension for MoltenVK support
+     for (const auto& properties : instance_extensions) {
+         if (strcmp("VK_KHR_portability_enumeration", properties.extensionName) == 0) {
+-            return true;
++            return false;
+         }
+     }
+     std::cerr << "ggml_vulkan: WARNING: Instance extension VK_KHR_portability_enumeration not found." << std::endl;
+@@ -15973,7 +16188,7 @@ static bool ggml_vk_instance_debug_utils_ext_available(
+     // Check for portability enumeration extension for MoltenVK support
+     for (const auto & properties : instance_extensions) {
+         if (strcmp("VK_EXT_debug_utils", properties.extensionName) == 0) {
+-            return true;
++            return false;
+         }
+     }
+ 
+@@ -16008,9 +16223,9 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
+             // Workaround for AMD proprietary driver reporting support on all GPUs
+             return arch == vk_device_architecture::AMD_RDNA3;
+         }
+-        return true;
++        return false;
+     default:
+-        return true;
++        return false;
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+index 5e9f8308c1..8b42bd1ed7 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net.comp
+@@ -115,7 +115,7 @@ void main() {
+         const uint k_off = q_off;
+         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
+         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
+-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
++        const FLOAT_TYPE beta_val = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-FLOAT_TYPE(data_beta[gb_off]))); // Phase 16: sigmoid fused
+ 
+         FLOAT_TYPE k_reg[ROWS_PER_LANE];
+         FLOAT_TYPE q_reg[ROWS_PER_LANE];
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv.comp b/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv.comp
+index 6802b1fc95..23df4684ab 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/ssm_conv.comp
+@@ -46,5 +46,5 @@ void main() {
+     }
+ 
+     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
+-    dst[dst_idx] = sum;
++    float s = sum; dst[dst_idx] = s / (1.0 + exp(-s));
+ }
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/ubershader_qwen35_elem.comp b/ggml/src/ggml-vulkan/vulkan-shaders/ubershader_qwen35_elem.comp
 new file mode 100644
-index 0000000000..686fa78a80
+index 0000000000..aafb9ab58f
 --- /dev/null
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/ubershader_qwen35_elem.comp
 @@ -0,0 +1,175 @@
@@ -343,7 +903,7 @@ index 0000000000..686fa78a80
 +        } break;
 +
 +        case OP_SWIGLU: {
-+            // swiglu single-input: src0=[gate;up] concat, ne=output (half)
++            // swiglu(gate, up) = silu(gate) * up
 +            FloatBuf s0 = FloatBuf(cmd.src0_addr);
 +            FloatBuf dst = FloatBuf(cmd.dst_addr);
 +            for (uint i = global_start; i < ne; i += global_stride) {
@@ -378,14 +938,151 @@ index 0000000000..686fa78a80
 +    }
 +}
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index 8186dba36f..2ff59a73df 100644
+index 8186dba36f..5cb51d0c91 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-@@ -1033,6 +1033,7 @@ void process_shaders() {
-     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
+@@ -1034,6 +1034,12 @@ void process_shaders() {
  
      string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
-+    string_to_spv("ubershader_qwen35_elem", "ubershader_qwen35_elem.comp", {});
  
++    string_to_spv("fused_gate_prep_f32", "fused_gate_prep.comp", {});
++    string_to_spv("fused_gated_norm_f32", "fused_gated_norm.comp", {});
++    string_to_spv("fused_dual_l2_norm_f32", "fused_dual_l2_norm.comp", {});
++
++    string_to_spv("ubershader_qwen35_elem", "ubershader_qwen35_elem.comp", {});
++
      string_to_spv("topk_moe_f32", "topk_moe.comp", {});
  
+     for (auto &c : compiles) {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 4c0764a0ac..c95409042b 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1040,6 +1040,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "RWKV_WKV7",
+     "SOLVE_TRI",
+     "GATED_DELTA_NET",
++    "FUSED_GATE_PREP",
++    "FUSED_GATED_NORM",
++    "FUSED_DUAL_L2_NORM",
+ 
+     "UNARY",
+ 
+@@ -1057,7 +1060,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
++static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1150,6 +1153,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "rwkv_wkv7(r, w, k, v, a, b, s)",
+     "A X = B, A triangular, solve X",
+     "gated_delta_net(q, k, v, g, beta, s)",
++    "fused_gate_prep(alpha, dt, a)",
++    "fused_gated_norm(x, w, gate)",
++    "fused_dual_l2_norm(q, k)",
+ 
+     "unary(x)",
+ 
+@@ -1167,7 +1173,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
++static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5468,6 +5474,55 @@ struct ggml_tensor * ggml_ssm_conv(
+     return result;
+ }
+ 
++// ggml_fused_gate_prep
++
++struct ggml_tensor * ggml_fused_gate_prep(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * alpha,
++        struct ggml_tensor  * dt_bias,
++        struct ggml_tensor  * ssm_a) {
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, alpha->ne);
++    result->op     = GGML_OP_FUSED_GATE_PREP;
++    result->src[0] = alpha;
++    result->src[1] = dt_bias;
++    result->src[2] = ssm_a;
++    return result;
++}
++
++// ggml_fused_gated_norm
++
++struct ggml_tensor * ggml_fused_gated_norm(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * input,
++        struct ggml_tensor  * norm_weights,
++        struct ggml_tensor  * gate) {
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, input->ne);
++    result->op     = GGML_OP_FUSED_GATED_NORM;
++    result->src[0] = input;
++    result->src[1] = norm_weights;
++    result->src[2] = gate;
++    return result;
++}
++
++// ggml_fused_dual_l2_norm
++
++struct ggml_tensor * ggml_fused_dual_l2_norm(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k) {
++    // Output is 2x q's first dimension (q_norm then k_norm concatenated)
++    int64_t ne[GGML_MAX_DIMS];
++    for (int i = 0; i < GGML_MAX_DIMS; i++) {
++        ne[i] = q->ne[i];
++    }
++    ne[0] *= 2;
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
++    result->op     = GGML_OP_FUSED_DUAL_L2_NORM;
++    result->src[0] = q;
++    result->src[1] = k;
++    return result;
++}
++
+ // ggml_ssm_scan
+ 
+ struct ggml_tensor * ggml_ssm_scan(
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index e0e48d2a4f..313a858ea8 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -224,17 +224,14 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
+     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+     cb(beta, "beta", il);
+ 
+-    beta = ggml_sigmoid(ctx0, beta);
++    // beta = ggml_sigmoid(ctx0, beta); // Phase 16: fused into gated_delta_net
+ 
+     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+     cb(alpha, "alpha", il);
+ 
+-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+-    cb(alpha_softplus, "a_softplus", il);
+-
+-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
++    // Phase 16: fused gate prep (add+softplus+mul -> 1 dispatch)
++    ggml_tensor * gate = ggml_fused_gate_prep(ctx0, alpha, model.layers[il].ssm_dt, model.layers[il].ssm_a);
+     cb(gate, "gate", il);
+ 
+     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+@@ -282,7 +279,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
++    ggml_tensor * conv_output_silu = conv_output_proper; // Phase 16: SiLU fused into ssm_conv
+     cb(conv_output_silu, "conv_output_silu", il);
+ 
+     ggml_tensor * conv_qkv_mix = conv_output_silu;
