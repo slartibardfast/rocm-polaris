@@ -1,0 +1,22 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v8.c
+@@ -215,6 +215,18 @@
+ 	if (valid_wptr)
+ 		WREG32(mmCP_HQD_PQ_WPTR, (wptr_val << wptr_shift) & wptr_mask);
+
++	if (wptr) {
++		/* Trigger CP to poll WPTR from the address in the MQD.
++		 * gfx9+ kgd_hqd_load writes CP_PQ_WPTR_POLL_CNTL1 with
++		 * the queue bitmask to trigger a one-shot WPTR read from
++		 * memory. Without this, the CP never reads updated WPTR
++		 * values after the initial register write, causing AQL
++		 * dispatch to hang.
++		 */
++		uint32_t queue_mask = 1 << (pipe_id *
++			adev->gfx.mec.num_queue_per_pipe + queue_id);
++		WREG32(mmCP_PQ_WPTR_POLL_CNTL1, queue_mask);
++	}
++
+ 	data = REG_SET_FIELD(m->cp_hqd_active, CP_HQD_ACTIVE, ACTIVE, 1);
+ 	WREG32(mmCP_HQD_ACTIVE, data);
+

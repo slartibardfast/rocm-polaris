@@ -1,0 +1,10 @@
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon Pro WX 2100 (RADV POLARIS12) (radv) | uma: 0 | fp16: 0 | bf16: 0 | warp size: 64 | shared memory: 65536 | int dot: 0 | matrix cores: none
+build: 8508 (9f102a1407) with GNU 15.2.1 for Linux x86_64
+main: llama backend init
+main: load the model and apply lora adapter, if any
+common_init_result: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on
+../../../llama.cpp-b8508/ggml/src/ggml.c:1876: GGML_ASSERT(tensor->op == GGML_OP_UNARY) failed
+⚠️ warning: the debug information found in "/usr/lib/debug/usr/bin/llama-completion.debug" does not match "/usr/bin/llama-completion" (CRC mismatch).
+⚠️ warning: the debug information found in "/usr/lib/debug/usr/bin/llama-completion.debug" does not match "/usr/bin/llama-completion" (CRC mismatch).
+⚠️ warning: 15331	../../../../llama.cpp-b8508/ggml/src/ggml-vulkan/ggml-vulkan.cpp: No such file or directory
