@@ -13,3 +13,7 @@
 [submodule "submodules/llvm-project"]
 	path = submodules/llvm-project
 	url = https://github.com/ROCm/llvm-project.git
+[submodule "llama-jit"]
+	path = llama-jit
+	url = ssh://git@github.com/slartibardfast/llama.cpp.git
+	branch = polaris-jit

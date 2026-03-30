@@ -36,4 +36,3 @@ tests/*.o
 .DS_Store
 Thumbs.db
 llama.cpp/llama.cpp-b7376/
-llama-jit/
