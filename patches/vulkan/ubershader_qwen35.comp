@@ -1,0 +1,291 @@
+// Phase 17: GCN3 Ubershader with matmul-vec for Qwen3.5 inference
+//
+// Single persistent dispatch replaces ALL elementwise + matmul dispatches.
+// Uses VK_KHR_buffer_device_address for direct buffer access.
+// Atomic global barriers between ops (~2µs vs ~50µs dispatch boundary).
+//
+// Workgroup count: 20 (4 per CU on 5-CU Polaris 12)
+// Workgroup size: 64 (1 GCN3 wavefront)
+
+#version 450
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// ========== BDA buffer reference types ==========
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatBuf { float d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Float2Buf { vec2 d[]; };
+
+// Q4_K block: 144 bytes = f16vec2 dm + uint16[6] scales + uint16[64] qs
+// We access as packed16 and packed32 views for efficient dequant
+struct Q4K_Block {
+    f16vec2 dm;           // 4 bytes: d (scale) and dmin (min)
+    uint16_t scales[6];   // 12 bytes: 6 × uint16 packed scales
+    uint16_t qs[64];      // 128 bytes: 64 × uint16 packed quants
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Q4K_Buf { Q4K_Block blocks[]; };
+
+struct Q4K_Packed32 {
+    f16vec2 dm;
+    uint32_t scales[3];
+    uint32_t qs[32];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Q4K_P32 { Q4K_Packed32 blocks[]; };
+
+// ========== Op type enum ==========
+
+const uint OP_ADD       = 0;
+const uint OP_MUL       = 1;
+const uint OP_SCALE     = 2;
+const uint OP_SILU      = 3;
+const uint OP_SIGMOID   = 4;
+const uint OP_CPY       = 5;
+const uint OP_SWIGLU    = 7;
+const uint OP_GATE_PREP = 8;
+const uint OP_MMV_Q4K   = 16;  // matmul-vec q4_K
+
+// ========== Command structure ==========
+
+struct UberCmd {
+    uint op_type;
+    uint ne;               // element count (elementwise) or ncols (matmul K)
+    uint64_t src0_addr;    // weight matrix (matmul) or source 0
+    uint64_t src1_addr;    // activation vector (matmul) or source 1
+    uint64_t src2_addr;    // unused for matmul
+    uint64_t dst_addr;     // output
+    uint params[2];        // [0]=M (matmul rows), [1]=stride_d (matmul)
+                           // [0]=scale (SCALE), [0]=num_v_heads (GATE_PREP)
+};
+
+layout(binding = 0) readonly buffer CmdBuf { UberCmd cmds[]; };
+layout(binding = 1) coherent buffer BarrierBuf { uint counters[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint num_cmds;
+    uint num_wgs;
+};
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// ========== Global barrier ==========
+
+void global_barrier(uint step) {
+    memoryBarrierBuffer();
+    if (gl_LocalInvocationID.x == 0) {
+        atomicAdd(counters[step], 1u);
+        while (atomicOr(counters[step], 0u) < num_wgs) {}
+    }
+    barrier();
+    memoryBarrierBuffer();
+}
+
+// ========== Q4_K matmul-vec (BDA version) ==========
+// Adapted from mul_mat_vec_q4_k.comp for buffer_reference access.
+// Each workgroup processes NUM_ROWS=4 rows. Grid-stride over M.
+// 16 threads per superblock, 4 thread groups per workgroup (64/16).
+
+const uint MMV_NUM_ROWS = 4;
+
+void q4k_matmul_vec(uint64_t a_addr, uint64_t b_addr, uint64_t d_addr,
+                     uint first_row, uint num_rows, uint num_blocks, uint stride_d) {
+
+    Q4K_Buf A = Q4K_Buf(a_addr);
+    Q4K_P32 A32 = Q4K_P32(a_addr);
+    FloatBuf B = FloatBuf(b_addr);
+    FloatBuf D = FloatBuf(d_addr);
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 16;   // 0..15
+    const uint ix = tid / 16;     // 0..3 (thread group index)
+    const uint it_size = 4;       // 64/16
+
+    const uint il = itid / 4;                    // 0..3
+    const uint ir = itid - 4 * il;               // 0..3
+    const uint v_im = il / 2;
+    const uint v_in = il % 2;
+    const uint l0 = 4 * (2 * ir + v_in);
+    const uint q_offset = 32 * v_im + l0;
+    const uint y_offset = 64 * v_im + l0;
+
+    float temp[MMV_NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < MMV_NUM_ROWS; n++) temp[n] = 0.0;
+
+    for (uint i = ix; i < num_blocks; i += it_size) {
+        const uint y1_idx = i * 256 + y_offset;
+        const uint y2_idx = y1_idx + 128;
+
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            const uint ib0 = (first_row + n) * num_blocks;
+
+            vec2 dm_v = vec2(A.blocks[ib0 + i].dm);
+            float d_val = dm_v.x;
+            float dmin = dm_v.y;
+
+            // Unpack scales
+            uint32_t scale0_u32 = A.blocks[ib0 + i].scales[v_im    ];
+            uint32_t scale4_u32 = A.blocks[ib0 + i].scales[v_im + 2];
+            uint32_t scale8_u32 = A.blocks[ib0 + i].scales[v_im + 4];
+
+            uint32_t scale_0_4_l = (scale4_u32 << 16) | scale0_u32;
+            uint32_t scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0) >> 2;
+            vec4 scale_0_4_l_f = vec4(unpack8(scale_0_4_l & 0x3F3F3F3F));
+            vec4 scale8_f = vec4(unpack8((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0F) | scale_0_4_h));
+
+            float sc0 = scale_0_4_l_f.x, sc1 = scale_0_4_l_f.y;
+            float sc2 = scale_0_4_l_f.z, sc3 = scale_0_4_l_f.w;
+            float sc4 = scale8_f.x,      sc5 = scale8_f.y;
+            float sc6 = scale8_f.z,      sc7 = scale8_f.w;
+
+            // Unpack quants
+            uint32_t qs0_u32 = A32.blocks[ib0 + i].qs[q_offset / 4];
+            uint32_t qs64_u32 = A32.blocks[ib0 + i].qs[q_offset / 4 + 16];
+
+            vec4 qs0_lo4 = vec4(unpack8(qs0_u32 & 0x0F0F0F0F));
+            vec4 qs0_hi4 = vec4(unpack8((qs0_u32 >> 4) & 0x0F0F0F0F));
+            vec4 qs64_lo4 = vec4(unpack8(qs64_u32 & 0x0F0F0F0F));
+            vec4 qs64_hi4 = vec4(unpack8((qs64_u32 >> 4) & 0x0F0F0F0F));
+
+            // Load B vector values
+            vec4 by10 = vec4(B.d[y1_idx], B.d[y1_idx+1], B.d[y1_idx+2], B.d[y1_idx+3]);
+            vec4 by132 = vec4(B.d[y1_idx+32], B.d[y1_idx+33], B.d[y1_idx+34], B.d[y1_idx+35]);
+            vec4 by20 = vec4(B.d[y2_idx], B.d[y2_idx+1], B.d[y2_idx+2], B.d[y2_idx+3]);
+            vec4 by232 = vec4(B.d[y2_idx+32], B.d[y2_idx+33], B.d[y2_idx+34], B.d[y2_idx+35]);
+
+            // Dot products
+            float sx = fma(by10.x, qs0_lo4.x, fma(by10.y, qs0_lo4.y, fma(by10.z, qs0_lo4.z, by10.w * qs0_lo4.w)));
+            float sy = fma(by132.x, qs0_hi4.x, fma(by132.y, qs0_hi4.y, fma(by132.z, qs0_hi4.z, by132.w * qs0_hi4.w)));
+            float sz = fma(by20.x, qs64_lo4.x, fma(by20.y, qs64_lo4.y, fma(by20.z, qs64_lo4.z, by20.w * qs64_lo4.w)));
+            float sw = fma(by232.x, qs64_hi4.x, fma(by232.y, qs64_hi4.y, fma(by232.z, qs64_hi4.z, by232.w * qs64_hi4.w)));
+
+            float smin =
+                fma(by10.x, sc2, fma(by132.x, sc3, fma(by20.x, sc6, fma(by232.x, sc7,
+                fma(by10.y, sc2, fma(by132.y, sc3, fma(by20.y, sc6, fma(by232.y, sc7,
+                fma(by10.z, sc2, fma(by132.z, sc3, fma(by20.z, sc6, fma(by232.z, sc7,
+                fma(by10.w, sc2, fma(by132.w, sc3, fma(by20.w, sc6, by232.w * sc7)))))))))))))));
+
+            temp[n] = fma(d_val, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dmin, smin, temp[n]));
+        }
+    }
+
+    // Subgroup reduction (DPP on GCN3)
+    [[unroll]] for (uint n = 0; n < num_rows; n++) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    // Write results (only thread 0 of subgroup)
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            D.d[stride_d * 0 + first_row + n] = temp[n];
+        }
+    }
+}
+
+// ========== Main ==========
+
+void main() {
+    const uint wg_id = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint global_stride = num_wgs * gl_WorkGroupSize.x;
+    const uint global_start = wg_id * gl_WorkGroupSize.x + tid;
+
+    for (uint cmd_idx = 0; cmd_idx < num_cmds; cmd_idx++) {
+        UberCmd cmd = cmds[cmd_idx];
+        const uint ne = cmd.ne;
+
+        switch (cmd.op_type) {
+        case OP_ADD: {
+            FloatBuf s0 = FloatBuf(cmd.src0_addr);
+            FloatBuf s1 = FloatBuf(cmd.src1_addr);
+            FloatBuf dst = FloatBuf(cmd.dst_addr);
+            for (uint i = global_start; i < ne; i += global_stride)
+                dst.d[i] = s0.d[i] + s1.d[i];
+        } break;
+
+        case OP_MUL: {
+            FloatBuf s0 = FloatBuf(cmd.src0_addr);
+            FloatBuf s1 = FloatBuf(cmd.src1_addr);
+            FloatBuf dst = FloatBuf(cmd.dst_addr);
+            for (uint i = global_start; i < ne; i += global_stride)
+                dst.d[i] = s0.d[i] * s1.d[i];
+        } break;
+
+        case OP_SCALE: {
+            FloatBuf s0 = FloatBuf(cmd.src0_addr);
+            FloatBuf dst = FloatBuf(cmd.dst_addr);
+            float scale_val = uintBitsToFloat(cmd.params[0]);
+            for (uint i = global_start; i < ne; i += global_stride)
+                dst.d[i] = s0.d[i] * scale_val;
+        } break;
+
+        case OP_SILU: {
+            FloatBuf s0 = FloatBuf(cmd.src0_addr);
+            FloatBuf dst = FloatBuf(cmd.dst_addr);
+            for (uint i = global_start; i < ne; i += global_stride) {
+                float x = s0.d[i];
+                dst.d[i] = x / (1.0 + exp(-x));
+            }
+        } break;
+
+        case OP_SIGMOID: {
+            FloatBuf s0 = FloatBuf(cmd.src0_addr);
+            FloatBuf dst = FloatBuf(cmd.dst_addr);
+            for (uint i = global_start; i < ne; i += global_stride)
+                dst.d[i] = 1.0 / (1.0 + exp(-s0.d[i]));
+        } break;
+
+        case OP_CPY: {
+            FloatBuf s0 = FloatBuf(cmd.src0_addr);
+            FloatBuf dst = FloatBuf(cmd.dst_addr);
+            for (uint i = global_start; i < ne; i += global_stride)
+                dst.d[i] = s0.d[i];
+        } break;
+
+        case OP_SWIGLU: {
+            FloatBuf s0 = FloatBuf(cmd.src0_addr);
+            FloatBuf dst = FloatBuf(cmd.dst_addr);
+            for (uint i = global_start; i < ne; i += global_stride) {
+                float g = s0.d[i];
+                dst.d[i] = (g / (1.0 + exp(-g))) * s0.d[ne + i];
+            }
+        } break;
+
+        case OP_GATE_PREP: {
+            FloatBuf alpha = FloatBuf(cmd.src0_addr);
+            FloatBuf dt_bias = FloatBuf(cmd.src1_addr);
+            FloatBuf ssm_a = FloatBuf(cmd.src2_addr);
+            FloatBuf dst = FloatBuf(cmd.dst_addr);
+            uint nhv = cmd.params[0];
+            for (uint i = global_start; i < ne; i += global_stride) {
+                uint h = i % nhv;
+                float x = alpha.d[i] + dt_bias.d[h];
+                float sp = (x > 20.0) ? x : log(1.0 + exp(x));
+                dst.d[i] = sp * ssm_a.d[h];
+            }
+        } break;
+
+        case OP_MMV_Q4K: {
+            // Matmul-vec with q4_K weights
+            // ne = ncols (K dimension), params[0] = nrows (M), params[1] = stride_d
+            uint M = cmd.params[0];
+            uint K = cmd.ne;
+            uint num_blocks = K / 256;
+            uint stride_d = cmd.params[1];
+
+            // Grid-stride over M rows (4 rows per iteration)
+            for (uint row = wg_id * MMV_NUM_ROWS; row < M; row += num_wgs * MMV_NUM_ROWS) {
+                uint rows_this = min(MMV_NUM_ROWS, M - row);
+                q4k_matmul_vec(cmd.src0_addr, cmd.src1_addr, cmd.dst_addr,
+                               row, rows_this, num_blocks, stride_d);
+            }
+        } break;
+
+        default:
+            break;
+        }
+
+        global_barrier(cmd_idx);
+    }
+}
