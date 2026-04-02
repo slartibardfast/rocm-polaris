@@ -1,18 +1,27 @@
 # Phase 17: GCN3 Ubershader — GPU-Driven Persistent Inference
 
-## Context
+## Status: ABANDONED — JIT interpreter is net negative (-12ms slower)
+
+The entire ubershader/JIT approach was fully implemented and proved to be
+architecturally unsuitable for GCN3. See "Conclusion" at end of document.
+
+The original ~17ms "dispatch overhead" estimate was inflated by measuring at
+n_ctx=256, which hits a 3× performance cliff (see PHASE18-20.md). At realistic
+n_ctx=512+, actual dispatch overhead is ~2ms (not 17ms), making dispatch
+elimination a low-value target.
+
+## Original Context (preserved for historical record)
 
 Phase 16 achieved 24.6 t/s (output-only q4_K model, b8508-13). Deep ISA analysis
 proved the matmul-vec shaders are near-optimal (79% MAC fusion, DPP reduction,
-proper load/ALU interleaving). The remaining bottleneck is **dispatch overhead**:
+proper load/ALU interleaving). The remaining bottleneck was **dispatch overhead**:
 
 - 340 dispatches/token × ~50µs each = **~17ms overhead on 40.7ms token (42%)**
 - Actual compute only needs ~24ms at 67% bandwidth utilization
 - Theoretical without dispatch overhead: **42 t/s (+70%)**
 
-Every attempt to improve per-shader efficiency (LARGE WG, NUM_ROWS tuning, GDN
-occupancy) REGRESSED because it increased dispatch count. On 5 CUs, dispatch
-cost dominates. The only way forward is **eliminating dispatches**.
+NOTE: These numbers were measured at n_ctx=256. At n_ctx=512+, the baseline
+is 22.6ms/44.2 t/s and dispatch overhead is ~2ms, not 17ms.
 
 ## Design: Per-Layer Ubershader with Atomic Barriers
 
@@ -246,3 +255,27 @@ struct MegaCmd {          // 64 bytes, aligned
 - **Register pressure**: ACO pre-calculates occupancy; if >64 VGPRs, split the switch
 - **Atomic barrier deadlock**: Only 5 WGs, all must reach barrier; if one crashes,
   detect timeout via CPU-side fence and fall back to standard dispatch
+
+## Conclusion: Net Negative
+
+The JIT interpreter was fully implemented (Phase 17c) and tested:
+
+- **JIT ON**: 95.26 ms/token (10.50 t/s) at n_ctx=256
+- **JIT OFF**: 82.96 ms/token (12.05 t/s) at n_ctx=256
+- **Result**: 12.3ms SLOWER with JIT — net negative
+
+Root causes:
+1. GLSL `barrier()` + `memoryBarrierBuffer()` between every op = ~0.47ms total
+2. SSBO reads for the op program add latency
+3. BDA indirection for tensor access slower than direct descriptors
+4. 1-WG limitation: interpreter serializes on 1 CU; standard path overlaps across 10 CUs
+5. Barrier optimization (dependency tracking) saved only 0.47ms, and removing barriers
+   between ops with false dependencies caused data corruption
+
+The fundamental issue: GCN3's in-order pipeline doesn't benefit from dispatch
+elimination the way out-of-order GPUs (RDNA) would. At realistic n_ctx=512+,
+dispatch overhead is only ~2ms (not the 17ms estimated from n_ctx=256 profiles),
+making the entire ubershader concept unnecessary for this hardware.
+
+**The BDA infrastructure developed for Phase 17 was repurposed for Phase 19-20
+(f16 state cache + state I/O elimination), where it delivered real gains (+11.3%).**
