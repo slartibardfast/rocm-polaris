@@ -279,3 +279,7 @@ making the entire ubershader concept unnecessary for this hardware.
 
 **The BDA infrastructure developed for Phase 17 was repurposed for Phase 19-20
 (f16 state cache + state I/O elimination), where it delivered real gains (+11.3%).**
+
+**Phase 21** re-attempted the megakernel with multi-WG support (flag-based atomic
+barriers, 10 WGs). Also failed: GCN3 cross-WG atomic sync deadlocks, and 1-WG JIT
+is 12% slower than standard dispatch at realistic context sizes. See PHASE21.md.
