@@ -23,14 +23,17 @@ GPU-draft / CPU-target speculative decoding pipeline.
 - **Auto-detection**: Correctly disables fused GDN when ops scheduled on CPU
   - Added `ggml_backend_dev_type() == CPU` check in llama-context.cpp
 
-### What's Broken
+### What's Fixed
 
-- **Chunked (prompt eval) path**: PPL REGRESSION
-  - GPU fused: PPL = 16.8 (0.8B, wikitext-2, 2 chunks)
-  - CPU unfused: PPL = 51.9 (same model, same data)
-  - Root cause: unknown, under investigation
-  - Autoregressive path is correct, so the bug is specific to
-    `build_delta_net_chunking` in delta-net-base.cpp
+- **Chunked (prompt eval) path**: PPL FIXED
+  - Root cause: `llama-context.cpp:2222` has `n_tokens < 32` threshold for
+    norm layer backend pinning. At ubatch >= 32, scheduler routed norms to
+    Vulkan GPU, creating CPU↔GPU splits and wrong results.
+  - Fix: Skip GPU backends in scheduler when `n_gpu_layers == 0`
+  - Also fixed: `memory_breakdown()` iterated `backends` not `backend_ptrs`,
+    crashing when GPU backend absent from scheduler.
+  - PPL now: 16.95 (was 51.9, GPU reference 16.8)
+  - Graph splits: 1 (was 446)
 
 ### Fixes Applied (in llama-jit working tree)
 
@@ -68,14 +71,24 @@ these must be restored as separate ops:
 4. Run full PPL comparison (20+ chunks) on 0.8B
 5. Benchmark 9B, 27B, 35B-A3B on CPU with validated path
 
-### CPU Performance (preliminary)
+### CPU Performance
 
 | Model | Threads | NUMA | t/s (gen) | ms/token |
 |-------|---------|------|-----------|----------|
 | 0.8B | 6 | single | ~8 | ~125 |
+| 9B | 12 | default | 1.14 | 880 |
 | 9B | 6 | single | 1.24 | 805 |
 | 9B | 12 | interleave | 1.02 | 980 |
-| 9B | 6 | socket 0 | 1.20 | 832 |
+
+### Validation Results (after all fixes)
+
+| Test | Expected | Actual | Status |
+|------|----------|--------|--------|
+| PPL batch=32 | ≈16.8 | 16.95 | PASS |
+| PPL batch=512, 5 chunks | ≈16.2 | 16.26 | PASS |
+| Greedy output GPU vs CPU | identical | identical | PASS |
+| 9B coherent output | yes | yes | PASS |
+| Graph splits (-ngl 0) | 1 | 1 | PASS |
 
 ### Models Downloaded
 
