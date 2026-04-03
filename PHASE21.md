@@ -115,9 +115,10 @@ with an empty run"), even with the env var fix. Works fine with `--no-warmup`.
 generation. Init-time JIT buffer allocation (65KB SSBO + 4KB barrier in host-visible
 VRAM) interacts poorly with the warmup graph's compute buffer reservation on Polaris 12.
 
-**Fix**: Use `--no-warmup` when JIT is enabled. A proper fix would increase the warmup
-gate to skip JIT during warmup graph_compute calls, or allocate JIT buffers lazily
-on first JIT dispatch.
+**Fix**: Auto-skip warmup when `POLARIS_JIT` env var is set (`common/common.cpp`).
+Attempted sync-based fixes (waitIdle, graph_cleanup, command pool reset) all failed —
+the corruption is inside RADV's pipeline state tracking, not recoverable from the
+application side.
 
 ### Bug 3: GCN3 Cross-WG Atomic Sync Deadlock
 
