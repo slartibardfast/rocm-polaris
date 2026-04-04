@@ -378,10 +378,20 @@ VK_ICD_FILENAMES=/dev/null numactl --membind=1 --cpunodebind=1 \
 | 0.8B dense Q4_K_M (GPU) | 3 | 2.25 | 5% | Garbled output, SSM rollback bugs |
 | 35B-A3B MoE IQ2_XXS (CPU) | 2 | 1.17 | 12% | Slower than standalone — both fight for bandwidth |
 
-Speculative decoding is net negative for MoE→MoE (bandwidth contention) and
-marginal for dense→MoE (architecture mismatch, broken SSM rollback at K≥2).
-Upstream PR #20075 (recurrent state checkpointing) applied but output still
-garbled — needs further upstream fixes.
+**After PR #20700 (MTP + recurrent state fixes):**
+
+| Draft | K | t/s | Accept | Quality |
+|-------|---|-----|--------|---------|
+| 0.8B dense (CPU) | 1 | 1.63 | 73% | Good |
+| 0.8B dense (CPU) | **2** | **1.76** | **42%** | **Good** |
+| 0.8B dense (CPU) | 3 | 1.63 | 3% | Poor |
+| 35B-A3B MoE (CPU) | 2 | 1.17 | 12% | Bandwidth contention |
+
+PR #20700's recurrent state `copy_cell` + checkpoint rollback fixed the
+garbled output at K=2 (was broken with PR #20075). Acceptance jumped from
+11.5% → 42% at K=2.
+
+**Best config: K=2, 0.8B dense draft, no Vulkan → 1.76 t/s (+25% over standalone)**
 
 ---
 
