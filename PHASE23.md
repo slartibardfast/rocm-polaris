@@ -333,7 +333,55 @@ Test both.
 
 **Expected impact**: 30-50% vs naive (no NUMA awareness).
 
-**Status**: TODO
+**Status**: DONE
+
+### Results: NUMA + Graph Splits + Allocation
+
+Systematic benchmark progression on 122B at c4096, 16 tokens generated:
+
+| Config | PP t/s | Gen t/s | Splits | Notes |
+|--------|--------|---------|--------|-------|
+| Baseline (scalar, 2N interleave, 12t) | 2.64 | 0.98 | 97 | Original Phase 23 Step 1 |
+| + SSSE3 kernels | 3.38 | 1.07 | 97 | +9% gen from SIMD |
+| + alloc (hugetlb, THP, prefault) | 3.07 | 1.06 | 97 | Within noise |
+| Node 0 only, 6t | 2.61 | 1.23 | 97 | +15% from eliminating QPI |
+| **Node 1 only, 6t** | **2.84** | **1.32** | **97** | +7% from clean node (no kernel) |
+| Node 1, no Vulkan (VK_ICD=/dev/null) | 3.31 | **1.41** | **1** | **+7% from eliminating 97 splits** |
+
+**Key findings:**
+1. **NUMA: single node > interleave for MoE.** QPI latency on scattered expert
+   access hurts more than 2x bandwidth helps. Node 1 (clean, no kernel) best.
+2. **Graph splits: 97→1 = +7%.** Vulkan GDN on tiny batch=1 SSM ops costs more
+   in sync overhead than it saves in compute. Pure CPU is faster.
+3. **SSSE3: +50% prompt eval, +9% generation.** Compute-bound at batch>1,
+   bandwidth-bound at batch=1.
+4. **Allocation (hugetlb, THP, NUMA interleave, prefault):** Correctness
+   improvement (mlock mutex, FADV_SEQUENTIAL) but negligible perf impact —
+   MoE random access pattern dominates.
+5. **Software prefetch:** No measurable impact. DDR3 DRAM row buffer misses
+   are the bottleneck, not cache/TLB misses.
+
+**Net: 0.98 → 1.41 t/s (+44%) from SSSE3 + NUMA node isolation + split elimination.**
+
+**Optimal target command:**
+```bash
+VK_ICD_FILENAMES=/dev/null numactl --membind=1 --cpunodebind=1 \
+  llama-completion -t 6 --no-mmap -ngl 0 -c 65536 \
+  -m Qwen3.5-122B-A10B-UD-Q4_K_XL.gguf
+```
+
+### Results: Speculative Decoding
+
+| Draft model | K | Gen t/s | Accept | Notes |
+|-------------|---|---------|--------|-------|
+| 0.8B dense Q4_K_M (GPU) | 1 | 1.81 | 52% | Decent quality, thinking mismatch |
+| 0.8B dense Q4_K_M (GPU) | 3 | 2.25 | 5% | Garbled output, SSM rollback bugs |
+| 35B-A3B MoE IQ2_XXS (CPU) | 2 | 1.17 | 12% | Slower than standalone — both fight for bandwidth |
+
+Speculative decoding is net negative for MoE→MoE (bandwidth contention) and
+marginal for dense→MoE (architecture mismatch, broken SSM rollback at K≥2).
+Upstream PR #20075 (recurrent state checkpointing) applied but output still
+garbled — needs further upstream fixes.
 
 ---
 
@@ -513,30 +561,31 @@ in target-side optimization. Steps 2+3 are independent system tuning,
 do them together. Step 4 is the high-effort/high-reward code change.
 Steps 5+6 depend on 0-4 being validated.
 
-## Performance Targets
+## Performance Targets (revised with actuals)
 
-| Milestone | Expected t/s | Context | Notes |
-|-----------|-------------|---------|-------|
-| Step 0 draft validation | 18.9 (full KV) | 64K | **DONE**: Q8_0, stable at 91% VRAM |
-| Step 1 baseline | 0.95-1.01 | 512-64K | **DONE**: scalar fallback, Vulkan GDN |
-| After 1GB pages + NUMA (2+3) | 3-5 | 512 | System tuning only |
-| After SSSE3 kernel (4) | 8-12 | 512 | Biggest single improvement |
-| Speculative decode (6) | 12-20 | 4096 | Draft+target wired up |
-| Full pipeline, 64K | 8-15 | 65536 | Primary target |
-| Stretch: 128K via -nkvo | 5-10 | 131072 | Draft slowed by PCIe |
+| Milestone | Expected | **Actual** | Context | Notes |
+|-----------|----------|------------|---------|-------|
+| Step 0 draft | 18.9 | **18.9** | 64K | DONE: Q8_0, stable |
+| Step 1 baseline | 0.95-1.01 | **0.98** | 4K | DONE: scalar, 97 splits |
+| SSSE3 (4) | 8-12 | **1.07** | 4K | Gen bandwidth-bound, PP +50% |
+| NUMA node 1 (3) | 3-5 | **1.32** | 4K | +35% cumulative |
+| No Vulkan splits | — | **1.41** | 4K | +44% cumulative, 1 split |
+| Spec decode (6) | 12-20 | **1.81** | 512 | K=1 dense→MoE only |
 
-### Prompt Eval Estimates (64K context)
+**Revised analysis:** Original estimates (8-12 t/s after SSSE3) assumed compute-bound
+workload. Reality: 122B MoE at batch=1 is **DDR3 random-access bandwidth-bound**
+(~5-8 GB/s effective vs 25.6 GB/s sequential due to scattered expert reads).
+SSSE3 helps batch (prompt eval +50%) but not generation (+9%). The ceiling is
+set by DRAM row buffer miss latency on MoE scatter access.
 
-| Stage | Baseline (scalar) | After SSSE3 |
-|-------|-------------------|-------------|
-| Target (122B CPU) | 30-60 min | 10-20 min |
-| Draft (0.8B GPU) | ~3 min | ~3 min |
+### Remaining Paths Forward
 
-### Draft Acceptance Rate Estimates
-
-| Context | Est. acceptance | Effective t/s multiplier |
-|---------|----------------|--------------------------|
-| 4K | 65-70% | ~1.5x over CPU-only |
+| Option | Effort | Expected gain | Notes |
+|--------|--------|---------------|-------|
+| Smaller quant (Q2_K_XL, 35 GB) | Zero (have file) | ~2x (halves reads) | Quality trade-off |
+| Expert gather+pipeline | High | 20-50% | Contiguous staging buffer |
+| Per-expert madvise(WILLNEED) | Medium | 10-30% | Kernel async prefetch |
+| Upstream spec decode fixes | Wait | Unknown | PR #20075, #20700 |
 | 16K | 55-65% | ~1.3x |
 | 64K | 40-55% | ~1.1-1.2x |
 | 128K | 30-45% | ~1.0-1.1x |
