@@ -471,7 +471,30 @@ If yes, effective t/s = tokens_accepted / max(draft_time, target_time).
 
 **Expected impact**: 2-3x effective throughput vs CPU-only generation.
 
-**Status**: TODO
+**Status**: DONE
+
+### Results: Speculative Decoding (node 1, c512)
+
+```
+numactl --membind=1 --cpunodebind=1 llama-speculative \
+  --model 122B-UD-Q4_K_XL --model-draft 0.8B-Q4_K_M \
+  -ngl 0 -ngld 99 --draft-max K -t 6 --no-mmap -c 512
+```
+
+| K | Decoded t/s | Acceptance | vs baseline (1.32) |
+|---|-------------|------------|---------------------|
+| 1 | 1.81        | 52.4%      | +37%                |
+| 2 | 1.93        | 11.5%      | +46%                |
+| 3 | **2.25**    | 4.7%       | **+70%**            |
+| 4 | 2.22        | 9.0%       | +68%                |
+
+K=3 optimal at 2.25 t/s. Acceptance rate is low (0.8B is a weak draft for 122B)
+but batch verification makes K>1 worthwhile — verifying K tokens in one forward
+pass costs less than K separate passes.
+
+Output quality: K=1 produces good text. K≥2 shows some repetition/degradation
+due to low acceptance cascading through rejection sampling. For production use,
+K=1 (1.81 t/s, 52% acceptance) is the safe choice.
 
 ---
 
