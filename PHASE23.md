@@ -376,7 +376,27 @@ Priority order (by usage in 122B inference):
 3-5x speedup on all CPU matmul operations. This could push 122B target from
 ~2-3 t/s to ~8-12 t/s, making speculative decoding highly effective.
 
-**Status**: TODO
+**Status**: DONE — SSSE3 Q4_K/Q5_K/Q6_K kernels implemented + allocation strategy
+
+### Results: SSSE3 + Perfect Allocation
+
+Backend tests: 105/105 pass (41 Q4_K, 11 Q5_K, 11 Q6_K, all sizes/shapes).
+
+| Context | Prompt eval | Generation | vs Baseline |
+|---------|-------------|------------|-------------|
+| c512    | 3.38 t/s    | 1.07 t/s   | PP +50%, Gen +9% |
+| c4096   | 3.07 t/s    | 1.06 t/s   | PP +36%, Gen +8% |
+
+**Analysis**: SSSE3 improved prompt eval significantly (+50%) but generation
+barely moved (+9%). At batch=1, generation is **memory-bandwidth-bound**:
+MoE reads ~3.2 GB active weights/token, scattered across 77 GB. At 51 GB/s
+DDR3 aggregate, theoretical floor is ~63 ms. We're at 930 ms — only 6.8% of
+bandwidth due to random expert access thrashing DRAM row buffers.
+
+Allocation improvements (MAP_POPULATE, NUMA interleave, THP, FADV_SEQUENTIAL)
+are active but hard to isolate — generation is dominated by memory access
+patterns, not page faults. SSSE3 will matter more for speculative decoding
+where target verifies K>1 tokens in parallel (batch matmul benefits from SIMD).
 
 ---
 
