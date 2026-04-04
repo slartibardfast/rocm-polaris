@@ -271,7 +271,28 @@ is cleanest.
 
 **Expected impact**: 10-20% throughput improvement for MoE scattered access.
 
-**Status**: TODO
+**Status**: DONE — marginal improvement
+
+### Results
+
+Successfully allocated 1GB huge pages for model weights via code patches:
+- `ggml.c`: `ggml_aligned_malloc` uses `mmap(MAP_HUGETLB|MAP_HUGE_1GB)` for ≥512MB
+- `ggml-vulkan.cpp`: redirect Vulkan_Host ≥256MB allocs to CPU buffer (enables huge pages)
+- Model splits into ~76 buffers of ~960MB each, each gets 1 × 1GB page
+
+| Config | Generation | vs Baseline |
+|--------|-----------|-------------|
+| Baseline (4KB pages) | 0.98 t/s | — |
+| THP (2MB, transparent) | 1.06-1.12 t/s | +8-14% |
+| **1GB huge pages** | **1.03 t/s** | **+5%** |
+
+**Conclusion**: Huge pages give marginal improvement (~5-14%) on Westmere.
+The bottleneck is scalar Q4_K dequant compute, not TLB misses. THP (2MB)
+actually performed slightly better than 1GB pages due to less memory waste
+(960MB buffers rounded up to 1GB waste 64MB each = ~5GB total).
+
+Huge pages will matter more AFTER the SSSE3 kernel fix makes inference
+bandwidth-bound instead of compute-bound.
 
 ---
 
