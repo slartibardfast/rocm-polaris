@@ -393,6 +393,42 @@ garbled output at K=2 (was broken with PR #20075). Acceptance jumped from
 
 **Best config: K=2, 0.8B dense draft, no Vulkan → 1.76 t/s (+25% over standalone)**
 
+**At c65536: spec decode collapses to 3.3% acceptance (1.40 t/s). Standalone
+1.38 t/s. Spec decode only helps at short context where draft alignment is good.**
+
+### Results: c65536 Final Numbers
+
+| Config | Gen t/s | Context | KV cache | Total RAM |
+|--------|---------|---------|----------|-----------|
+| Standalone, node 1 | **1.38** | 65536 | 1.5 GB | 75 GB |
+| + spec K=2 (0.8B) | 1.40 | 65536 | 1.2 GB | 75.2 GB |
+
+### Results: Quantization Comparison
+
+| Quant | Size | Gen t/s | PP t/s | Bottleneck |
+|-------|------|---------|--------|------------|
+| Q4_K_XL | 77 GB | **1.41** | 3.31 | DDR3 bandwidth |
+| Q2_K_XL (+ IQ SSSE3) | 39 GB | 1.31 | 1.81 | IQ dequant compute |
+| Q2_K_XL (scalar) | 39 GB | 0.82 | 1.00 | IQ dequant compute |
+
+Q4_K_XL is already the optimal mixed quant: Q8_0 for shared layers,
+Q4_K for MoE experts. Smaller quants use IQ types that are compute-bound
+even with SSSE3 kernels. Larger quants (Q8) don't fit on one NUMA node.
+
+## Phase 23 Conclusion
+
+**Final: 1.38 t/s at c65536 on Qwen3.5-122B-A10B (UD-Q4_K_XL)**
+
+From 0.98 t/s baseline (+41%):
+- SSSE3 Q4_K/Q5_K/Q6_K/IQ2_XS/IQ3_XXS kernels: +9% gen, +50% PP
+- NUMA node 1 isolation: +24% (eliminates QPI + kernel contention)
+- Eliminate 97 Vulkan graph splits: +7%
+
+Speculative decoding works at short context (1.76 t/s at c4096, 42% accept)
+but acceptance collapses at c65536 (3.3%). The DDR3 random-access bandwidth
+ceiling (~5-8 GB/s effective on MoE scatter) is the fundamental hardware limit.
+No software optimization can exceed it.
+
 ---
 
 ## Step 4: SSSE3 Q4_K Dequantization Kernel
