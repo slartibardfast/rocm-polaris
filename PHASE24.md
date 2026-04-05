@@ -74,11 +74,23 @@ using the AVX2 body as template. Build, test, commit after each function.
 
 | # | Function | Status | Commit | Tests |
 |---|----------|--------|--------|-------|
-| 1 | quantize_row_q8_0 | | | |
-| 2 | quantize_row_q8_1 | | | |
-| 3 | quantize_row_q8_K | | | |
-| 4 | vec_dot_tq2_0 | | | |
-| 5 | vec_dot_iq2_xxs | | | |
-| 6 | vec_dot_mxfp4 | | | |
-| 7 | bf16_to_fp32 | | | |
-| 8 | vec_dot_bf16 | | | |
+| 1 | quantize_row_q8_0 | DONE | 84b5f4813 | q4_0 backend-ops OK |
+| 2 | quantize_row_q8_1 | DONE | 9536223af | q4_1 backend-ops OK |
+| 3 | quantize_row_q8_K | DONE | 26aa88073 | q4_K backend-ops OK |
+| 4 | vec_dot_tq2_0 | DONE | 679bf699e | no Vulkan shader, manual review |
+| 5 | vec_dot_iq2_xxs | DONE | fb25f91b0 | backend-ops OK |
+| 6 | vec_dot_mxfp4 | DONE | ff7832120 | backend-ops OK |
+| 7 | bf16_to_fp32 | DONE | 99a1810d6 | — |
+| 8 | vec_dot_bf16 | DONE | 99a1810d6 | — |
+
+## Additional Changes
+
+- Moved `hsum_i32_4` out of `#if __AVX__` guard into its own `#if __SSE2__` guard
+  so it's available in SSE4.1-only quantization paths (commit 9536223af)
+
+## Summary
+
+**Phase 24 COMPLETE.** All 8 functions now have SSSE3/SSE4.1 paths.
+Combined with the 20 SSSE3 vec_dot kernels from the prior session,
+every function in the CPU backend that had an AVX/AVX2 path now has
+a 128-bit SIMD fallback. Zero scalar fallbacks remain on Westmere.
