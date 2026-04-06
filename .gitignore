@@ -24,6 +24,7 @@ tests/test_*
 !tests/*.sh
 !tests/*.txt
 tests/*.o
+tests/*.log
 
 # Editor/IDE
 *.swp
