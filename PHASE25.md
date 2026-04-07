@@ -277,3 +277,50 @@ where most of the win lives.
 - Largest remaining levers: Step 4.5 (TurboQuant V fused mad), 
   Step 4 (SIMDe repack), Step 4.75 (fused KV single-stream), 
   Step 8 (LTO + PGO)
+
+## Step 4 (skipped): repack.cpp not on hot path
+
+`perf record` during generation showed zero activity in any
+`ggml_gemv_*` or `ggml_gemm_*` function from `arch/x86/repack.cpp`.
+71% of CPU time is in the Phase 24-covered K-quant `vec_dot_*`
+functions (q8_0, q4_K, q5_K, q6_K). The repack kernels are gated by
+`ggml_backend_cpu_repack_buffer_type()` which is opt-in per tensor
+and not used by our standard model load. Skipping Step 4 entirely.
+
+## Step 4.5: TurboQuant V 4-bit (TQ_V_4B) with fused mad
+
+New block format `block_tq_v_4b` (66 bytes per 128 elements, symmetric
+q4_0-style quant with implicit zero-point 8, 128-element blocks).
+Registered as `GGML_TYPE_TQ_V_4B = 42` in ggml.h, with full type_traits
+entries in ggml.c and ggml-cpu.c.
+
+The hot-path optimisation is `tq_v_4b_vec_mad_f32` — a fused dequant
++ fmadd call that replaces the classical `v_to_float(v_data, V32, DV);
+ggml_vec_mad_f32(DV, VKQ32, V32, vs);` pair in the flash attention V
+loop. Register-resident SSE4.1 body, ~30 SSE instructions per
+128-element block, no intermediate V32 buffer writes.
+
+Flash attention dispatch in ops.cpp:
+```cpp
+if (v->type == GGML_TYPE_TQ_V_4B) {
+    tq_v_4b_vec_mad_f32(DV, VKQ32, v_data, vs);
+}
+```
+
+### 8K fill, `-ctk tq_kv_1b -ctv tq_v_4b` (Step 4.5)
+
+| Metric | Baseline | Step 1 | Step 3 | **Step 4.5** | Δ vs baseline |
+|--------|---------:|-------:|-------:|-------------:|--------------:|
+| PP t/s | 8.30 | 9.86 | 9.93 | **12.32** | **+48.4%** |
+| Gen t/s | 3.37 | 3.53 | 3.64 | **4.21** | **+24.9%** |
+| Gen ms/tok | 297.14 | 283.29 | 274.71 | **237.38** | -59.76 ms |
+| Wall time | 17.0 min | 14.4 min | 14.3 min | **11.6 min** | -5.4 min |
+
+### Running total
+
+- Gap closed: 25% of 48% = **52% of the way to target**
+- Gap remaining: 19% more needed (save another 37 ms/tok to hit 200 ms)
+- Target (5.00) requires hitting 200 ms/tok; we're at 237 ms
+- Largest remaining levers: Step 5 (split-KV parallelism across
+  all 6 threads), Step 4.75 (fused KV single-stream — deferred
+  pending Step 5 result), Step 8 (LTO + PGO)
