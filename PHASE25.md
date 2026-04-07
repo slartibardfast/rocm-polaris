@@ -226,8 +226,54 @@ and V-side dequant. Phase 24 saves ~14 ms per gen token, leaving
 
 Key insight for remaining steps: the V-side dequant is itself scalar
 (`dequantize_row_q4_0` in ggml-quants.c is a plain scalar loop, not
-touched by Phase 24). The biggest remaining compute-side win is
-likely Step 4 (SIMDe repack), Step 4.5 (TurboQuant V fused mad), and
-a potentially-new "Step 3b" to vectorize `dequantize_row_q4_0` via
-ggml-cpu override. The plan's gain table must be updated to reflect
-this reality.
+touched by Phase 24). Step 3 addresses this via Layer 1 shim helpers.
+
+## Steps 2–3: Layer 1 shim + V dequant vectorisation
+
+Systematic shimming architecture introduced:
+- Layer 1 (`ggml-cpu/arch/x86/downlevel.h`): hand-rolled register-
+  resident SSE4.1 helpers, `ggml_x86_*` namespace
+- Layer 2 (`simde-shim.h`): SIMDe translation, reserved for
+  `repack.cpp` in Step 4
+- Layer 3: direct inline SSE4.1 in caller
+
+Step 3 ships two Layer 1 helpers:
+
+1. **`ggml_x86_cvtph_ps` / `ggml_x86_cvtph_ps_8`**: Giesen's public-
+   domain `half_to_float_SSE2` algorithm. Register-resident, ~19
+   SSE2 instructions per 4 fp16 values. Unit-tested against a scalar
+   reference on the full 65536-value fp16 input range — bit-identical.
+   A first-pass bug in infinity handling (wrong mask constant 0x47800000
+   instead of 0x7F800000) was caught by the test before shipping; the
+   fix landed in the same step.
+
+2. **`ggml_x86_q4_0_unpack_32`**: original SSE4.1 PMOVZXBD-based
+   nibble unpack, ~30 instructions per 32-element block.
+
+Wrapping both in `ggml_cpu_*` callable APIs and overriding
+`v_to_float` in `ops.cpp` flash attention when `v->type` is F16 or
+Q4_0, so the V dequant hot path bypasses ggml-base's scalar row
+functions.
+
+### 8K fill, q4_0 KV (Step 3)
+
+| Metric | Baseline | Step 1 | Step 3 | Delta |
+|--------|---------:|-------:|-------:|-------|
+| PP t/s | 8.30 | 9.86 | 9.93 | **+19.6%** |
+| Gen t/s | 3.37 | 3.53 | **3.64** | **+8.0%** vs baseline; **+3.1%** vs Step 1 |
+| Gen ms/tok | 297.14 | 283.29 | 274.71 | -22.4 ms total |
+
+Step 3 saved ~8.5 ms per gen token on top of Step 1. The Giesen fp16
+path is cold on q4_0 V configs (V dequant doesn't touch fp16) but hot
+on the KV mask scan and softmax accumulator where ggml-base still
+calls `GGML_FP16_TO_FP32` per element. The q4_0 dequant override is
+where most of the win lives.
+
+### Running total
+
+- Gap closed: 8.0% of 48% = ~17% of the way to target
+- Gap remaining: 40% more needed (need to save another 74.71 ms/tok
+  to reach 200 ms)
+- Largest remaining levers: Step 4.5 (TurboQuant V fused mad), 
+  Step 4 (SIMDe repack), Step 4.75 (fused KV single-stream), 
+  Step 8 (LTO + PGO)
