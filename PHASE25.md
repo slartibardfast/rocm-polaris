@@ -197,3 +197,37 @@ Required savings: **97 ms per token**
 Median expectation based on plan steps: ~150 ms saved → 147 ms/token
 → 6.8 t/s. Pessimistic: ~75 ms saved → 222 ms/token → 4.5 t/s (below
 target). Optimistic is capped around 100 ms by DDR3 bandwidth.
+
+## Step 1: Phase 24 SSSE3/SSE4.1 K-quant cherry-pick
+
+Wholesale copied `ggml/src/ggml-cpu/arch/x86/quants.c` from the
+`llama-jit` submodule (~1800 lines of new SSSE3/SSE4.1 vec_dot and
+quantize kernels). Verified in object code:
+`ggml_vec_dot_q4_K_q8_K` now contains 24 `pshufb`/`pmaddubsw`
+instructions within its 273-line body (was scalar).
+
+### 8K fill, q4_0 KV
+
+| Metric | Baseline | Step 1 | Delta |
+|--------|---------:|-------:|-------|
+| PP t/s | 8.30 | 9.86 | **+18.8%** |
+| Gen t/s | 3.37 | 3.53 | **+4.7%** |
+| Gen ms/tok | 297.14 | 283.29 | -13.85 ms |
+| Wall time | 17.0 min | 14.4 min | -2.6 min |
+
+### Reading
+
+Phase 24 helps **batch prompt-eval** (PP) much more than single-query
+**decode** (gen). This matches Phase 23's finding (SSSE3 +50% PP /
++9% gen). Gen is KV-bandwidth bound at 8K fill, and K-quant compute
+is a smaller fraction of the per-token budget than model-weight reads
+and V-side dequant. Phase 24 saves ~14 ms per gen token, leaving
+83 ms of the 97 ms target gap.
+
+Key insight for remaining steps: the V-side dequant is itself scalar
+(`dequantize_row_q4_0` in ggml-quants.c is a plain scalar loop, not
+touched by Phase 24). The biggest remaining compute-side win is
+likely Step 4 (SIMDe repack), Step 4.5 (TurboQuant V fused mad), and
+a potentially-new "Step 3b" to vectorize `dequantize_row_q4_0` via
+ggml-cpu override. The plan's gain table must be updated to reflect
+this reality.
