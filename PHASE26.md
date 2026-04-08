@@ -703,3 +703,301 @@ Before resuming spec decode, the work to do:
    If draft-model spec decode lands first and gets us to 7-10 t/s,
    MTP becomes optional. If draft-model is hard to land, MTP
    might be easier despite the GGUF re-conversion cost.
+
+## NUMA mirror — KV cache work plan (2026-04-08)
+
+User direction: finish the NUMA mirror story before pivoting to spec
+decode. Even though the profile shows KV mirror is a small win
+(+1-3% expected, not the +5-10% I claimed pre-profile), it closes
+out Phase 26 #1 cleanly and gives us a verified-correct mirror code
+path that any future work (spec decode, op fusion, etc.) can lean on.
+
+### Goal
+
+Land KV cache mirroring + after-op sync hook on `phase25-decode-perf`
+so that the KV cache and recurrent state buffers are physically
+replicated across both NUMA nodes, threads on each socket read their
+local copy, and writes from any thread propagate to both copies. The
+result must be token-identical to the current weights-only mirror
+(verified by greedy temp=0 generation diff).
+
+### Touch list
+
+**1. Runtime-aware buft selection helper.**
+
+Add to `ggml/include/ggml-cpu.h` (public API):
+
+```c
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_for_runtime(void);
+```
+
+Returns the mirror buft when `g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR`,
+else falls through to the regular `ggml_backend_cpu_buffer_type()`.
+Implementation in `numa-mirror.cpp` (it has access to both buft
+constructors and the runtime strategy via `ggml_cpu_get_numa_strategy()`).
+
+**2. Use it at the KV cache and recurrent state allocation sites.**
+
+`src/llama-kv-cache.cpp:119`:
+```cpp
+- ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
++ ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type_for_runtime();
+```
+
+`src/llama-memory-recurrent.cpp:79`: same one-line change.
+
+These callsites currently bypass `make_cpu_buft_list` and the
+extra-bufts mechanism that the model loader uses for weights. They
+ask for the default CPU buft directly. The helper redirects them
+to the mirror buft when MIRROR is active.
+
+Add `#include "ggml-cpu.h"` to both files if not already present.
+
+**3. Wire the after-op sync hook in `ggml_compute_forward`.**
+
+In `ggml/src/ggml-cpu/ggml-cpu.c`, the dispatch switch ends at
+line 2176. Right after the switch closes (and before the function
+returns at line 2177), add:
+
+```c
+// NUMA mirror: replicate per-op writes to the secondary copy.
+// No-op for non-mirror buffers (the helper checks the buft and
+// returns immediately).
+ggml_backend_cpu_numa_mirror_after_op_sync(tensor);
+```
+
+The hook is called by every thread that enters `ggml_compute_forward`
+for this op. The hook itself uses `params->ith` to coordinate
+parallelism — see step 4.
+
+Add `#include "numa-mirror.h"` to `ggml-cpu.c`.
+
+**4. Make the after-op hook actually do per-op narrow dirty-region sync.**
+
+The current `ggml_backend_cpu_numa_mirror_after_op_sync` in
+`numa-mirror.cpp` is a stub that does a full-tensor memcpy:
+
+```cpp
+const size_t nbytes = ggml_nbytes(tensor);
+memcpy((char *) tensor->data + alt_off, tensor->data, nbytes);
+```
+
+For the KV cache (~63 MB at 8K context per layer), syncing the
+whole tensor on every set_rows call (one per layer per token) is
+catastrophic — ~2.5 GB/token of cross-socket memcpy traffic. Need
+per-op narrow dispatch.
+
+Replace the stub with:
+
+```cpp
+void ggml_backend_cpu_numa_mirror_after_op_sync(struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->buffer) return;
+    const ptrdiff_t alt_off = ggml_backend_cpu_numa_mirror_alt_offset(tensor->buffer);
+    if (alt_off == 0) return;  // not a mirror buffer
+
+    switch (tensor->op) {
+        case GGML_OP_SET_ROWS: {
+            // Dirty region: rows in dst whose indices are in src[1].
+            // Walk src[1] and memcpy each touched row from copy 0 to copy 1.
+            const ggml_tensor * idxs = tensor->src[1];
+            // ... read each index, compute row offset, memcpy row_size bytes ...
+            // (Handles both i32 and i64 index types, mirroring the
+            // template specialization in compute_forward_set_rows.)
+            break;
+        }
+        case GGML_OP_CPY:
+        case GGML_OP_DUP: {
+            // Dirty region: the entire dst tensor view extent.
+            memcpy((char*)tensor->data + alt_off, tensor->data, ggml_nbytes(tensor));
+            break;
+        }
+        case GGML_OP_SCALE:
+        case GGML_OP_SCALE_INPLACE: {
+            // Same — entire dst view.
+            memcpy((char*)tensor->data + alt_off, tensor->data, ggml_nbytes(tensor));
+            break;
+        }
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_GATED_DELTA_NET: {
+            // SSM/GDN write the new recurrent state to dst. Sync the
+            // entire dst view (small per token — kilobytes scale).
+            memcpy((char*)tensor->data + alt_off, tensor->data, ggml_nbytes(tensor));
+            break;
+        }
+        default:
+            // Unknown write op — fall back to full-tensor sync.
+            // This is a correctness safety net: if we forgot to add
+            // a case for a new write op, the model still produces
+            // correct output (just with more cross-socket traffic).
+            memcpy((char*)tensor->data + alt_off, tensor->data, ggml_nbytes(tensor));
+            break;
+    }
+}
+```
+
+**Per-thread vs single-thread sync:** the simple version above runs
+on EVERY thread that enters compute_forward — each thread does the
+full memcpy redundantly. That's wasteful. Two options:
+
+- **Option A (simpler):** gate on `params->ith == 0` so only the master
+  thread does the sync. The other 11 threads just return. Still
+  works because OpenMP barriers between ops sync all threads at the
+  next op entry.
+- **Option B (faster for big writes):** parallelize the memcpy across
+  the calling threads using `params->ith / params->nth`. Each thread
+  copies its slice of the dirty region.
+
+For our case, KV writes are tiny (single row) so option A is fine.
+For SSM_CONV and GATED_DELTA_NET, the dst view is larger but still
+KB-scale. Option A works for everything.
+
+**Adopt option A** in v1. If profiling shows it matters, switch to B.
+
+**5. Read-only ops should not trigger sync.**
+
+Many ops in the dispatch switch are read-only (compute output to a
+fresh dst tensor that lives in scratch, not in a mirror buffer).
+Their dst buffer is the compute scratch, not a mirror buffer, so
+the helper's `alt_off == 0` check rejects them at the first branch.
+No special handling needed at the call site.
+
+**6. Kill switch for equivalence testing.**
+
+Add an env var `LLAMA_NUMA_MIRROR_KV_DISABLE` (default 0). When set
+to 1, the runtime-aware buft helper returns the regular CPU buft
+even with `--numa mirror`. Used to A/B test KV mirroring without
+rebuilding.
+
+```c
+ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_for_runtime(void) {
+    if (ggml_cpu_get_numa_strategy() != GGML_NUMA_STRATEGY_MIRROR) {
+        return ggml_backend_cpu_buffer_type();
+    }
+    if (getenv("LLAMA_NUMA_MIRROR_KV_DISABLE") != NULL) {
+        return ggml_backend_cpu_buffer_type();
+    }
+    return ggml_backend_cpu_numa_mirror_buffer_type();
+}
+```
+
+The kill switch is removed in the same commit that lands the bench
+results, after equivalence is verified.
+
+### Verification gates
+
+Each gate must pass before moving to the next.
+
+**Gate A — Build clean.** All commits compile, no new warnings in
+files I touched.
+
+**Gate B — `--numa mirror` smoke test.** Same `tests/smoke_test.sh`
+as for the weights mirror. Output is coherent English text. Process
+exits cleanly.
+
+**Gate C — Numastat verification.** While a `--numa mirror` bench
+is running, `numastat -p $pid` should show:
+- Approximately equal split across nodes for total memory (~21 GB
+  weights × 2 + ~10 MB KV cache × 2 + activations on the dominant
+  socket)
+- The exact KV cache size depends on context length but should
+  appear on BOTH nodes when mirror is active
+
+**Gate D — Token-identical equivalence.** Greedy temp=0 generation
+of 64 tokens with the OpenClaw smoke prompt:
+- Run with `--numa mirror`
+- Run with `--numa mirror LLAMA_NUMA_MIRROR_KV_DISABLE=1`
+- `diff` the outputs — must be byte-identical
+- Both should also match the single-socket reference output (same
+  greedy seed, same model state)
+
+**Gate E — Bench result.** Run `tests/openclaw_64k_bench.sh` with
+`-ctk tq_kv_1b -ctv tq_v_4b`, three configs:
+- Current weights-only mirror (the 5.17 t/s baseline)
+- KV mirror with full-tensor sync stub (just to confirm correctness
+  of the wiring before optimizing the dispatch)
+- KV mirror with per-op narrow dispatch
+
+Decision criteria:
+- Per-op narrow dispatch must be ≥ weights-only baseline (no
+  regression). Realistic +1% to +3% gain.
+- Full-tensor sync stub will probably be slower due to the
+  catastrophic cross-socket bandwidth. That's expected and
+  ships only as an intermediate testing step, never as the
+  final state.
+
+### Commit boundaries
+
+Three commits, each landing a coherent unit:
+
+**Commit 1: KV mirror buft selection + full-tensor after-op sync.**
+- New `ggml_backend_cpu_buffer_type_for_runtime()` helper
+- KV cache and recurrent state callsites use it
+- After-op hook wired in `ggml_compute_forward`, helper does
+  full-tensor sync for any mirror dst (no per-op dispatch yet)
+- Kill switch `LLAMA_NUMA_MIRROR_KV_DISABLE`
+- Verification: gates A, B, D (equivalence test)
+
+This is the minimum-correct intermediate state. KV mirror works,
+but every write op syncs the full dst tensor. Bench will show
+significant slowdown vs the weights-only baseline. That's fine
+for this commit — we just need to confirm correctness.
+
+**Commit 2: Per-op narrow dirty-region dispatch.**
+- Replace the stub `after_op_sync` with the per-op switch dispatch
+- For SET_ROWS: walk the index tensor and sync only the touched rows
+- For CPY/DUP/SCALE/SSM_CONV/GATED_DELTA_NET: sync the dst view extent
+- For unknown ops: fall back to full-tensor sync (safety net)
+- Verification: gates A, B, D, E
+
+This is the perf optimization that takes us from "correct but slow"
+to "correct and fast".
+
+**Commit 3: Remove kill switch + write up bench result.**
+- Drop `LLAMA_NUMA_MIRROR_KV_DISABLE` from the helper
+- PHASE26.md update with the actual bench numbers
+- Mark Phase 26 #1 as DONE
+
+### Risk surface
+
+**Risk 1: I forget a write op type.**
+The default case in the dispatch switch is a full-tensor sync,
+which is correct (just slow). The model never produces wrong
+output, just wastes cross-socket bandwidth on the unhandled op.
+Mitigation: log the unhandled op type the first time it's hit
+during bring-up, then add a case for it.
+
+**Risk 2: SET_ROWS index walk is wrong.**
+The compute_forward_set_rows iterates `(i03, i02, i in [ir0, ir1))`
+and reads `*(idx_t*)(src1->data + i10*nb10 + i11*nb11 + i12*nb12)`.
+The hook needs to do the same index iteration but over the FULL
+range, not the per-thread slice. Need to be careful with the
+template specialization (i32 vs i64 indices).
+
+**Risk 3: Recurrent state checkpointing path.**
+PR #20075 added `copy_cell` in `llama-memory-recurrent.cpp` which
+uses `ggml_backend_tensor_copy` to clone an entire cell of recurrent
+state. This goes through the buffer's `cpy_tensor` callback, which
+the mirror buft already implements (it writes to both copies). So
+this should "just work" without any changes to the hook.
+
+**Risk 4: Activation buffer is single-copy and gets QPI traffic.**
+The activation tensors live in compute scratch, which uses the
+default CPU buft (not the mirror). Threads on socket 1 reading
+activations produced by socket 0 still pay QPI cost. Profile says
+activations are small (KB scale per layer per token) so this is
+fine — but if profiling after KV mirror shows it matters, we
+revisit.
+
+**Risk 5: Op-launch overhead is the actual bottleneck.**
+Already known from profile. KV mirror won't fix this. The +1-3%
+expected gain is from removing the small bandwidth overhead, not
+from making the bottleneck go away. Manage expectations
+accordingly.
+
+### Out of scope for this work
+
+- Activation buffer mirroring (defer until after KV mirror is
+  measured; profile says it's a small win)
+- Spec decode (separate Phase 26 work, much higher leverage)
+- Op fusion (separate Phase 26 work)
+- Anything in PHASE26.md priority list 4-9
