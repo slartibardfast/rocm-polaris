@@ -409,3 +409,59 @@ with more code.
 When resuming, the first action is the bench pass above, NOT more
 implementation. Only after the numbers come back do we decide which
 direction to take.
+
+### Bench matrix results (2026-04-08)
+
+The proper bench pass against `tests/openclaw_64k_bench.sh` +
+`openclaw_8k_fill.txt`, `-n 256`, full warmup:
+
+| # | Config | Gen t/s | PP t/s | Δ vs Phase 25 (4.32) |
+|---|---|---:|---:|---:|
+| A | `-t 6 --cpunodebind=1 --membind=1` | 4.29 | 12.40 | -0.7% (within noise) |
+| B | `-t 12 --numa distribute` | 3.85 | 21.58 | -10.9% |
+| **C** | **`-t 12 --numa mirror`** | **5.01** | **21.71** | **+16.0%** |
+
+**The 5.0 t/s nominal Phase 25 target is hit.** Cumulative gain
+from the system baseline (3.37 t/s) is **+48.7%** — we crossed the
+target with weights-only mirroring, before any KV cache or
+activation work.
+
+Key observations:
+
+- **Mirror beats single-socket by +17% on gen.** The dual-socket
+  bandwidth advantage is real and the read-side hoist captures it.
+- **Mirror beats distribute by +30% on gen.** Without mirroring,
+  12-thread dual-socket is *worse* than 6-thread single-socket
+  because cross-socket weight reads dominate. With weight reads
+  local to each socket, the bandwidth doubling shows up.
+- **PP is +75% over single-socket** in both B and C. Prefill is
+  compute-bound (large batched matmul, weights amortize across
+  many tokens), so 12-thread parallelism helps directly and the
+  mirror has no marginal effect — both B and C land at ~21.6 t/s.
+- **The earlier smoke-test "2.99 t/s mirror is slower than baseline"
+  comparison was a measurement artifact.** A 32-token greedy
+  generation from a 5-token prompt is dominated by warm-up and
+  load-time amortization — it doesn't measure steady-state decode
+  rate. The methodology lesson stands and is documented above.
+
+### Decision: ship as-is, then iterate
+
+Per the decision tree above, **C ≥ A** clearly: ship the current
+state as the new Phase 26 milestone, then continue with KV cache
+mirror and activation buffer placement as further bandwidth chunks.
+
+Realistic expectation for the next chunk:
+- KV cache is ~13.5% of bandwidth at 8K fill. Half of those reads
+  cross sockets in C today. Removing that contention plausibly
+  adds another **+3% to +6%** at 8K → ~5.20 t/s.
+- At 64K fill, KV approaches parity with weight bandwidth. The
+  same KV mirror should add **+8% to +12%** at the 64K production
+  target.
+- Activation buffer placement is a smaller win (~1%) and trickier
+  to implement cleanly. Defer until KV mirror is measured.
+
+The next coding step is therefore KV cache mirror plus the after-op
+sync hook (which the KV write path needs to keep both copies in
+lockstep). The plumbing pattern is already designed in the
+"Strategy C-elegant" discussion above; the implementation is the
+final third of the original Phase 26 #1 work.
