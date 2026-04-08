@@ -447,21 +447,202 @@ Key observations:
 ### Decision: ship as-is, then iterate
 
 Per the decision tree above, **C ≥ A** clearly: ship the current
-state as the new Phase 26 milestone, then continue with KV cache
-mirror and activation buffer placement as further bandwidth chunks.
+state as the new Phase 26 milestone, then profile to understand the
+actual bottleneck before adding more code on top.
 
-Realistic expectation for the next chunk:
-- KV cache is ~13.5% of bandwidth at 8K fill. Half of those reads
-  cross sockets in C today. Removing that contention plausibly
-  adds another **+3% to +6%** at 8K → ~5.20 t/s.
-- At 64K fill, KV approaches parity with weight bandwidth. The
-  same KV mirror should add **+8% to +12%** at the 64K production
-  target.
-- Activation buffer placement is a smaller win (~1%) and trickier
-  to implement cleanly. Defer until KV mirror is measured.
+### Profile pass under --numa mirror (2026-04-08)
 
-The next coding step is therefore KV cache mirror plus the after-op
-sync hook (which the KV write path needs to keep both copies in
-lockstep). The plumbing pattern is already designed in the
-"Strategy C-elegant" discussion above; the implementation is the
-final third of the original Phase 26 #1 work.
+Captured pcm + perf record + numastat during a long-decode run
+under --numa mirror. The findings completely reshape the Phase 26
+priority list.
+
+**Verification first:**
+- `numastat -p $pid` shows ~21 GB on each NUMA node. Dual-mbind
+  allocator is working as designed. Both copies of model weights
+  are physically resident on their assigned sockets.
+- The `set_numa_thread_affinity` MIRROR case is correctly pinning
+  threads — verified via `ps -mo` showing even thread indices on
+  node 0 CPUs and odd on node 1.
+
+**pcm during decode steady-state:**
+| Socket | Read GB/s | Write GB/s |
+|---|---:|---:|
+| 0 | 0.7–1.1 | 0.18–0.24 |
+| 1 | 1.0–1.5 | 0.25–0.40 |
+| **Total** | **~2.5** | **~0.6** |
+
+**~2.5 GB/s total DRAM reads, against a ~44 GB/s dual-socket
+ceiling. We are at 5% of the bandwidth ceiling.** This rules out
+"more bandwidth via more mirroring" as the lever to chase.
+
+Working backward: 2.5 GB/s × 199 ms/token ≈ **500 MB DRAM reads
+per token**. Earlier I estimated ~1.8 GB/token; that was 3-4× too
+high. Cache (L2 91% hit, L3 76% hit) is serving most of the weight
+reads — only the cold-miss bytes hit DRAM.
+
+The implication: **the real bandwidth ceiling for this model is
+~88 t/s** (44 GB/s ÷ 0.5 GB/token), not 25. There's much more
+room than I thought — but that room can't be reached by feeding
+DRAM faster.
+
+**CPU utilization during decode:**
+- Aggregate: ~46% (`ps` reports 554% / 1200%)
+- Per-active-core: ~85% (pcm `Core UTIL` field)
+- IPC: 2.05 (strong instruction-level parallelism when running)
+
+So when cores ARE active they're computing efficiently. The
+~54% aggregate idle is from cores being literally not-running,
+not from memory stalls.
+
+**perf record top hot functions (% of active cycles):**
+| % | Function |
+|---:|---|
+| 34.8 | `ggml_vec_dot_q8_0_q8_0` (likely GDN linear projections) |
+| 14.9 | `ggml_vec_dot_q4_K_q8_K` (MoE expert matmul) |
+| 14.0 | `tq_v_4b_vec_mad_f32` (TQ V mad in FA loop) |
+| 12.6 | `ggml_vec_dot_q5_K_q8_K` (mixed-quant matmul) |
+| ~7  | libgomp (OMP barriers / runtime) |
+| 4.0 | `tq_kv_fused_attention` |
+| 3.3 | `ggml_vec_dot_f32` |
+| 1.8 | `ggml_compute_forward_gated_delta_net` |
+| ~6 | other compute / dispatch |
+
+**~86% of active cycles is real compute. ~7% is libgomp barriers
+inside the active phase.** The hot path is healthy when running.
+
+### Thread scaling probe
+
+Tested mirror at -t 6 (3 threads per socket) vs -t 12 (6 threads
+per socket) on the same fixture:
+
+| Config | Gen t/s | PP t/s |
+|---|---:|---:|
+| -t 6 mirror | 4.88 | 12.99 |
+| -t 12 mirror | 5.01 | 21.71 |
+| -t 12 mirror + OMP_WAIT_POLICY=ACTIVE | 5.17 | 22.39 |
+
+**Decode 6→12 thread scaling is +3%. PP 6→12 thread scaling is +67%.**
+
+Decode at batch=1 has tiny per-op work units. Each op is roughly
+"matmul-vec for this single token" — thousands of MACs split
+across N threads. At N=12 each thread gets ~hundreds of MACs and
+the op-launch / barrier / wakeup overhead becomes comparable to
+the op compute itself. Adding more threads doesn't help because
+the work doesn't subdivide meaningfully.
+
+**For decode at batch=1, the bottleneck is op-launch overhead per
+op, multiplied by ~hundreds of ops per token, multiplied by 40
+layers.** Not bandwidth, not compute, not memory placement.
+
+### Reshaped Phase 26 priority list
+
+The original Phase 26 plan put NUMA mirror first as the highest-EV
+lever. After running it and profiling, we have:
+
+1. **NUMA mirror v1 (weights only) — DONE.** +17% over single-socket
+   reference. Captures the bandwidth-side win that was available.
+   Beats single-socket because it makes 12 threads possible (which
+   PP needs) without paying the dual-socket cross-QPI penalty for
+   weight reads.
+
+2. **NUMA mirror — KV cache + activations (the rest of #1).**
+   *DEMOTED.* Profile shows we're at 5% of bandwidth ceiling.
+   Removing the remaining cross-socket reads has a small ceiling.
+   Realistic upside: **+1% to +3%**, not the +5–10% I estimated
+   before profiling. Worth doing for code completeness but not
+   as a perf lever.
+
+3. **Speculative decoding — PROMOTED to highest priority.**
+   Spec decode turns batch=1 into batch=N at the matmul level.
+   With N=4, each per-op work unit is 4× larger, which makes the
+   12-thread parallelism actually pay off for decode the way it
+   already does for prefill (+67% from 6→12 threads). This
+   directly attacks the op-overhead bottleneck. Phase 25's
+   cherry-picks of PR #20075 + PR #20700 are the foundation;
+   the structural compat-check fix and GGUF re-conversion are
+   the remaining work. Realistic upside if N=4 with even modest
+   acceptance rate: **+50–100% on gen t/s**, or roughly 7.5–10
+   t/s on this hardware.
+
+4. **Op fusion — second-priority parallel track.**
+   Each fused op reduces the number of barriers and the number
+   of times threads must coordinate. TQ_KV_FUSED already fused
+   K Hamming + softmax + V mad in the FA loop. Concrete next
+   targets:
+   - `FUSED_GATE_PREP` CPU kernel (cherry-pick 0fba88dc5 from
+     llama-jit and write a real CPU implementation, not the
+     Vulkan-only stub). Currently every GDN gate is a 3-op
+     `add → softplus → mul` sequence; fusing eliminates 2
+     intermediate materializations per layer per token.
+   - `rms_norm + residual_add` fusion (per-layer, ~2 saved
+     per layer × 40 layers = 80 saved barriers per token).
+   - SSM_CONV + SiLU fusion (already exists via Vulkan JIT;
+     port to CPU).
+   Per-target estimate: **+1% to +3%** each. Cumulative across
+   3-4 fusions: maybe **+5% to +10%**.
+
+5. **OMP tuning — exhausted at +3%.**
+   `OMP_WAIT_POLICY=ACTIVE` gives ~3%. Adding `GOMP_SPINCOUNT=infinite`
+   and `OMP_PROC_BIND=close` gave no further improvement. The
+   barrier overhead is small; can't squeeze more from OMP config.
+
+6. **Refined Step 5 split-KV chunking.**
+   Same priority as before. Useful at higher contexts but
+   doesn't address the op-overhead bottleneck.
+
+7. **NUMA mirror — KV cache + activations.**
+   Demoted to here. Code-quality finishing touch.
+
+8. **K stride bug fix.** Same as before — defer until model swap.
+
+9. **Production benchmark at 64K.** Last, locks in result.
+
+### The honest revised target
+
+The 25 t/s "theoretical dual-socket bandwidth ceiling" is now
+known to be wrong on the upside — the real bandwidth ceiling for
+this model and this cache pattern is closer to 88 t/s (~5% of
+which we're using). But we can't reach that ceiling via bandwidth
+levers alone, because the actual bottleneck is op-launch overhead
+at batch=1.
+
+Realistic target with the levers above:
+- **Spec decode landing**: 7–10 t/s (1.5–2× over current 5 t/s)
+- **+ op fusion**: 8–12 t/s
+- **+ small wins (KV mirror, refined chunking)**: 9–13 t/s
+
+Beyond ~13 t/s requires either:
+- A different threading model (per-socket independent compute streams,
+  i.e. the socket-isolated-worker pattern from
+  `finding_socket_isolated_worker_pattern.md`) — but that gives
+  throughput, not single-stream latency
+- Tensor parallelism at the matmul level — major rewrite
+- A different model architecture (smaller MoE, fewer layers)
+
+**Spec decode is now the next coding move.** The Phase 25 work
+on PR #20075 + PR #20700 was the right direction; we paused at
+the wrong moment because the structural compat-check issue felt
+hard. With the profile data in hand, we now know spec decode is
+THE lever for this hardware, not a nice-to-have.
+
+### Pre-flight for the next session
+
+Before resuming spec decode, the work to do:
+
+1. **(Optional) Run the OMP_WAIT_POLICY=ACTIVE bench again** for a
+   confirmed +3% baseline. The 5.17 t/s number is from one run;
+   noise is probably ±2%. Worth a second run for statistical
+   confidence before treating it as the new floor.
+2. **Add OMP_WAIT_POLICY=ACTIVE to the bench script default**
+   so it lands in production builds without needing manual env
+   var setting.
+3. **Look at the spec-decode compat-check fix from Phase 25
+   Step 9** — that's the 2-line patch to `common_speculative_is_compat`
+   that feeds two tokens in two separate `llama_decode` calls
+   instead of one. Then end-to-end test with `llama-server -md`
+   against a small draft model (0.8B Qwen3.5).
+4. **Decide whether to re-convert the GGUF for MTP.** The MTP
+   path is a different spec decode strategy than draft-model.
+   If draft-model spec decode lands first and gets us to 7-10 t/s,
+   MTP becomes optional. If draft-model is hard to land, MTP
+   might be easier despite the GGUF re-conversion cost.
