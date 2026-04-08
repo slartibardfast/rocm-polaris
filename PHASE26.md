@@ -228,3 +228,184 @@ the gap is bigger than expected:
 - Test infra changes
 - Re-baselining against a different model (Qwen3.5-35B-A3B is fixed)
 - Tensile/MIOpen tuning
+
+## NUMA mirror — current state (2026-04-08, mid-implementation)
+
+The Phase 26 #1 NUMA mirror work is partially landed on
+`phase25-decode-perf` and **paused mid-stream** before benchmarking.
+This section captures the state precisely so we can resume cleanly.
+
+### Commits landed (in order)
+
+- `73bf75c03` — `ggml-cpu: scaffolding for GGML_NUMA_STRATEGY_MIRROR`
+  TLS NUMA node id, MIRROR case in set_numa_thread_affinity, mirror
+  buffer type with single-copy fallback. No-op when MIRROR is inactive.
+- `1675818ef` — `ggml-cpu: dual-mbind allocator and --numa mirror CLI`
+  The mirror buft now actually allocates two physical regions via
+  mbind to nodes 0 and 1. CLI exposes `--numa mirror`. supports_op
+  dispatch is guarded against null contexts. libnuma linked.
+- `aa78a1381` — `ggml-cpu: read-side hoists for the NUMA mirror buffer type`
+  matmul, mul_mat_id, flash_attn_ext_f16, get_rows_{q,f16,bf16,f32}
+  all hoist a NUMA-local pointer at function entry and use it in the
+  inner loops. Post-load replication helper
+  `ggml_backend_cpu_buffer_finalize_load` is wired into the model
+  loader so weights end up in both copies after `file->read_raw`.
+
+### What works
+
+- Build clean.
+- Model loads with `--numa mirror` without crashing.
+- Output is byte-coherent on the smoke prompt — greedy generation
+  produces real English text answering the question. (Verified with
+  the OpenClaw smoke fixture; the model picks Paris as the capital
+  of France and generates a multiple-choice question, etc.)
+
+### What's NOT done yet (the "next chunk")
+
+1. **KV cache mirroring.** `llama-kv-cache.cpp:119` and
+   `llama-memory-recurrent.cpp:79` still hardcode
+   `ggml_backend_cpu_buffer_type()` and bypass the buft_list. The
+   KV cache lives on a single NUMA node and threads on the other
+   socket read it via QPI for half their accesses.
+2. **The after-op sync hook.** `ggml_backend_cpu_numa_mirror_after_op_sync`
+   is implemented in `numa-mirror.cpp` but **not yet called from
+   ggml_compute_forward**. Without this, KV writes (set_rows / cpy)
+   only land in copy 0; copy 1 stays stale and reads return wrong
+   data. KV mirror cannot ship until this hook is wired.
+3. **Activation buffer placement.** Compute scratch and activation
+   buffers also live on a single NUMA node. Half the threads pay
+   QPI cost for activation reads/writes. The fix may be either
+   first-touch via per-thread page binding, or also mirroring the
+   activation buffer (which requires the after-op hook for every
+   compute op, not just KV writes).
+
+### The methodology problem we caught and parked
+
+After landing the read-side hoists, the smoke test reported
+**2.99 t/s** for `--numa mirror -t 12` vs **4.39 t/s** for
+`-t 6 --cpunodebind=1 --membind=1`. I declared "mirror is 32% slower
+than single-socket, that's bad" and started designing the next step.
+
+**That comparison is not trustworthy** and should not be used to
+make any decisions about the mirror's worth. Reasons:
+
+- Both numbers came from `-c 512 -n 32` runs with a 5-token prompt.
+  This is a SMOKE test, not a benchmark. Total runtime ~10 s, of
+  which several seconds are warm-up and load-time amortization.
+  Noise floor on a 32-token greedy generation is probably ±15%.
+- The Phase 25 baseline numbers (4.25 → 4.32 t/s across the
+  TQ_KV_FUSED commits) were measured on
+  `tests/openclaw_64k_bench.sh` against `openclaw_8k_fill.txt`,
+  with `-n 256` and the full warmup loop. **That's a different
+  test point.** A smoke test rate cannot be directly compared to
+  a bench rate, in either direction.
+- The Phase 25 NUMA strategy sweep (memory file
+  `finding_numa_single_node.md`) found dual-socket interleaved was
+  **15% slower** than single-socket bound. My smoke comparison
+  showed 38% slower for `--numa distribute`. The 23-point gap
+  between those two numbers is by itself enough evidence that the
+  smoke comparison isn't measuring what I thought it was.
+- I never verified the dual NUMA placement actually happened.
+  `numastat -p <pid>` was never run. The mbind call could have
+  silently failed into the single-copy fallback path and I would
+  not have noticed (the output would still be coherent because the
+  fallback is the regular CPU buffer behavior).
+- I never verified the read-side hoist is reaching the local copy.
+  `perf stat -e mem_load_uops_retired.local_dram,mem_load_uops_retired.remote_dram`
+  was never run.
+
+**Lesson for next session:** before making ANY perf comparison
+between configurations, run them on the SAME bench fixture with
+the SAME script and ENOUGH tokens for the rate to stabilize. The
+existing `tests/openclaw_64k_bench.sh` is the right tool. Smoke
+tests are pass/fail gates, not measurement instruments. This is
+already covered by the `feedback_benchmarking_rules.md` memory
+but I broke the rule anyway in the heat of iteration.
+
+### The bench pass to run when resuming
+
+Before deciding what to do next on the NUMA mirror, run this
+matrix on the SAME script and SAME fixture as Phase 25's
+4.32 t/s baseline:
+
+```
+FILL=tests/openclaw_8k_fill.txt SKIP_SMOKE=1 \
+  tests/openclaw_64k_bench.sh \
+  llama.cpp/src/llama.cpp-b8508/build-tq/bin/llama-completion \
+  -ctk tq_kv_1b -ctv tq_v_4b
+```
+
+Three configurations, sequentially (never parallel — see
+`feedback_benchmarking_rules.md`):
+
+| # | Config | Notes |
+|---|---|---|
+| A | `-t 6` with `numactl --cpunodebind=1 --membind=1` (existing bench script default) | Phase 25 single-socket reference. Should land at ~4.32 t/s. |
+| B | `-t 12 --numa distribute` (drop the `numactl` wrapper) | 12-thread dual-socket without mirror. Apples-to-apples baseline for "what does ggml's existing dual-socket strategy give us on this workload". Expected: ~3.6 t/s based on Phase 25 NUMA sweep, but verify. |
+| C | `-t 12 --numa mirror` (current state, weights mirrored only) | The thing we're actually evaluating. |
+
+The current bench script hardcodes `numactl --cpunodebind=1 --membind=1`
+in the run command. To run B and C, either modify the script or run the
+inner command directly. Suggest a small generalization: accept a
+`NUMA_MODE=mirror` env var that overrides the default `numactl`
+wrapper with `--numa mirror -t 12` and similar for `distribute`.
+
+### Verification steps (run alongside the bench)
+
+While the bench is running for configurations B and C, in a separate
+terminal window:
+
+1. **Confirm dual-NUMA allocation.** `numastat -p $(pgrep llama-completion)`
+   should show ~21 GB on each node when MIRROR is active. If it shows
+   ~21 GB on one node only, the mbind allocator silently fell back to
+   single-copy and the mirror is not actually happening.
+2. **Confirm threads are pinned per socket.** `ps -mo pid,tid,psr,comm
+   $(pgrep llama-completion)` shows each thread's assigned CPU. With
+   MIRROR + `-t 12`, six threads should be on even-numbered CPUs
+   (node 0) and six on odd-numbered (node 1).
+3. **Confirm local DRAM reads dominate** (only worth doing if (1) and
+   (2) check out). Re-run a short generation under `perf stat -e
+   mem_load_uops_retired.local_dram,mem_load_uops_retired.remote_dram
+   ./build-tq/bin/llama-completion ...`. The local count should be
+   substantially higher than remote when MIRROR is active. If they're
+   close, the read-side hoist isn't reaching the local copy.
+
+### Decision tree based on bench results
+
+- **If C ≥ A** (mirror beats single-socket on the real bench):
+  ship the current state, then add KV cache mirroring + after-op
+  hook for further gains. The +9% smoke-test number was probably
+  underselling the actual win.
+- **If C is within 10% of A**: KV cache mirror is the next move.
+  KV is ~13.5% of bandwidth at 8K, so removing the cross-socket
+  cost there can plausibly close the gap.
+- **If C < 0.8 × A** (mirror is significantly worse than single-socket):
+  there's a structural issue. Investigate via the verification steps
+  above. Most likely candidates:
+  - The mbind silently fell back to single-copy (look for it).
+  - The read-side hoist is computing the wrong offset (perf counters
+    will show this — remote DRAM reads stay high).
+  - ggml's 12-thread coordination on dual-socket Westmere has too
+    much overhead and it's the actual bottleneck (not bandwidth).
+    In that case, mirror is doing its job but it's a single-process
+    architecture problem and we'd need to look at the
+    socket-isolated-worker pattern from
+    `finding_socket_isolated_worker_pattern.md` instead.
+- **If C is wildly different from B** in either direction: that
+  itself is a useful signal. C should always be ≥ B if the mirror
+  is doing anything. If C ≈ B, the mirror code is a no-op and
+  there's a bug.
+
+### Why we're pausing here
+
+We have three commits that compile, produce correct output, and add
+the read-side infrastructure. The next chunk (KV mirror + after-op
+hook) is non-trivial and the right move is to first measure whether
+what we've built so far is actually working before adding more code
+on top of an unverified foundation. Adding KV mirror on top of a
+broken weight mirror would just paper over the underlying issue
+with more code.
+
+When resuming, the first action is the bench pass above, NOT more
+implementation. Only after the numbers come back do we decide which
+direction to take.
