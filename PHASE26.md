@@ -472,18 +472,38 @@ priority list.
 | **Total** | **~2.5** | **~0.6** |
 
 **~2.5 GB/s total DRAM reads, against a ~44 GB/s dual-socket
-ceiling. We are at 5% of the bandwidth ceiling.** This rules out
-"more bandwidth via more mirroring" as the lever to chase.
+peak streaming ceiling.** Bandwidth is not on the critical path
+right now; mirroring more buffers won't move the needle much.
 
-Working backward: 2.5 GB/s × 199 ms/token ≈ **500 MB DRAM reads
-per token**. Earlier I estimated ~1.8 GB/token; that was 3-4× too
-high. Cache (L2 91% hit, L3 76% hit) is serving most of the weight
-reads — only the cold-miss bytes hit DRAM.
+But the "5% of ceiling = 20× t/s headroom" math I initially did
+is wrong. Dividing aggregate bandwidth by per-token demand only
+gives a t/s ceiling if bandwidth is the binding constraint —
+which it isn't here. To find the actual ceiling we have to look
+at compute and op-overhead instead.
 
-The implication: **the real bandwidth ceiling for this model is
-~88 t/s** (44 GB/s ÷ 0.5 GB/token), not 25. There's much more
-room than I thought — but that room can't be reached by feeding
-DRAM faster.
+Honest model param math (Qwen3.5-35B-A3B observed at runtime):
+- Total: 34.66B params, 20.49 GiB at 5.08 BPW
+- MoE expert FFN per token: 8 active × 512 FF × 2048 embd × 2 ≈ 16.8M
+- Plus shared expert per layer: +2.1M
+- Plus attention QKVO per layer: ~16M
+- × 40 layers + embeddings + norms ≈ **~1.4–1.6B active params/token**
+- At 5.08 BPW: **~950 MB of weight reads per token** (NOT 1.875 GB)
+- 5.01 t/s × 0.95 GB = 4.75 GB/s of weight demand
+- pcm measured 2.5 GB/s DRAM, so cache is serving ~2.25 GB/s
+- Cache hit rate by bytes: ~47% (more believable than the 75% I
+  initially calculated from a wrong starting estimate)
+
+Compute ceiling math:
+- 1.5B active params × 2 ops/param (FMA) ≈ 3 GFLOPS/token
+- Westmere int8/quant matmul realistic effective throughput on
+  hand-tuned SSE4.2 kernels: ~25–40% of peak
+- 12 cores × 2.67 GHz × ~16 INT-MACs/cycle peak ≈ 512 GINT-MACs/sec
+- At 25–40% efficiency: ~130–200 GINT-MACs/sec usable
+- Per-token compute: ~3 G ops / 130–200 G/sec ≈ 15–25 ms/token
+- **Compute ceiling: ~40–65 t/s peak, ~10–15 t/s realistic**
+
+5 t/s is **~35–50% of the realistic compute ceiling**, not 5% of
+some absurd 88 t/s ceiling. There's 2–3× headroom available, not 17×.
 
 **CPU utilization during decode:**
 - Aggregate: ~46% (`ps` reports 554% / 1200%)
@@ -599,25 +619,37 @@ lever. After running it and profiling, we have:
 
 ### The honest revised target
 
-The 25 t/s "theoretical dual-socket bandwidth ceiling" is now
-known to be wrong on the upside — the real bandwidth ceiling for
-this model and this cache pattern is closer to 88 t/s (~5% of
-which we're using). But we can't reach that ceiling via bandwidth
-levers alone, because the actual bottleneck is op-launch overhead
-at batch=1.
+Earlier in this doc I claimed the ceiling was 25 t/s (bandwidth
+math) and then briefly 88 t/s (worse bandwidth math). Both are
+wrong. Bandwidth is not the binding constraint at our current
+operating point — compute and op-overhead are.
 
-Realistic target with the levers above:
-- **Spec decode landing**: 7–10 t/s (1.5–2× over current 5 t/s)
-- **+ op fusion**: 8–12 t/s
-- **+ small wins (KV mirror, refined chunking)**: 9–13 t/s
+Realistic ceiling for this exact model on this exact hardware,
+bound by compute on hand-tuned SSE4.2 quant kernels:
+**~10–15 t/s realistic, ~25 t/s hard upper bound**.
 
-Beyond ~13 t/s requires either:
-- A different threading model (per-socket independent compute streams,
-  i.e. the socket-isolated-worker pattern from
+5 t/s is **~35–50% of the realistic compute ceiling**, with
+2–3× headroom — meaningful but not the 17× I claimed before
+checking my arithmetic.
+
+Realistic target with the levers below:
+- **Spec decode landing (N=4, modest acceptance)**: 7–10 t/s
+  (1.5–2× over current 5 t/s — amortizes op overhead and
+  shifts the workload toward larger per-op work units that
+  the matmul kernels handle well)
+- **+ op fusion**: 8–11 t/s
+- **+ small wins (KV mirror, refined chunking, bench script
+  default OMP_WAIT_POLICY=ACTIVE)**: 9–12 t/s
+
+Beyond ~12 t/s requires either:
+- A different threading model (per-socket independent compute
+  streams, i.e. the socket-isolated-worker pattern from
   `finding_socket_isolated_worker_pattern.md`) — but that gives
   throughput, not single-stream latency
-- Tensor parallelism at the matmul level — major rewrite
-- A different model architecture (smaller MoE, fewer layers)
+- Tensor parallelism at the matmul level — major rewrite,
+  uncertain payoff on this hardware
+- A different model architecture (smaller MoE, fewer layers,
+  or lower-bitwidth quantization)
 
 **Spec decode is now the next coding move.** The Phase 25 work
 on PR #20075 + PR #20700 was the right direction; we paused at
