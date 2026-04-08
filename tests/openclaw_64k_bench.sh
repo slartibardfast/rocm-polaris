@@ -102,7 +102,15 @@ echo "  Extra:    $*"
 echo "=============================================="
 
 # Run.
+# OMP_WAIT_POLICY=ACTIVE keeps OpenMP worker threads busy-waiting at
+# barriers between ops instead of sleeping. Phase 26 measurement showed
+# this gives ~+3% on the 8K openclaw fill (5.01 → 5.17 t/s) under
+# --numa mirror, with no downside on the single-socket reference
+# configuration. Set as the bench default so the perf number is
+# representative of the production binary, which will inherit the
+# same env via the systemd unit / launcher.
 set -x
+OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-ACTIVE} \
 VK_ICD_FILENAMES=/dev/null \
   numactl --membind="$NUMA_NODE" --cpunodebind="$NUMA_NODE" \
   "$BINARY" \
