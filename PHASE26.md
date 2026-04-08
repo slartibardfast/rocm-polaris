@@ -6,25 +6,50 @@
 > (which are mostly tapped out at 8K fill) to MoE-side bandwidth and
 > production validation at the real 64K target context.
 
-## Status entering Phase 26
+## Status entering Phase 26 (historical, see "Current standing" below for live state)
 
-- **Current best:** 4.32 t/s on 8K fill, `Qwen3.5-35B-A3B-Q4_K_M`,
+- **Phase 25 final:** 4.32 t/s on 8K fill, `Qwen3.5-35B-A3B-Q4_K_M`,
   `-ctk tq_kv_1b -ctv tq_v_4b`, dual Xeon X5650 single-socket-bound
-- **Target (nominal):** 5.0 t/s
-- **Target (production):** 5.0 t/s **sustained at 64K fill** — the
-  real OpenClaw production scenario
-- **Bandwidth ceiling:** ~13 t/s on a single socket at 100% effective
-  DDR3 streaming, ~25 t/s if we capture both sockets
-- **Gap to nominal:** 0.68 t/s = 15.7% = 36 ms/tok at 8K fill
-- **Gap to bandwidth ceiling:** ~3x at 8K fill — large headroom
-  remains, but every additional bps requires touching the MoE-side
-  scatter pattern that Phase 25's KV work didn't reach
+- **Target (nominal):** 5.0 t/s — **HIT** by NUMA mirror v1
+- **Realistic ceiling on this hardware** (corrected after profile pass):
+  ~10-15 t/s. The earlier "25 t/s" and "88 t/s" numbers in this doc
+  were both wrong; see the bench results section for honest math.
+
+## Current standing (2026-04-08)
+
+- **Best decode rate:** **5.17 t/s** at 8K openclaw fill, with
+  `--numa mirror -t 12 -ctk tq_kv_1b -ctv tq_v_4b`,
+  `OMP_WAIT_POLICY=ACTIVE` (now the bench script default)
+- **Cumulative gain over Phase 25 system baseline (3.37 t/s):** **+53.4%**
+- **Cumulative gain over Phase 25 final (4.32 t/s):** **+19.7%**
+- **Headroom to realistic compute ceiling (~10-15 t/s):** ~2-3×
+- **Active branch tip:** `phase25-decode-perf` at `aa78a1381`
+  (NUMA mirror v1: scaffolding + dual-mbind + read-side hoists +
+  post-load replication, weights mirrored only)
+
+What's landed:
+
+| Commit | What |
+|---|---|
+| `73bf75c03` | `ggml-cpu: scaffolding for GGML_NUMA_STRATEGY_MIRROR` |
+| `1675818ef` | `ggml-cpu: dual-mbind allocator and --numa mirror CLI` |
+| `aa78a1381` | `ggml-cpu: read-side hoists for the NUMA mirror buffer type` |
+| `cfd594d` (top-level) | `tests: openclaw bench — set OMP_WAIT_POLICY=ACTIVE by default` |
+
+Status of the originally-planned Phase 26 #1 work:
+- ✅ Mirror buffer type, dual-mbind allocator, CLI exposure
+- ✅ Read-side hoists for matmul/mul_mat_id/flash_attn/get_rows
+- ✅ Post-load replication (weights buffer finalize_load helper)
+- ✅ Bench matrix run + profile pass + ceiling math correction
+- ⏸️ KV cache mirroring (bumped to next, see below)
+- ⏸️ After-op sync hook (lands with KV mirroring)
+- ⏸️ Activation buffer placement (TBD if needed after KV)
 
 ## Active branch
 
 - **`phase25-decode-perf`** (in `llama.cpp/src/llama.cpp-b8508`): the
   ongoing single branch carrying all in-flight Phase 25/26 work.
-  Tip: `2fc8347bb` (TQ_KV_FUSED kernel).
+  Tip: `aa78a1381` (NUMA mirror read-side hoists).
 - Phase 26 work continues on this branch unless a sub-experiment
   needs isolation.
 
