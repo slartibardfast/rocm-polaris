@@ -506,3 +506,185 @@ either (a) patching the compat check to use two separate `llama_decode` calls,
 (b) re-converting the GGUF with MTP heads, or (c) both. Re-prioritizing
 toward higher-leverage Phase 25 levers (Step 4.75 TQ_KV_FUSED, or a real
 CPU kernel for `FUSED_GATE_PREP`) before returning to spec decode.
+
+## Step 4.75 — TQ_KV_FUSED (loop-level fusion) — design (2026-04-08)
+
+**Decision:** Fuse at the **hot-loop level**, not at the block-format level.
+Keep `block_tq_kv_1b` and `block_tq_v_4b` exactly as they are. The KV cache
+storage stays as two separate ggml tensors. What changes is the kernel API
+and the FA op call site.
+
+### Why loop fusion, not format unification
+
+A unified 90-byte K+V block would require:
+- New ggml type registration (`GGML_TYPE_TQ_KV_FUSED`)
+- KV cache allocator changes to plumb a single tensor for K+V
+- llama-graph rewrites where K and V are accessed independently
+- New quantize/dequantize/vec_dot type traits
+- ~1–2 days of plumbing for ~the same perf as loop fusion
+
+Loop fusion captures the structural wins (no score scratch, K and V read
+close in time, single pass over the valid run) at a fraction of the surface
+area: one new C kernel, one rewrite of the FA inner loop branch.
+
+### Bandwidth ground truth (8K bench)
+
+| Component | Per-token | Share |
+|---|---:|---:|
+| MoE expert weights (active) | ~1.5 GB | 86% |
+| K cache (TQ_KV_1B, DK=256) | ~63 MB | 4% |
+| V cache (TQ_V_4B, DV=256) | ~173 MB | 10% |
+
+KV is **13.5%** of bandwidth at 8K fill. Realistic gain ceiling for any
+KV-side optimization is in the +2–4% range at 8K, growing to +5–8% at 64K
+where KV approaches parity with MoE traffic. **Step 4.75 is a building
+block, not the move that crosses 5 t/s on its own.** It will be one of
+several levers; the +5–15% number from the original plan was the optimistic
+high end of the 64K case.
+
+### New kernel API
+
+```c
+/* Fused K-Hamming + V-mad + online softmax for one FA row.
+ *
+ * Replaces tq_kv_1b_attention_multi + the per-position loop in
+ * ggml_compute_forward_flash_attn_ext_f16 for the (TQ_KV_1B, TQ_V_4B) pair.
+ *
+ * Maintains the running max/sum of online softmax across the [0, valid_run)
+ * range and accumulates VKQ32 in place. Caller must initialize VKQ32 to
+ * zero, M to -INFINITY, S to 0 before the call (matching the existing
+ * loop preconditions).
+ *
+ * Mask is applied per-position via `mp` (fp16, NULL means unmasked) and
+ * `slope`. Positions where the masked score is -INFINITY are skipped at
+ * zero cost (no V mad, no softmax update).
+ */
+void tq_kv_fused_attention(
+    const float          * query,        /* DK floats                       */
+    const block_tq_kv_1b * k_blocks,     /* (valid_run * DK/128) blocks     */
+    const block_tq_v_4b  * v_blocks,     /* (valid_run * DV/128) blocks     */
+    const ggml_fp16_t    * mp,           /* mask (valid_run fp16) or NULL   */
+    int                    valid_run,
+    int                    DK,
+    int                    DV,
+    float                  scale,
+    float                  slope,
+    float                  logit_softcap, /* 0.0f for no softcap            */
+    float                * VKQ32,        /* DV floats, accumulator (in/out) */
+    float                * M_inout,      /* running max  (in/out)           */
+    float                * S_inout       /* running sum  (in/out)           */
+);
+```
+
+### Kernel structure (pseudocode)
+
+```
+Per-block Q precomputation (unchanged):
+    for b in [0, DK/128):
+        q_rot[b] = RHT(query[b*128 : (b+1)*128])
+        q_signs[b] = sign_extract(q_rot[b])
+        q_norm[b] = ||query[b*128 : (b+1)*128]||
+
+Hot loop:
+    for s in [0, valid_run):
+        # K-side: Hamming score for position s
+        score = 0
+        for b in [0, DK/128):
+            ham = popcount(q_signs[b] XOR k_blocks[s*nb + b].signs)
+            score += q_norm[b] * k_norm(k_blocks[s*nb+b]) * per_block_scale * (2*(128-ham)-128)
+
+        score = score * scale
+        if logit_softcap != 0: score = logit_softcap * tanhf(score)
+        if mp: score += slope * fp16_to_fp32(mp[s])
+        if score == -INFINITY: continue   # masked
+
+        # Online softmax update
+        Mold = M
+        ms = 1
+        vs = 1
+        if score > M:
+            M = score
+            ms = expf(Mold - M)
+            vec_scale_f32(DV, VKQ32, ms)
+        else:
+            vs = expf(score - M)
+        S = S * ms + vs
+
+        # V-side: fused dequant+mad in place
+        tq_v_4b_vec_mad_f32(DV, VKQ32, &v_blocks[s*(DV/128)], vs)
+```
+
+Notes:
+- The Q-precompute is identical to the existing `tq_kv_1b_attention_multi`,
+  hoisted out of the position loop.
+- `tq_v_4b_vec_mad_f32` already exists (Step 4.5) and is reused unchanged.
+- The online softmax block is copy-pasted from `ops.cpp:8344-8395`, fp32
+  variant only — TQ_V_4B never pairs with the fp16 VKQ accumulator.
+- Mask handling: the kernel handles the per-position mask check itself,
+  matching what the caller does today around line 8322.
+
+### FA op call-site change
+
+In `ggml_compute_forward_flash_attn_ext_f16` (`ops.cpp:8200+`), replace the
+TQ_KV_1B + TQ_V_4B branch with a single call:
+
+```cpp
+const bool use_tq_kv_fused =
+    (k->type == GGML_TYPE_TQ_KV_1B) && (v->type == GGML_TYPE_TQ_V_4B);
+
+if (use_tq_kv_fused) {
+    /* Find valid_run from the mask (existing logic) */
+    /* ... */
+    tq_kv_fused_attention(pq,
+        (const block_tq_kv_1b *) k_data_base,
+        (const block_tq_v_4b  *) v_data_base,
+        mp ? mp + ic_start : NULL,
+        (int) valid_run,
+        (int) DK, (int) DV,
+        scale, slope, logit_softcap,
+        VKQ32, &M, &S);
+    /* skip the per-position loop entirely for this row */
+}
+```
+
+The non-TQ paths and the TQ_KV_1B-only-with-non-TQ_V_4B mixed configs are
+unchanged.
+
+### Per-thread scratch impact
+
+The `tq_thread_buf` allocation (sized `nek1 * sizeof(float) * nthreads` in
+the FA work-size calc) is no longer needed by the fused path. We keep the
+allocation in place for the legacy TQ_KV_1B-only path (when V is not
+TQ_V_4B), but a future cleanup could split the work-size calc. Out of scope
+for Step 4.75.
+
+### Verification plan
+
+1. **Numerical equivalence test.** Add a small unit test that runs the same
+   (Q, K, V, mask) through both the fused kernel and the existing
+   tq_kv_1b_attention_multi + ops.cpp loop, and asserts the resulting
+   VKQ32, M, S match within fp32 noise (~1e-5 relative).
+2. **Smoke test.** Run the existing `tests/smoke_test.sh` and verify gen
+   t/s ≥ 4.0 (same sanity floor as before).
+3. **Bench.** Run the 8K-fill OpenClaw bench. Accept any result ≥ 4.25 t/s
+   (no regression from the 4.25 baseline). Goal: 4.30–4.40 t/s.
+4. **Per-token equivalence.** Run llama-perplexity on wikitext-2 and verify
+   PPL matches the Step 8a baseline within ±0.005 (the same fidelity
+   standard the prior steps held to).
+
+### Out-of-scope for this step
+
+- Block format unification (deferred or dropped entirely)
+- Eliminating the `tq_thread_buf` allocation in the work-size calc
+- Multi-thread reorganization of the FA outer loop
+- Re-tackling Step 5 (split-KV decode path)
+
+### Expected outcome
+
+Honest estimate:
+- 8K bench: **+1.5% to +3%** (~4.36–4.43 t/s)
+- 64K bench: **+4% to +7%** (extrapolated, not measured this step)
+
+If it lands above the high end at 8K, that's a positive surprise. If it
+lands flat, the cherry-pick stays in the tree as a code-quality cleanup
+(score scratch eliminated, single pass) and we move on to the next lever.
