@@ -756,3 +756,57 @@ is deferred to a separate Step 7 production validation.
 Gap to target: 0.68 t/s = 15.7%, or 36 ms/tok. The remaining levers
 (refined Step 5 split-KV, MoE expert caching, NUMA duplication) all
 target the MoE-side bandwidth ceiling that Step 4.75 didn't reach.
+
+## Phase 25 — closed (2026-04-08)
+
+**Final standing:** 4.32 t/s on 8K-fill OpenClaw bench, **86.4% of the
+5 t/s target.** Started at 3.37 t/s system baseline. Cumulative gain
++28.2% across nine landed steps (1, 2, 3, 4, 4.5, 4.75, 5/reverted,
+6, 8a). Two steps were paused mid-implementation: 8b PGO (no
+benefit, build cost too high) and 9 spec-decode cherry-picks
+(structural gaps in compat check + missing MTP head in GGUF).
+
+**What worked:**
+- Phase 24 SSSE3 K-quant kernels (Step 1): +4.7%
+- downlevel.h fp16/q4_0 helpers (Step 3): +3.1% on top of Step 1
+- TurboQuant 1-bit K + 4-bit V (Steps 4–4.5): +15.6% on top of Step 3
+  (the largest single jump in Phase 25)
+- Link-time optimisation (Step 8a): +0.9%
+- Loop-level fusion of K Hamming + softmax + V mad (Step 4.75): +1.6%
+
+**What didn't:**
+- Split-KV decode path (Step 5): regressed at partial fill, reverted
+- PGO (Step 8b): no benefit on bandwidth-bound hot path with hand-rolled
+  SIMD; -fno-unsafe-math-optimizations + -ffp-contract=off constrain
+  the headroom PGO needs to find
+- Spec-decode cherry-picks (Step 9): cherry-picks themselves landed
+  cleanly and produced no perf regression, but the spec-decode path
+  doesn't activate at runtime due to compat-check granularity mismatch
+  in PR #20075 and missing MTP tensors in our existing GGUF
+
+**Things discovered along the way:**
+- KV is only 13.5% of bandwidth at 8K fill (the actual test point);
+  the original Phase 25 plan over-priced KV-side optimizations because
+  it implicitly modeled the 64K case
+- We are at ~70% of the realistic single-socket bandwidth ceiling
+  (~10-12 GB/s effective for MoE scatter on DDR3 from one NUMA node)
+- The "real" bandwidth ceiling is ~13 t/s; getting there requires
+  MoE-side work (expert caching, NUMA duplication), not KV work
+- `tq_kv_1b_attention_multi` has a latent K stride bug that's been
+  invisible because Qwen3.5 GQA broadcasts identical K across both
+  KV heads — see `finding_tq_kv_1b_helper_stride_bug.md`
+- llama-cli is interactive-only in the b8508 cut; llama-completion
+  doesn't expose `-md` or `--spec-type`; spec-decode validation
+  requires llama-server and a re-converted GGUF
+- The b8508 vendored tree is volatile — submodule commits must use
+  upstream-style naming (no Phase/Step language) so they survive
+  future diff-rebases. Captured as `feedback_submodule_commit_naming.md`
+
+**Carryover to Phase 26:** see `PHASE26.md`. The pending levers
+(production validation at 64K, MoE-side bandwidth attack, retry of
+spec decode with proper plumbing, refined split-KV) target the gap
+to the bandwidth ceiling rather than the gap to nominal 5 t/s. The
+honest read is that 5 t/s at 8K fill may be achievable; 5 t/s
+sustained at 64K fill is harder because KV traffic at that fill
+swamps everything else and the model's attention layers aren't
+fundamentally cheaper than the SSM layers.
