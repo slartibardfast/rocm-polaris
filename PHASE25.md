@@ -688,3 +688,71 @@ Honest estimate:
 If it lands above the high end at 8K, that's a positive surprise. If it
 lands flat, the cherry-pick stays in the tree as a code-quality cleanup
 (score scratch eliminated, single pass) and we move on to the next lever.
+
+### Step 4.75 — outcome (2026-04-08)
+
+Landed as `2fc8347bb` on `phase25-decode-perf`:
+**`ggml-cpu/flash-attn: fused K Hamming + softmax + V mad for TQ_KV_1B + TQ_V_4B`**
+
+| Step | Config | PP t/s | Gen t/s | Δ vs Step 8a |
+|---|---|---:|---:|---:|
+| Step 8a (LTO) | tq_kv_1b+tq_v_4b | 12.38 | 4.25 | — |
+| Post spec-decode cherry-picks | same | 12.42 | 4.30 | +1.2% |
+| **Step 4.75 (TQ_KV_FUSED)** | same | **12.36** | **4.32** | **+1.6%** |
+
+Lands in the bottom half of the +1.5–3% prediction. Token-identical to
+the unfused path on 64-token greedy temp=0 generation (equivalence
+test method described below).
+
+**Equivalence test methodology:** A `LLAMA_TQ_FUSED_DISABLE` environment
+kill switch was added during development (now removed) that fell back to
+the legacy two-stage path. Running greedy temp=0 generation with the
+same prompt and seed, both with and without the kill switch, the
+generated token sequences were diffed. Token-identical for 64 tokens
+on `Qwen3.5-35B-A3B-Q4_K_M.gguf` with the OpenClaw smoke prompt.
+
+**Bug found and fixed mid-implementation:** Initial kernel used
+`s * n_blocks_v * sizeof(block_tq_v_4b)` (132 bytes) as the per-K-position
+V stride, which was wrong for the GQA layouts the model uses. The actual
+V cache stride is `nbv1 = 264` bytes per K position because two KV heads
+are interleaved at the row level (`nb[1] = n_head_kv * nb[2]`). The
+buggy version read from the wrong V positions and produced different
+VKQ32 values than the legacy path (M and S still matched, because the
+score side was consistently broken between paths — see below). Fixed
+by passing `v_row_stride = nbv1` from the caller and computing
+`v_row = v_base + s * v_row_stride` in the kernel.
+
+**Pre-existing bug discovered:** `tq_kv_1b_attention_multi` (the legacy
+K Hamming helper) iterates `kv_cache[s * n_blocks]` which is HALF the
+real per-K-position stride for the same GQA layout. It's been producing
+correct results purely because Qwen3.5's GQA broadcast stores identical
+K data across the two KV heads — reading "head 1's K[0]" returns the
+same bytes as "head 0's K[0]". The fused kernel preserves this same
+broken K stride for byte-equivalence with the legacy path. If a future
+model breaks the GQA-broadcast assumption, BOTH `tq_kv_1b_attention_multi`
+and `tq_kv_fused_attention` need to be fixed in lockstep. Documented in
+`finding_tq_kv_1b_helper_stride_bug.md`.
+
+**Why the gain is on the low side of the prediction:** The bandwidth
+math in the design plan said KV is only 13.5% of bandwidth at 8K fill,
+upper-bounding any KV-side optimization at ~7%. Step 4.75 captures the
+structural wins (no score scratch, single pass) but doesn't move the
+MoE-side bandwidth ceiling. At 64K fill where KV approaches parity
+with MoE traffic, the gain should grow to ~5–8% — that measurement
+is deferred to a separate Step 7 production validation.
+
+**Cumulative Phase 25 standing after Step 4.75:**
+
+| Step | Gen t/s | Cumulative gain vs system baseline (3.37) |
+|---|---:|---:|
+| System baseline | 3.37 | — |
+| Step 1 (Phase 24 SSSE3) | 3.53 | +4.7% |
+| Step 3 (downlevel.h) | 3.64 | +8.0% |
+| Step 4.5 (TQ_V_4B fused mad) | 4.21 | +24.9% |
+| Step 8a (LTO) | 4.25 | +26.1% |
+| **Step 4.75 (TQ_KV_FUSED)** | **4.32** | **+28.2%** |
+| Target (5.0 t/s) | 5.00 | +48.4% |
+
+Gap to target: 0.68 t/s = 15.7%, or 36 ms/tok. The remaining levers
+(refined Step 5 split-KV, MoE expert caching, NUMA duplication) all
+target the MoE-side bandwidth ceiling that Step 4.75 didn't reach.
