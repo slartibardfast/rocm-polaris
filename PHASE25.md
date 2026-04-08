@@ -440,3 +440,69 @@ plan estimated +5–15% from this step. If realised at the top of the
 range, we'd reach 4.89 t/s — still 2.2% short of target. Likely
 need Step 4.75 plus a refined Step 5 (valid-range-aware chunking) to
 fully cross 5.0.
+
+## Step 9 — Spec-decode cherry-pick experiment (2026-04-08)
+
+Branch `phase25-decode-perf` cherry-picked from `llama-jit`:
+
+| Commit | What |
+|--------|------|
+| `0101022aa` | PR #20075 base — synchronous recurrent state checkpointing |
+| `652c1b648` | PR #20075 follow-up — has_cell=true checkpoint path |
+| `be83d99e5` | PR #20700 — MTP for dense Qwen3.5 + FastMTP vocab trim |
+| `51234a98a` | Polaris MTP MoE extension (10 lines on top of `be83d99e5`) |
+| `7f8bffb1b` | Cleanup: strip three `[MTP-*]` debug fprintfs from hot paths |
+
+**Conflict resolution decisions:**
+- `llama-memory-recurrent.cpp` line 710 — kept HEAD's checkpoint creation
+  (rejected the incoming "no checkpoint for MTP" comment from `19fdba56b`)
+- `qwen35.cpp` and `qwen35moe.cpp` — kept the unfused 3-step
+  `add → softplus → mul` form for the GDN gate. The incoming
+  `ggml_fused_gate_prep` is a Vulkan-only op (CPU stub crashes) defined in
+  `0fba88dc5` which we did **not** cherry-pick. Polaris is CPU-only so
+  the unfused path is required.
+
+**Build + perf result:** clean rebuild at `7f8bffb1b`. 8K-fill OpenClaw bench
+on `tq_kv_1b + tq_v_4b`:
+
+| Metric | Pre-cherry-pick (4.25 baseline) | Post-cherry-pick |
+|---|---:|---:|
+| PP t/s | 12.38 | 12.42 |
+| Gen t/s | **4.25** | **4.30** |
+
+Within ±2% noise — **no regression** from the cherry-picks.
+
+**Spec decode does NOT work yet.** Two structural gaps blocking validation:
+
+1. **Compat-check granularity mismatch.** `common_speculative_is_compat`
+   (common/speculative.cpp:884) feeds **two tokens in a single batch** then
+   tries `seq_rm(0, 1, -1)`. PR #20075's checkpoint creation only fires in
+   the seq-owns-cell *else* branch — i.e., at batch boundaries. With both
+   tokens in one ubatch, `find_slot` takes the *new-cell* if-branch, no
+   checkpoint exists at pos 0, and seq_rm returns false. The compat check
+   then falls through to:
+
+2. **No MTP layers in the GGUF.** The fallback gate is
+   `llama_model_n_mtp_layers(model) > 0`. Our existing
+   `Qwen3.5-35B-A3B-Q4_K_M.gguf` was converted before any of these PRs and
+   has no MTP head tensors. Re-conversion via the cherry-picked
+   `convert_hf_to_gguf.py` would be needed.
+
+`llama-server --spec-type mtp` consequently logs:
+```
+common_speculative_is_compat: the target context does not support partial sequence removal
+srv    load_model: speculative decoding not supported by this context
+```
+…and serves as a regular non-spec target.
+
+**Tool-surface notes (b8508 cut):**
+- `llama-completion`: non-interactive but **does not expose** `-md` or `--spec-type mtp`
+- `llama-cli`: exposes `-md` but is **interactive-only**; rejects `-no-cnv`
+  ("--no-conversation is not supported by llama-cli, please use llama-completion instead")
+- `llama-server`: only binary that exposes both spec-decode flags
+
+**Status: paused.** The cherry-picks are landed and benign. Validation needs
+either (a) patching the compat check to use two separate `llama_decode` calls,
+(b) re-converting the GGUF with MTP heads, or (c) both. Re-prioritizing
+toward higher-leverage Phase 25 levers (Step 4.75 TQ_KV_FUSED, or a real
+CPU kernel for `FUSED_GATE_PREP`) before returning to spec decode.
