@@ -324,3 +324,119 @@ if (v->type == GGML_TYPE_TQ_V_4B) {
 - Largest remaining levers: Step 5 (split-KV parallelism across
   all 6 threads), Step 4.75 (fused KV single-stream — deferred
   pending Step 5 result), Step 8 (LTO + PGO)
+
+## Step 5: split-KV decode path for TQ_KV_1B (REVERTED)
+
+Initial attempt admitted TQ_KV_1B to `use_split_kv_path` so all 6
+threads could chunk the K cache horizontally during decode. Measured:
+
+| Step | Gen t/s |
+|------|---------:|
+| Step 4.5 baseline | 4.21 |
+| Step 5 (split-KV on TQ) | 3.95 |
+
+**Regressed by 6%.** Root cause: at 8K fill in a 65K-allocated cache,
+chunk_size = nek1/nth = 10923 spans the entire valid range in
+thread 0's first chunk. Threads 1..5 receive ic_start ≥ 10923 which
+is fully masked → they spin on dead chunks. The non-split path
+parallelises by query head (16 heads ÷ 6 threads ≈ 3 heads/thread)
+which keeps every thread busy.
+
+Reverted. The fix requires valid-range-aware chunking (walk mask
+once, divide [0, valid_end) across threads), out of scope for this
+session.
+
+## Step 6: RWKV/GLA early-exit fix (SKIPPED — N/A)
+
+The b8637 commit `d43375ff7` removes an `if (ith >= HEADS) return;`
+guard from `ggml_compute_forward_rwkv_wkv6_f32`,
+`ggml_compute_forward_gla_f32`, and `ggml_compute_forward_rwkv_wkv7_f32`.
+Qwen3.5 uses `ggml_compute_forward_gated_delta_net` which has its
+own dynamic work-stealing (`ggml_threadpool_chunk_add`) and doesn't
+have the early-exit bug. No gain for our workload.
+
+## Step 8a: LTO
+
+`-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON` + clean rebuild. Added
+`__attribute__((target("sse2,ssse3,sse4.1,sse4.2,popcnt")))` to the
+downlevel.h helpers so the per-source `-march=native` survives LTO
+inlining into callers in TUs without that flag.
+
+| Step | Gen t/s | Δ |
+|------|---------:|---:|
+| Step 4.5 (no LTO) | 4.21 | — |
+| **Step 8a (LTO)** | **4.25** | **+0.9%** |
+
+Modest gain. The downlevel.h helpers are already `static inline` in
+a header, so `-O3` without LTO already inlines them cleanly. LTO's
+extra wins come from cross-TU inlining of larger functions, which
+isn't where our hot path lives.
+
+## Step 8b: PGO (LTO+PGO combined)
+
+Three-stage build: instrumented `build-pgo-gen` → training run with
+`-fprofile-generate` → optimised `build-pgo-use` with `-fprofile-use`.
+
+Training: 8K fill, 128 gen tokens, the same fixture as the bench.
+Instrumentation overhead was severe — the training run took 2 hours
+40 minutes (vs ~12 min for the unprofiled build, ~13× slowdown). 191
+gcda files, 3.2 MB profile data.
+
+Build flags for stage 3 included `-fno-unsafe-math-optimizations
+-ffp-contract=off` to keep numerics byte-stable.
+
+| Step | Gen t/s | Δ vs Step 4.5 |
+|------|---------:|---:|
+| Step 4.5 (no LTO/PGO) | 4.21 | — |
+| Step 8a (LTO) | 4.25 | +0.9% |
+| **Step 8b (LTO+PGO)** | **4.19** | **-0.5%** |
+
+PGO gave us nothing material (within noise of ±2%). Why:
+
+1. **The hot path is bandwidth-bound, not branch-bound.** PGO helps
+   most for branch-heavy compute where the compiler needs to know
+   the common case to lay out fast paths. Our flash attention loop
+   is a tight matmul with predictable access pattern; there's no
+   branch layout for PGO to improve.
+2. **Hand-rolled SSE4.1 helpers already short-circuit dynamic
+   dispatch.** The Giesen fp16 helper, `ggml_x86_q4_0_unpack_32`,
+   and `tq_v_4b_vec_mad_f32` are all `static inline` with no
+   conditional bodies. PGO can't reorganise what's already a
+   straight-line vector loop.
+3. **Server-side glue not trained.** We trained `llama-completion`,
+   not `llama-server`. Server-specific code paths (HTTP, JSON, chat
+   templates) get cold compilation. For a server-targeted PGO we'd
+   need to instrument and run a real client workload through
+   llama-server.
+
+Notes for next time:
+- PGO training overhead is ~13× for the inference loop. Single-run
+  training is ~2.5 hours; multi-run training would be a multi-hour
+  commitment. Instrumented PGO is impractical for fast iteration.
+- Where PGO helps a lot: server glue, sampling code, I/O paths. Where
+  PGO doesn't help: tight SIMD vector loops we've already hand-rolled.
+- For our use case, LTO alone (Step 8a) captured the +0.9% available;
+  PGO didn't add anything on top.
+
+## Final standing — Phase 25 gap-closing run
+
+| Step | Config | PP t/s | Gen t/s | Cumulative gain | Wall time |
+|------|--------|-------:|--------:|----------------:|----------:|
+| Baseline (system binary) | q4_0+q4_0 | 8.30 | 3.37 | — | 17.0 min |
+| Step 1: Phase 24 cherry-pick | q4_0+q4_0 | 9.86 | 3.53 | +4.7% | 14.4 min |
+| Step 3: downlevel.h shim | q4_0+q4_0 | 9.93 | 3.64 | +8.0% | 14.3 min |
+| Step 4.5: TQ_V_4B fused mad | tq_kv_1b+tq_v_4b | 12.32 | 4.21 | +24.9% | 11.6 min |
+| Step 8a: + LTO | tq_kv_1b+tq_v_4b | 12.38 | **4.25** | **+26.1%** | 11.5 min |
+| Step 8b: + PGO | tq_kv_1b+tq_v_4b | 12.40 | 4.19 | +24.3% | 11.5 min |
+| Target | | | 5.00 | +48.4% | |
+
+**Best stable result: 4.25 t/s** with `-ctk tq_kv_1b -ctv tq_v_4b`
+on the LTO build. **85% of the 5 t/s target.** Gap remaining: 0.75 t/s
+= 17.8%, equivalent to 35 ms/tok.
+
+The biggest unattempted lever is Step 4.75 (TurboQuant fused KV block,
+single-stream K+V memory access via a unified 84-byte block). The
+plan estimated +5–15% from this step. If realised at the top of the
+range, we'd reach 4.89 t/s — still 2.2% short of target. Likely
+need Step 4.75 plus a refined Step 5 (valid-range-aware chunking) to
+fully cross 5.0.
