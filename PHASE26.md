@@ -245,20 +245,23 @@ setup + GPU draft, higher is possible.
 
 ### Revised Phase 26 ordering (2026-04-09)
 
-1. **Re-bench 64K with `-ctk q4_0 -ctv tq_v_4b`** — the production
-   config. Measure both default and `LLAMA_NUMA_MIRROR_KV=1`.
-2. **Spec decode runtime crash** — investigate the ggml context OOM
-   in copy_cell during spec-decode inference. This blocks spec
-   decode from being usable.
-3. **Spec decode end-to-end validation** — once the crash is fixed,
-   re-run the test and measure acceptance rate + net t/s. Spec
-   decode is the primary lever for hitting 5 t/s at 64K (2.60 base
-   × 2x acceptance ≈ 5.2 t/s).
-4. **Turbo3 K compression (deferred)** — WHT + Lloyd-Max 3-bit K
-   for ~25% less KV bandwidth. Revisit only if KV bandwidth is
-   still the bottleneck after spec decode.
-5. Everything else (FUSED_GATE_PREP, expert cache, split-KV, etc.)
-   is lower priority.
+1. ~~Spec decode runtime crash~~ — **DONE** (`18489228d`). OOB in
+   `find_slot` checkpoint when all cells used. Bounds check fix.
+2. ~~Spec decode end-to-end~~ — **DONE**. 59–83% acceptance rate
+   with GPU draft (0.8B on WX 2100). 6.52–6.65 t/s at 8K fill,
+   11.5 t/s at short context. Use `-dev none -ngld 99 -devd Vulkan0`.
+3. ~~FUSED_GATE_PREP~~ — **DONE** (`cc7612e92`). GGML_OP_FUSED
+   framework + first fusion. Saves 80 dispatches/token.
+4. ~~SILU_MUL~~ — **DONE** (`82ecb2c7a`). Second fusion, saves
+   another 40 dispatches/token. Total: 120 saved out of ~3729.
+5. **Re-bench 64K with `-ctk q4_0 -ctv tq_v_4b`** — the production
+   config with spec decode + NUMA mirror. This is the next overnight
+   item.
+6. **Turbo3 K compression (deferred)** — revisit only if KV
+   bandwidth is still the bottleneck after spec decode.
+7. **Vulkan pipelines for fusions** — GATE_PREP shader exists in
+   llama-jit; SILU_MUL is trivial. Deferred until Vulkan is the
+   production path again.
 
 ## Overnight chain (2026-04-09)
 
