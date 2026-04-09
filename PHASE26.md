@@ -114,12 +114,49 @@ Variance source appears to be hardware/OS state, not software:
 For comparisons in this doc going forward, treat the baseline as
 ~4.20 t/s and any number above 4.5 t/s as suspicious until reproduced.
 
+## Production benchmark at 64K fill (2026-04-09)
+
+**First measurement of decode rate at the production target context.**
+The 8K openclaw fill numbers we've been chasing (~4.20 t/s) are not
+representative of the actual production workload, where the KV cache
+is filled to ~55-64K tokens.
+
+| Config | Fill | PP (t/s) | Decode (t/s) | PP wall | Notes |
+|---|---:|---:|---:|---:|---|
+| `--numa mirror -t 12` default | 8K | 19.74 | ~4.20 | ~7 min | Our baseline reference |
+| `--numa mirror -t 12` default | **55K** | **9.79** | **2.60** | **~94 min** | **Production target** |
+
+The 55K decode rate is **38% slower** than the 8K decode rate, and
+**~48% of the 5 t/s nominal Phase 25 target** at the actual
+production context. The plan predicted 3.5–4.0 t/s at 64K; reality
+is 2.60 t/s, lower than the prediction by another ~30%.
+
+PP at 55K is about half the 8K rate (9.79 vs 19.74), reflecting the
+~linear growth of attention cost with kv_len. PP wall time is ~94
+minutes for 55K tokens, which is the dominant cost of the test.
+
+The opt-in `LLAMA_NUMA_MIRROR_KV=1` 64K bench is running next in the
+chain — that result will tell us whether KV mirror starts paying off
+at the production target where KV reads dominate. The 8K result said
+no (-12 to -14% regression); 55K may flip the sign or worsen it.
+
+Implications for Phase 26 ordering:
+- The gap to 5 t/s at 64K is ~2x, not ~20% as it was at 8K
+- Spec decode (item #4 / "next coding move") becomes much more
+  attractive: at 2.60 t/s base × 2x acceptance ≈ 5.2 t/s, which
+  meets the nominal target
+- MoE expert caching (item #5) is also more attractive at 64K
+  because the per-token cost is dominated by attention scan + the
+  same expert reads as at 8K
+- KV mirror's expected payoff window (large fill where KV scan
+  dominates) is exactly here — the opt-in bench tells us if it
+  delivers
+
 ## Overnight chain (2026-04-09)
 
-The default 64K production bench (#1) is running on commit `7e657cc3b`
-(KV mirror landed but routed only via opt-in env var). A detached
-chain script (`tests/run_64k_chain.sh`) waits for the bench to finish
-and then runs:
+The default 64K production bench (#1) **completed at 07:07** with
+the numbers above. A detached chain script (`tests/run_64k_chain.sh`)
+waits for the bench to finish and then runs:
 
 1. **Opt-in 64K bench** (`LLAMA_NUMA_MIRROR_KV=1`) — measures whether
    KV mirror starts paying off at the 64K production target where
