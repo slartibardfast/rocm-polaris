@@ -200,26 +200,48 @@ Keep TQ_KV_1B in-tree as an extreme-compression tier (documented
 only if the 64K production bench shows KV bandwidth is still the
 bottleneck after spec decode lands.
 
-### Spec decode compat-check (Phase 26 #4a, 2026-04-09)
+### Spec decode — WORKING (Phase 26 #4a+#4b, 2026-04-09)
 
-The two-decode patch (`583e6bedf`) **fixes the compat-check**: the
-server starts without the "does not support partial sequence removal"
-rejection, confirming that the checkpoint/restore mechanism fires at
-the batch boundary between the two single-token decodes.
+Two bugs fixed, spec decode now fully functional:
 
-However, the server **aborts with a ggml tensor allocation failure**
-during the first spec-decode inference request:
-```
-ggml_abort @ ggml_new_tensor_impl.constprop
-  → ggml_view_1d
-  → llama_memory_recurrent::copy_cell
-  → llama_memory_recurrent::find_slot
-  → llama_context::decode
-```
-The crash is in the checkpoint copy_cell path during decode of a
-spec-decode-drafted batch. The ggml context runs out of memory for
-the view tensor used in cell copying. This is a separate bug from
-the compat-check issue and needs its own investigation.
+1. **Compat-check fix** (`583e6bedf`): split 2-token batch into two
+   single-token `llama_decode` calls so PR #20075's checkpoint fires
+   at the batch boundary. Addresses upstream
+   [ggml-org/llama.cpp#20039](https://github.com/ggml-org/llama.cpp/issues/20039).
+
+2. **Runtime OOB fix** (`18489228d`): `find_slot` checkpoint code
+   accessed `cells[next_empty_cell]` without bounds-checking
+   `next_empty_cell < size`. When all cells were occupied (e.g.
+   `--parallel 4`, `size=4`), `next_empty_cell == size` caused
+   `copy_cell` to create a ggml view past the tensor allocation →
+   abort.
+
+**GPU-accelerated draft model:**
+
+The Qwen3.5-0.8B draft (532 MB Q4_K_M) fits entirely on the WX 2100
+(2 GB GDDR5). Target runs on CPU (`-ngl 0 -dev none`), draft runs
+on GPU (`-ngld 99 -devd Vulkan0`).
+
+Use `-dev none` for the target to prevent the scheduler from
+allocating a ~900 MB Vulkan compute buffer for the target model
+(which wastes VRAM without any performance benefit when -ngl 0).
+
+| Config | Context | Decode | Acceptance |
+|---|---|---:|---:|
+| CPU only, no draft | 8K fill | ~4.2 t/s | — |
+| CPU draft (both on CPU) | short | 4.76 t/s | 63% |
+| **GPU draft (0.8B on WX 2100)** | **8K fill** | **6.52–6.65 t/s** | **44–79%** |
+| GPU draft, short context | short | **11.5 t/s** | **81–83%** |
+
+Draft parameter tuning (--draft-max 4/8/16) showed no significant
+difference at short context — default 16 is fine. The bottleneck
+at long context is the CPU target verification time, not the draft
+generation speed.
+
+**Outstanding:** 64K production bench with spec decode (overnight).
+At 2.60 t/s baseline, spec decode with ~50% acceptance could push
+to ~3.5–4.0 t/s at 64K. With the full 12-thread `--numa mirror`
+setup + GPU draft, higher is possible.
 
 ### Revised Phase 26 ordering (2026-04-09)
 
