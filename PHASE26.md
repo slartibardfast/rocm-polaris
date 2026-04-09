@@ -135,22 +135,77 @@ PP at 55K is about half the 8K rate (9.79 vs 19.74), reflecting the
 ~linear growth of attention cost with kv_len. PP wall time is ~94
 minutes for 55K tokens, which is the dominant cost of the test.
 
-The opt-in `LLAMA_NUMA_MIRROR_KV=1` 64K bench is running next in the
-chain — that result will tell us whether KV mirror starts paying off
-at the production target where KV reads dominate. The 8K result said
-no (-12 to -14% regression); 55K may flip the sign or worsen it.
+### KV mirror at 64K (opt-in result, 2026-04-09)
 
-Implications for Phase 26 ordering:
-- The gap to 5 t/s at 64K is ~2x, not ~20% as it was at 8K
-- Spec decode (item #4 / "next coding move") becomes much more
-  attractive: at 2.60 t/s base × 2x acceptance ≈ 5.2 t/s, which
-  meets the nominal target
-- MoE expert caching (item #5) is also more attractive at 64K
-  because the per-token cost is dominated by attention scan + the
-  same expert reads as at 8K
-- KV mirror's expected payoff window (large fill where KV scan
-  dominates) is exactly here — the opt-in bench tells us if it
-  delivers
+| Config | Fill | PP (t/s) | Decode (t/s) | Δ vs default |
+|---|---:|---:|---:|---:|
+| Default (KV on regular CPU) | 55K | 9.79 | 2.60 | (baseline) |
+| `LLAMA_NUMA_MIRROR_KV=1` | 55K | **10.30** | **2.68** | **+3.1% decode, +5.2% PP** |
+
+**The sign flipped.** At 55K fill, KV mirror adds +3% decode and +5%
+PP vs the -12 to -14% at 8K. L3 can't cache 225 MiB of KV at this
+fill, so the mirror's per-socket copy makes reads genuinely local.
+The per-op sync cost is amortised over the much larger KV scan.
+
+Decision: consider enabling KV mirror by default when fill
+exceeds a threshold (~16K?). Today it's opt-in only.
+
+### Quality validation (Phase 26 #2, 2026-04-09) — **CRITICAL FINDING**
+
+**TQ_KV_1B + TQ_V_4B KV cache is catastrophically lossy on this model.**
+
+| KV config | PPL (2 chunks wikitext-2, n_ctx=2048) | Δ vs F16 |
+|---|---:|---:|
+| `-ctk f16 -ctv f16` (baseline) | **5.88** | — |
+| `-ctk q4_0 -ctv q4_0` | **5.92** | **+0.7%** ✓ |
+| `-ctk tq_kv_1b -ctv tq_v_4b` | **14.78** | **+151%** ✗ |
+
+The 1-bit K + 4-bit V TurboQuant scheme destroys output quality:
+PPL nearly triples. The model generates fluent-looking text (the
+smoke tests never caught this because greedy generation hides PPL
+degradation), but the information content is badly corrupted.
+
+q4_0 KV is near-lossless (+0.7%), within the 1% acceptance criterion.
+**All production benchmarks and deployment must use q4_0 KV, not TQ.**
+
+This invalidates the perf headline numbers measured with TQ KV.
+The relevant production number is q4_0 decode at 64K fill, which
+we have not yet measured under `--numa mirror`. That measurement
+is the next priority.
+
+### Spec decode compat-check (Phase 26 #4a, 2026-04-09)
+
+The two-decode patch (`583e6bedf`) **fixes the compat-check**: the
+server starts without the "does not support partial sequence removal"
+rejection, confirming that the checkpoint/restore mechanism fires at
+the batch boundary between the two single-token decodes.
+
+However, the server **aborts with a ggml tensor allocation failure**
+during the first spec-decode inference request:
+```
+ggml_abort @ ggml_new_tensor_impl.constprop
+  → ggml_view_1d
+  → llama_memory_recurrent::copy_cell
+  → llama_memory_recurrent::find_slot
+  → llama_context::decode
+```
+The crash is in the checkpoint copy_cell path during decode of a
+spec-decode-drafted batch. The ggml context runs out of memory for
+the view tensor used in cell copying. This is a separate bug from
+the compat-check issue and needs its own investigation.
+
+### Revised Phase 26 ordering (2026-04-09)
+
+1. **Re-bench 64K with `-ctk q4_0 -ctv q4_0`** — this is now the
+   real production configuration. Measure both default and
+   `LLAMA_NUMA_MIRROR_KV=1`.
+2. **Spec decode runtime crash** — investigate the ggml context OOM
+   in copy_cell during spec-decode inference. This blocks spec
+   decode from being usable.
+3. **Spec decode end-to-end validation** — once the crash is fixed,
+   re-run the test and measure acceptance rate + net t/s.
+4. Everything else from the original priority list (FUSED_GATE_PREP,
+   expert cache, split-KV, etc.) is lower priority.
 
 ## Overnight chain (2026-04-09)
 
