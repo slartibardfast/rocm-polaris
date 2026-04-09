@@ -150,28 +150,55 @@ The per-op sync cost is amortised over the much larger KV scan.
 Decision: consider enabling KV mirror by default when fill
 exceeds a threshold (~16K?). Today it's opt-in only.
 
-### Quality validation (Phase 26 #2, 2026-04-09) — **CRITICAL FINDING**
+### Quality validation (Phase 26 #2, 2026-04-09)
 
-**TQ_KV_1B + TQ_V_4B KV cache is catastrophically lossy on this model.**
+Full PPL matrix (2 chunks wikitext-2, n_ctx=2048, Qwen3.5-35B-A3B Q4_K_M):
 
-| KV config | PPL (2 chunks wikitext-2, n_ctx=2048) | Δ vs F16 |
-|---|---:|---:|
-| `-ctk f16 -ctv f16` (baseline) | **5.88** | — |
-| `-ctk q4_0 -ctv q4_0` | **5.92** | **+0.7%** ✓ |
-| `-ctk tq_kv_1b -ctv tq_v_4b` | **14.78** | **+151%** ✗ |
+| K config | V config | PPL | Δ vs F16 | Verdict |
+|---|---|---:|---:|---|
+| f16 | f16 | **5.88** | — | baseline |
+| f16 | tq_v_4b | 5.90 | +0.4% | V quant near-lossless ✓ |
+| q4_0 | q4_0 | 5.92 | +0.7% | ✓ |
+| **q4_0** | **tq_v_4b** | **5.95** | **+1.2%** | **production candidate** ✓ |
+| tq_kv_1b | f16 | 7.66 | +30.3% | 1-bit K is the problem ✗ |
+| tq_kv_1b | tq_v_4b | 7.75 | +31.8% | extreme compression only ✗ |
 
-The 1-bit K + 4-bit V TurboQuant scheme destroys output quality:
-PPL nearly triples. The model generates fluent-looking text (the
-smoke tests never caught this because greedy generation hides PPL
-degradation), but the information content is badly corrupted.
+**Root cause of the 1-bit K regression:** a K stride bug in
+`tq_kv_1b_attention_multi` and `tq_kv_fused_attention` caused reads
+to alternate between KV heads instead of advancing positions (fixed
+in commit `16848780b`). After the fix, PPL dropped from 14.78 to
+7.75 — the remaining +31.8% is the **inherent** quality loss of
+1-bit sign-hash attention (theoretical cosine similarity 2/π ≈ 0.637).
 
-q4_0 KV is near-lossless (+0.7%), within the 1% acceptance criterion.
-**All production benchmarks and deployment must use q4_0 KV, not TQ.**
+Four diagnostic tests confirm the fix and isolate each suspect:
+- `test-tq-k-stride`: stride correctness (PASS after fix)
+- `test-tq-rht-roundtrip`: RHT seed consistency (PASS, not a bug)
+- `test-tq-multiblock-accum`: multi-block math (PASS, not a bug)
+- `test-tq-integrated-gqa`: end-to-end GQA layout (PASS after fix)
 
-This invalidates the perf headline numbers measured with TQ KV.
-The relevant production number is q4_0 decode at 64K fill, which
-we have not yet measured under `--numa mirror`. That measurement
-is the next priority.
+**Literature survey (2024-2026)** confirms no existing method achieves
+near-lossless PPL at true 1-bit K across diverse models:
+
+| Method | Source | Bits | PPL impact |
+|---|---|---:|---|
+| QJL (AAAI'25) | [arXiv:2406.03482](https://arxiv.org/abs/2406.03482) | 1-3 | "5x at 3-bit"; community found QJL hurts at 4-bit |
+| PolarQuant (NeurIPS'25) | [arXiv:2502.02617](https://arxiv.org/abs/2502.02617) | 2-4 | 4.2x compression, GPU only |
+| KVLinC | [arXiv:2510.05373](https://arxiv.org/abs/2510.05373) | 2 | +15% at 2-bit, requires trained adapters |
+| TurboQuant ([llama.cpp #20969](https://github.com/ggml-org/llama.cpp/discussions/20969)) | community | 3-4 | **+0.15% at 4-bit** (WHT + Lloyd-Max) |
+| Our TQ_KV_1B | this project | 1 | +31.8% (RHT + sign extraction) |
+
+The practical minimum for near-lossless K compression is **3-4 bit**.
+The quant.cpp claim of "+0.03% PPL at 1-bit K" is not reproducible
+by the community on diverse models. TurboQuant's WHT+Lloyd-Max at
+3-4 bit is the proven CPU-friendly path but offers marginal gain
+over q4_0 (+0.15% vs +0.7%) at the same bit width.
+
+**Decision:** Ship `q4_0 K + tq_v_4b V` as the production config.
+TQ_V_4B is our best V quantizer (+0.4% PPL, better than q4_0 V).
+Keep TQ_KV_1B in-tree as an extreme-compression tier (documented
++31.8% PPL impact). Revisit turbo3 (3-bit K with WHT preprocessing)
+only if the 64K production bench shows KV bandwidth is still the
+bottleneck after spec decode lands.
 
 ### Spec decode compat-check (Phase 26 #4a, 2026-04-09)
 
@@ -196,16 +223,20 @@ the compat-check issue and needs its own investigation.
 
 ### Revised Phase 26 ordering (2026-04-09)
 
-1. **Re-bench 64K with `-ctk q4_0 -ctv q4_0`** — this is now the
-   real production configuration. Measure both default and
-   `LLAMA_NUMA_MIRROR_KV=1`.
+1. **Re-bench 64K with `-ctk q4_0 -ctv tq_v_4b`** — the production
+   config. Measure both default and `LLAMA_NUMA_MIRROR_KV=1`.
 2. **Spec decode runtime crash** — investigate the ggml context OOM
    in copy_cell during spec-decode inference. This blocks spec
    decode from being usable.
 3. **Spec decode end-to-end validation** — once the crash is fixed,
-   re-run the test and measure acceptance rate + net t/s.
-4. Everything else from the original priority list (FUSED_GATE_PREP,
-   expert cache, split-KV, etc.) is lower priority.
+   re-run the test and measure acceptance rate + net t/s. Spec
+   decode is the primary lever for hitting 5 t/s at 64K (2.60 base
+   × 2x acceptance ≈ 5.2 t/s).
+4. **Turbo3 K compression (deferred)** — WHT + Lloyd-Max 3-bit K
+   for ~25% less KV bandwidth. Revisit only if KV bandwidth is
+   still the bottleneck after spec decode.
+5. Everything else (FUSED_GATE_PREP, expert cache, split-KV, etc.)
+   is lower priority.
 
 ## Overnight chain (2026-04-09)
 
