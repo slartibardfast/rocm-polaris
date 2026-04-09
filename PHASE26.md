@@ -15,17 +15,24 @@
   ~10-15 t/s. The earlier "25 t/s" and "88 t/s" numbers in this doc
   were both wrong; see the bench results section for honest math.
 
-## Current standing (2026-04-08)
+## Current standing (2026-04-09)
 
-- **Best decode rate:** **5.17 t/s** at 8K openclaw fill, with
-  `--numa mirror -t 12 -ctk tq_kv_1b -ctv tq_v_4b`,
-  `OMP_WAIT_POLICY=ACTIVE` (now the bench script default)
-- **Cumulative gain over Phase 25 system baseline (3.37 t/s):** **+53.4%**
-- **Cumulative gain over Phase 25 final (4.32 t/s):** **+19.7%**
-- **Headroom to realistic compute ceiling (~10-15 t/s):** ~2-3×
-- **Active branch tip:** `phase25-decode-perf` at `aa78a1381`
-  (NUMA mirror v1: scaffolding + dual-mbind + read-side hoists +
-  post-load replication, weights mirrored only)
+- **Best decode rate (reproducible):** **~4.20 t/s** at 8K openclaw
+  fill, with `--numa mirror -t 12 -ctk tq_kv_1b -ctv tq_v_4b`,
+  `OMP_WAIT_POLICY=ACTIVE` (the bench script default)
+- **Cumulative gain over Phase 25 system baseline (3.37 t/s):** **+24.6%**
+- **Headroom to realistic compute ceiling (~10-15 t/s):** ~2.5-3.5×
+- **Active branch tip:** `phase25-decode-perf` at `7e657cc3b`
+  (NUMA mirror v1 + KV mirror framework, KV routing opt-in via env var)
+
+> The earlier "5.17 t/s" headline was a single outlier run; subsequent
+> remeasurement on the same baseline binary (aa78a1381) showed 4.31 and
+> 4.23 t/s. Reproducible mirror decode is ~4.2 t/s on this hardware, not
+> 5.17. The 5.0 t/s nominal Phase 25 target is still met by the bench
+> matrix's 5.01 t/s C measurement (a separate one-off in earlier
+> system state) but isn't reliably reproducible. Variance appears to
+> come from CPU power/thermal soft cap (X5650 base 2.66 GHz; observed
+> 2.40 GHz under 12-thread mirror load) rather than software state.
 
 What's landed:
 
@@ -34,6 +41,8 @@ What's landed:
 | `73bf75c03` | `ggml-cpu: scaffolding for GGML_NUMA_STRATEGY_MIRROR` |
 | `1675818ef` | `ggml-cpu: dual-mbind allocator and --numa mirror CLI` |
 | `aa78a1381` | `ggml-cpu: read-side hoists for the NUMA mirror buffer type` |
+| `17f421a6f` | `ggml-cpu: KV cache mirror — buft selection helper + after-op sync stub` |
+| `7e657cc3b` | `ggml-cpu: KV mirror — per-op narrow dispatch + barrier-free parallel slice` |
 | `cfd594d` (top-level) | `tests: openclaw bench — set OMP_WAIT_POLICY=ACTIVE by default` |
 
 Status of the originally-planned Phase 26 #1 work:
@@ -41,9 +50,69 @@ Status of the originally-planned Phase 26 #1 work:
 - ✅ Read-side hoists for matmul/mul_mat_id/flash_attn/get_rows
 - ✅ Post-load replication (weights buffer finalize_load helper)
 - ✅ Bench matrix run + profile pass + ceiling math correction
-- ⏸️ KV cache mirroring (bumped to next, see below)
-- ⏸️ After-op sync hook (lands with KV mirroring)
-- ⏸️ Activation buffer placement (TBD if needed after KV)
+- ✅ After-op sync hook with per-op narrow dispatch (parallel-slice,
+  no barrier in the hot path)
+- ✅ KV cache mirroring framework — landed but **opt-in only via
+  `LLAMA_NUMA_MIRROR_KV=1`** env var. Default is OFF because
+  measurement showed a -12% to -14% decode regression at 8K fill on
+  this workload (see "KV mirror — outcome" below)
+- ⏸️ Activation buffer placement (deferred — same risk profile as
+  KV; revisit after spec decode)
+
+### KV mirror — outcome
+
+The plan in `git show 39c7d7e` predicted +1-3% decode gain from KV
+mirroring with per-op narrow dispatch. The actual measurement on the
+hot bench fixture (8K openclaw fill, `--numa mirror -t 12`) is:
+
+| Config | Decode (t/s) | PP (t/s) | Δ vs default |
+|---|---:|---:|---:|
+| Default (KV on regular CPU buft) | 4.10–4.21 | 19.49–19.54 | (baseline) |
+| `LLAMA_NUMA_MIRROR_KV=1` (KV on mirror buft) | 3.59–3.75 | 19.43–19.45 | **−12% to −14%** |
+
+The regression is consistent across two independent sync strategies
+(master-thread + barrier; per-thread parallel slice with no barrier),
+which rules out barrier overhead as the dominant cost. The remaining
+suspects are cache-line bouncing on the alt-copy write path and the
+inherent cost of cross-socket DRAM writes for the per-op sync, both
+of which scale with the ~120 mirror-write ops per token (40 layers ×
+2 K/V SET_ROWS + ~40 SSM/recurrent CPYs). Cross-socket savings on KV
+*reads* — which the read-side hoists deliver — apparently don't
+recoup the per-op write cost at moderate fill, where KV reads are
+L3-friendly anyway.
+
+The KV mirror code path stays landed because:
+1. It's a tested mirror-write framework that any future mirrored
+   buffer (e.g. activations) can re-use without re-deriving the
+   parallel-slice / barrier-safety logic.
+2. It may pay off at much larger fill (the 64K production target)
+   where KV scan dominates and L3 caching is less effective. Worth
+   re-measuring there before declaring it dead.
+3. The opt-in env var makes A/B testing trivial — no rebuild needed.
+
+The framework includes:
+- `ggml_backend_cpu_buffer_type_for_runtime()` public helper
+  (currently called only by KV cache and recurrent state allocators;
+  future buffers can use the same call site)
+- After-op sync hook in `ggml_compute_forward` (`ggml-cpu.c:2179`),
+  gated on a 7-op call-site filter so non-write ops pay zero overhead
+- Per-op narrow dispatch in `ggml_backend_cpu_numa_mirror_after_op_sync`:
+  parallel-slice for SET_ROWS / CPY / DUP / SCALE / SSM_*, master-sync
+  with explicit barrier as the safety-net default
+
+### Reproducibility note (2026-04-09)
+
+A second pass with the original baseline binary (`aa78a1381`) gave
+4.31 and 4.23 t/s rather than the originally-recorded 5.17 t/s.
+Variance source appears to be hardware/OS state, not software:
+- CPU governor: `performance` (verified, `cpu0/scaling_cur_freq = 2.40 GHz`)
+- X5650 base clock is 2.66 GHz, no turbo; observed 2.40 GHz under
+  12-thread mirror load suggests power capping or thermal budgeting
+- Cores at 47-53°C, well under 80°C trip — not classic thermal throttle
+- Difference is consistent across multiple runs (not single-run noise)
+
+For comparisons in this doc going forward, treat the baseline as
+~4.20 t/s and any number above 4.5 t/s as suspicious until reproduced.
 
 ## Active branch
 
