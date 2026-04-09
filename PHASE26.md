@@ -114,6 +114,93 @@ Variance source appears to be hardware/OS state, not software:
 For comparisons in this doc going forward, treat the baseline as
 ~4.20 t/s and any number above 4.5 t/s as suspicious until reproduced.
 
+## Overnight chain (2026-04-09)
+
+The default 64K production bench (#1) is running on commit `7e657cc3b`
+(KV mirror landed but routed only via opt-in env var). A detached
+chain script (`tests/run_64k_chain.sh`) waits for the bench to finish
+and then runs:
+
+1. **Opt-in 64K bench** (`LLAMA_NUMA_MIRROR_KV=1`) — measures whether
+   KV mirror starts paying off at the 64K production target where
+   KV reads dominate and L3 caching is less effective. The 8K bench
+   showed -12 to -14% from KV mirror; the question is whether the
+   sign flips at 64K.
+2. **Spec decode end-to-end test** (`tests/spec_decode_test.sh`) —
+   validates the `common_speculative_is_compat` 2-decode patch
+   (commit `583e6bedf`) by launching `llama-server -md` against
+   Qwen3.5-0.8B-Q4_K_M draft + 35B-A3B target. Acceptance: no
+   "partial sequence removal" rejection in the log.
+3. **TQ perplexity smoke** — 4 chunks of wikitext-2, KV config
+   `-ctk tq_kv_1b -ctv tq_v_4b`.
+
+A second detached script (`tests/run_perplexity_baseline.sh`) waits
+for step 3 to finish and then runs the same fixture with
+`-ctk f16 -ctv f16` for the F16 baseline. Both PPL numbers compared
+post-hoc — acceptance is TQ within 1% of F16 baseline.
+
+Each step writes its own .out / .err / .done in tests/ for partial
+visibility.
+
+### Step 5 split-KV revival sketch (deferred — not in chain)
+
+Item #3 in the priority list (refined Step 5: valid-range-aware
+split-KV) is a deliberate non-goal for this overnight chain because
+it requires post-bench validation against a fresh re-bench, which
+would burn another hour. Documenting the sketch here so the next
+session can pick it up.
+
+The original Step 5 attempt (reverted as `83ecba512`) chunked the
+ALLOCATED `nek1` range (65536 slots) across `nth` threads. At
+partial fill (8K valid out of 65K allocated), thread 0 handled the
+entire valid range while threads 1..nth-1 spun on fully-masked
+chunks. The fix is to walk the mask once before chunking to find
+`valid_end`, then chunk over `[0, valid_end)`.
+
+```cpp
+// In ggml_compute_forward_flash_attn_ext_f16, before the chunking:
+int64_t valid_end = nek1;
+const ggml_tensor * mask_t = dst->src[3];
+if (mask_t) {
+    // Decode (neq1 == 1, neq3 == 1) so the mask row is at iq1=0,
+    // iq2=0, iq3=0. Mask is shared across query heads.
+    const ggml_fp16_t * mp = (const ggml_fp16_t *)((char *) mask_t->data);
+    for (int64_t ic = 0; ic < nek1; ++ic) {
+        if (GGML_CPU_FP16_TO_FP32(mp[ic]) == -INFINITY) {
+            valid_end = ic;
+            break;
+        }
+    }
+}
+const int64_t chunk_size = (valid_end + nth - 1) / nth;
+```
+
+The walk is O(nek1) on thread 0... wait, the walk runs on EVERY
+thread that enters the function, which is wasteful. Better:
+
+- Have only thread 0 walk and write `valid_end` to a shared location
+  (params->wdata at a known offset, or a stack-allocated atomic).
+- Barrier so all threads see the result.
+- Then chunk over the shared `valid_end`.
+
+The walk itself is ~13 µs (65 KB / 5 GB/s), so it's not free but
+it's much cheaper than the load imbalance it cures.
+
+After the chunking fix, also re-relax the gate to admit `TQ_KV_1B`
+(the original Step 5 change at commit `241b9621f`) and drop the
+`k->type == v->type` constraint. The TQ K side already honours
+ic_start..ic_end correctly inside `_one_chunk`.
+
+Land + bench checklist for the next session:
+1. Cherry-pick `241b9621f` (the gate relaxation + partials_offset
+   fix), reverting `83ecba512` (the revert).
+2. Add the valid_end walk + barrier + shared variable.
+3. Build, smoke test, equivalence test against the non-split path.
+4. Re-bench with `--numa mirror -t 12` at both 8K and 64K fill.
+   Expected gain: small at 8K (where the load imbalance was the
+   bug we fixed), moderate at 64K (where larger nek1 amplifies
+   the benefit of parallelizing K scan).
+
 ## Active branch
 
 - **`phase25-decode-perf`** (in `llama.cpp/src/llama.cpp-b8508`): the
