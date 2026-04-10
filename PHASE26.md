@@ -15,49 +15,57 @@
   ~10-15 t/s. The earlier "25 t/s" and "88 t/s" numbers in this doc
   were both wrong; see the bench results section for honest math.
 
-## Current standing (2026-04-09)
+## Current standing (2026-04-10)
 
-- **Best decode rate (reproducible):** **~4.20 t/s** at 8K openclaw
-  fill, with `--numa mirror -t 12 -ctk tq_kv_1b -ctv tq_v_4b`,
-  `OMP_WAIT_POLICY=ACTIVE` (the bench script default)
-- **Cumulative gain over Phase 25 system baseline (3.37 t/s):** **+24.6%**
-- **Headroom to realistic compute ceiling (~10-15 t/s):** ~2.5-3.5×
-- **Active branch tip:** `phase25-decode-perf` at `7e657cc3b`
-  (NUMA mirror v1 + KV mirror framework, KV routing opt-in via env var)
+- **Production config:** `q4_0 K + tq_v_4b V` (+1.2% PPL vs F16)
+- **Best decode (8K fill):** **1.86 t/s** with NUMA mirror 8t + GPU
+  draft spec decode (95% acceptance at temp=0.7; 90% at temp=0)
+- **Best decode (8K fill, no draft):** **4.07 t/s** with single socket
+  6t, `q4_0 K + tq_v_4b V`
+- **64K fill decode (no draft):** **1.64 t/s** NUMA mirror 12t
+- **Active branch:** `polaris-hybrid-cpu-opt` on `slartibardfast/llama.cpp`,
+  merged with upstream master (230 commits since b8508)
 
-> The earlier "5.17 t/s" headline was a single outlier run; subsequent
-> remeasurement on the same baseline binary (aa78a1381) showed 4.31 and
-> 4.23 t/s. Reproducible mirror decode is ~4.2 t/s on this hardware, not
-> 5.17. The 5.0 t/s nominal Phase 25 target is still met by the bench
-> matrix's 5.01 t/s C measurement (a separate one-off in earlier
-> system state) but isn't reliably reproducible. Variance appears to
-> come from CPU power/thermal soft cap (X5650 base 2.66 GHz; observed
-> 2.40 GHz under 12-thread mirror load) rather than software state.
+**Models:**
+- **Target:** Qwen3.5-35B-A3B Q4_K_M (21 GB, hybrid DeltaNet SSM +
+  MoE, IMROPE) — runs on CPU (dual Xeon X5650)
+- **Draft:** Qwen3.5-0.8B Q4_K_M (532 MB, dense DeltaNet, IMROPE) —
+  runs on GPU (WX 2100, 2 GB GDDR5, Vulkan)
+- **Spec decode flags:** `-ngl 0 -dev none -ngld 99 -devd Vulkan0`
 
-What's landed:
+What's landed (Phase 26 commits on `polaris-hybrid-cpu-opt`):
 
 | Commit | What |
 |---|---|
-| `73bf75c03` | `ggml-cpu: scaffolding for GGML_NUMA_STRATEGY_MIRROR` |
-| `1675818ef` | `ggml-cpu: dual-mbind allocator and --numa mirror CLI` |
-| `aa78a1381` | `ggml-cpu: read-side hoists for the NUMA mirror buffer type` |
-| `17f421a6f` | `ggml-cpu: KV cache mirror — buft selection helper + after-op sync stub` |
-| `7e657cc3b` | `ggml-cpu: KV mirror — per-op narrow dispatch + barrier-free parallel slice` |
-| `cfd594d` (top-level) | `tests: openclaw bench — set OMP_WAIT_POLICY=ACTIVE by default` |
+| `4f5c6608f` | NUMA mirror buft selection helper + after-op sync stub |
+| `a776e8936` | NUMA mirror per-op narrow dispatch + barrier-free parallel slice |
+| `f2eed9dab` | NUMA mirror fix mirror_sync_rows_slice for 3D/4D dst |
+| `042e0806c` | Speculative compat-check: two single-token decode calls |
+| `61928eea8` | Fix TQ_KV_1B K stride bug for GQA multi-head layouts |
+| `f0338a499` | TQ diagnostic test suite (4 tests) |
+| `a74cb6596` | Fix OOB in find_slot checkpoint when all cells used |
+| `ff64be29d` | GGML_OP_FUSED framework + GATE_PREP CPU kernel |
+| `20fecf66f` | GGML_FUSION_SILU_MUL — fused SiLU gate multiply |
+| `6d518ef4c` | MoE expert reuse instrumentation (80% hit rate) |
+| `23e351621` | Prefetch active MoE expert weight tiles |
+| `76e8317de` | Split-KV for all vec_dot types + valid-range chunking |
+| `2233dc31e` | madvise(MADV_WILLNEED) for shared expert weight tile |
+| `1310abc72` | Merge upstream master (230 commits since b8508) |
+| `ce455eb4c` | Fix numa-mirror buffer iface for upstream 2d tensor API |
+| `c23cd0894` | GGML_FUSION_SIGMOID_MUL — fused sigmoid gate multiply |
+| `d9bba1d3e` | Fix seq_add/seq_div for IMROPE (enables spec decode on Qwen3.5) |
 
-Status of the originally-planned Phase 26 #1 work:
-- ✅ Mirror buffer type, dual-mbind allocator, CLI exposure
-- ✅ Read-side hoists for matmul/mul_mat_id/flash_attn/get_rows
-- ✅ Post-load replication (weights buffer finalize_load helper)
-- ✅ Bench matrix run + profile pass + ceiling math correction
-- ✅ After-op sync hook with per-op narrow dispatch (parallel-slice,
-  no barrier in the hot path)
-- ✅ KV cache mirroring framework — landed but **opt-in only via
-  `LLAMA_NUMA_MIRROR_KV=1`** env var. Default is OFF because
-  measurement showed a -12% to -14% decode regression at 8K fill on
-  this workload (see "KV mirror — outcome" below)
-- ⏸️ Activation buffer placement (deferred — same risk profile as
-  KV; revisit after spec decode)
+Phase 26 work summary:
+- ✅ NUMA mirror (weights + opt-in KV) with per-op sync framework
+- ✅ Quality validation: full PPL matrix, q4_0 K + tq_v_4b V = +1.2%
+- ✅ K stride bug fixed (TQ_KV_1B GQA layout) + 4 diagnostic tests
+- ✅ Spec decode: compat-check fix + OOB crash fix + IMROPE seq_add fix
+- ✅ GPU draft: 0.8B on WX 2100 via Vulkan, 90% acceptance at temp=0
+- ✅ Op fusion framework: GATE_PREP + SILU_MUL + SIGMOID_MUL (160
+  dispatches/token saved)
+- ✅ MoE expert optimization: 80% reuse rate, prefetch, shared expert pin
+- ✅ Split-KV for all vec_dot types + valid-range chunking
+- ✅ Upstream merge (230 commits) + buffer interface update
 
 ### KV mirror — outcome
 
@@ -238,25 +246,24 @@ difference at short context — default 16 is fine. The bottleneck
 at long context is the CPU target verification time, not the draft
 generation speed.
 
-**Outstanding:** 64K production bench with spec decode (overnight).
-At 2.60 t/s baseline, spec decode with ~50% acceptance could push
-to ~3.5–4.0 t/s at 64K. With the full 12-thread `--numa mirror`
-setup + GPU draft, higher is possible.
+### Bench matrix (2026-04-10)
 
-### Revised Phase 26 ordering (2026-04-09)
+| Config | Fill | PP (t/s) | Decode (t/s) | Accept | Notes |
+|---|---|---:|---:|---:|---|
+| A: mirror 12t, no draft | 64K | 4.33 | 1.64 | — | q4_0+tq_v_4b |
+| B: single 6t, no draft | 64K | 3.89 | 1.52 | — | q4_0+tq_v_4b |
+| C: single 6t, GPU draft | 8K | 9.1 | 1.51 | 90% | temp=0 |
+| **D: mirror 8t, GPU draft** | **8K** | **11.7** | **1.59** | **90%** | **temp=0, best config** |
 
-1. ~~Spec decode runtime crash~~ — **DONE** (`18489228d`). OOB in
-   `find_slot` checkpoint when all cells used. Bounds check fix.
-2. ~~Spec decode end-to-end~~ — **DONE**. 59–83% acceptance rate
-   with GPU draft (0.8B on WX 2100). 6.52–6.65 t/s at 8K fill,
-   11.5 t/s at short context. Use `-dev none -ngld 99 -devd Vulkan0`.
-3. ~~FUSED_GATE_PREP~~ — **DONE** (`cc7612e92`). GGML_OP_FUSED
-   framework + first fusion. Saves 80 dispatches/token.
-4. ~~SILU_MUL~~ — **DONE** (`82ecb2c7a`). Second fusion, saves
-   another 40 dispatches/token. Total: 120 saved out of ~3729.
-5. **Re-bench 64K with `-ctk q4_0 -ctv tq_v_4b`** — the production
-   config with spec decode + NUMA mirror. This is the next overnight
-   item.
+### Remaining work
+
+1. **64K bench with spec decode** — needs real wikitext fill (the
+   synthetic fill-64k.txt gave 100% acceptance = not representative).
+   Use `tests/wikitext_64k_fill.txt` (280 KB, real text).
+2. **Vulkan pipelines for fusions** — GATE_PREP shader exists in
+   llama-jit; SILU_MUL and SIGMOID_MUL are trivial.
+3. **RMS_NORM_ADD fusion** — saves ~80 more dispatches/token but
+   requires inline reduction (more complex).
 6. **Turbo3 K compression (deferred)** — revisit only if KV
    bandwidth is still the bottleneck after spec decode.
 7. **Vulkan pipelines for fusions** — GATE_PREP shader exists in
