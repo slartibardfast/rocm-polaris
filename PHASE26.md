@@ -1356,3 +1356,62 @@ KV mirror NUMA path. None of these need spec decode infrastructure.
 
 See `memory/finding_plan_a_phase5_fails_gate.md` for the full
 cost-accounting breakdown.
+
+## Tool-calling accuracy on 35B-q4km — mission gate CLEARED (2026-04-11)
+
+After killing Plan A, pivoted back to the original mission question:
+*is the 35B-A3B q4km model actually accurate at tool calling?* The
+`finding_mtp_moe_mission_status.md` memory note had flagged this as
+"built the infra, never validated the mission" — spec decode was
+only ever means to an end, and we'd been optimizing for throughput
+on a model we hadn't verified was fit for purpose.
+
+Built a 12-test battery (`tests/tool_call_battery.py`) covering:
+
+- **Positive cases**: weather, calculator (enum op), stock ticker
+  resolution, file_op with enum + optional arg, web_search with
+  optional int arg.
+- **Disambiguation**: 2 tools available, pick the right one (weather
+  vs stock); 5 tools available, pick the right one (file_op).
+- **Negative cases**: no-tool-needed ("what is 2+2?" — answer
+  directly, don't spuriously call calculator); no-tool-available
+  (weather question with only calc+stock tools — refuse
+  transparently, point to external sources).
+
+Server config: `llama-server --jinja --chat-template-file
+models/templates/Qwen3.5-4B.jinja -ngl 0 -t 12 -c 8192 -fa off`.
+Default 2-phase MTP path, q4km quant.
+
+**Result: 12/12 pass in 1038 s (~82 s per test).**
+
+Both negative cases produced correct *intent*, not just absence of
+a tool call. The no-tool-available case response:
+
+> "I don't have access to weather information through my available
+> tools. I can only help with arithmetic calculations or getting
+> stock prices. For weather information in Berlin, I'd recommend
+> checking a weather service like Weather.com, AccuWeather, or your
+> local weather app."
+
+The model enumerated its actual tools, refused the un-covered
+request, and pointed to external sources. This is the behavior we
+want — no hallucinated tools, no wrong-tool calls, transparent
+about constraints.
+
+**Implications**: the 35B-q4km is the production model. The mission
+gate is cleared. Every remaining lever is throughput, not
+quantization quality:
+
+1. Op-launch overhead (Phase 21 profile).
+2. GDN chunked kernel tuning on 35B (never done — small model got
+   +24% from occupancy fixes).
+3. MoE expert routing batching toward the pp16 sweet spot.
+4. KV mirror NUMA path (this document, earlier sections).
+5. Minor: output logits requant, fusion tweaks.
+
+Current working baseline: **1.83 t/s with 2-phase MTP at `-ngl 0`,
+tool calls averaging ~82 s each**. Usable for local agent-style
+flows, unusable for streaming. Throughput work from here.
+
+See `memory/finding_tool_call_accuracy_35b_q4km.md` for the full
+result table and response inspection for negative cases.
