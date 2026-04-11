@@ -1415,3 +1415,101 @@ flows, unusable for streaming. Throughput work from here.
 
 See `memory/finding_tool_call_accuracy_35b_q4km.md` for the full
 result table and response inspection for negative cases.
+
+## Throughput Phase 1 — f16 register load + FA off default (2026-04-11)
+
+Baseline above was measured without the NUMA mirror and with the
+default f16 load path. Two changes closed the gap between measured
+and theoretical throughput for this hardware:
+
+### Change 1: register-resident f16 load
+
+perf profile showed `ggml_vec_dot_f16` at 44.93% self time. Root
+cause was `__sse_f16x4_load` in `ggml/src/ggml-cpu/simd-mappings.h`:
+on Westmere (no F16C) it did four scalar `GGML_CPU_FP16_TO_FP32`
+lookups into the 256 KB `ggml_table_f32_f16` table, stored them to
+a stack buffer, then reloaded via `_mm_loadu_ps`. That's four
+serial L2 hits plus a store-load round trip per 4-element load,
+and `ggml_vec_dot_f16` is the hot kernel for both GDN state
+matmul (29 layers) and attention Q@K^T / softmax@V (11 layers).
+
+Fix: route `__sse_f16x4_load` through the already-present
+`ggml_x86_cvtph_ps` helper in `arch/x86/downlevel.h` (Giesen's
+half-to-float SSE2 algorithm, ~19 SSE2 ops, fully register-
+resident, IEEE-correct on denormals/inf/nan/zero). The helper
+had been written months ago but was only wired into a bulk
+conversion loop in `ggml-cpu.c`, not into the hot macro path.
+
+See llama.cpp commit `5065c2267`.
+
+Post-fix perf: `ggml_vec_dot_f16` is 32.60% self time
+(−12.3 pp = −27% of its prior share).
+
+### Change 2: FA off is the correct default on this target
+
+Earlier measurements were run with `-fa off`, inherited from a
+stale assumption about historical FA issues. Ran a rigorous
+back-to-back 3-run comparison at `n_predict=128`, same short
+prompt, after the f16 fix:
+
+```
+FA off:  2.803, 2.723, 2.651  →  mean 2.72 t/s (±3%)
+FA on:   2.435, 2.426, 2.432  →  mean 2.43 t/s (±0.2%)
+```
+
+FA off is **+12% faster** at this operating point, with much
+higher variance in the FA off numbers indicating thermal/system
+noise while FA on is a rock-solid systematic regression.
+
+Tool-call battery agrees:
+- FA off + f16 fix: 12/12 pass in  990.9 s
+- FA on  + f16 fix: 12/12 pass in 1011.0 s (−2 %)
+
+### Why FA off wins on this hardware
+
+Qwen3.5 is FA-friendly by design (GQA 16:2, head_dim 256,
+softcap-capable) and FA wins handily on GPU. On Westmere CPU
+the fused FA kernel in `ggml_compute_forward_flash_attn_ext_f16`
+is not tuned for our target, and a handful of factors flip the
+balance:
+
+1. FA still calls `ggml_vec_dot_f16` per K position via
+   `kq_vec_dot` (see ops.cpp:8265-8266), so the f16 hot kernel
+   fires either way. The fusion doesn't eliminate it.
+2. Per-row setup cost (VKQ32 scratch, `q_to_vec_dot`,
+   `v_to_float` resolution, online softmax state) exceeds the
+   cost of the three barriers saved by fusing Q@K^T →
+   softmax → p@V into one op.
+3. Only 11 of 40 main layers are attention at all; the other
+   29 are DeltaNet recurrent. FA can only affect ~27 % of
+   total compute even in the best case.
+
+The architectural argument for FA (fewer barriers, reduced
+op-launch overhead) is real but outweighed by the per-row
+bookkeeping cost on this tiny attention footprint and this
+specific hardware.
+
+### Locked-in production baseline
+
+| Config | short t/s | battery | Δ from session start |
+|---|---:|---:|---:|
+| Session start (FA off, no f16 fix)          | 2.25 | 1038 s | 0 % |
+| **FA off + f16 fix + mirror + OMP ACTIVE** | **2.72** | **991 s** | **+21 %** |
+| FA on  + f16 fix + mirror + OMP ACTIVE      | 2.43 | 1011 s | +8 % |
+| TQ cache (FA on required, short ctx)        | 2.47 |   —  | +10 % |
+
+Production command:
+```
+OMP_WAIT_POLICY=ACTIVE llama-server \
+  -m Qwen3.5-35B-A3B-mtp-q4km.gguf \
+  --numa mirror -c 8192 -ngl 0 -fa off -np 1 -t 12 \
+  --jinja --chat-template-file models/templates/Qwen3.5-4B.jinja \
+  --host 127.0.0.1 --port 9099 --no-warmup
+```
+
+Tool-call battery passes 12/12 at this config. The f16 register
+load fix is committed in the llama.cpp fork
+(`polaris-hybrid-cpu-opt` branch, `5065c2267`). The `-fa off`
+default is a server-start flag, not a code change — it just
+needs to land in whatever bench / production scripts carry
+forward.
