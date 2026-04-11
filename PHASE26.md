@@ -1312,3 +1312,47 @@ accordingly.
 - Spec decode (separate Phase 26 work, much higher leverage)
 - Op fusion (separate Phase 26 work)
 - Anything in PHASE26.md priority list 4-9
+
+## Plan A 1-phase batched MTP spec decode — go/no-go measured (2026-04-11)
+
+Built the full 5-phase Plan A stack (DeltaNet snapshot/restore API,
+chained MTP rollout graph, shared draft helper, server 1-phase state
+machine). Phase 5 is the go/no-go gate: measure against 2-phase MTP
+on CPU-bound 35B. **Plan A fails the gate.**
+
+Measurement on Qwen3.5-35B-A3B-mtp-q4km, 128-token neural-net prompt,
+`-ngl 0 -t 12`, temp=0 seed=42:
+
+| Config | t/s | Δ vs no-MTP baseline |
+|---|---:|---:|
+| No-MTP baseline | 1.75 | 0% |
+| **2-phase MTP (default)** | **1.83** | **+4.6%** |
+| Plan A k=1 | 1.74 | -0.6% |
+| Plan A k=2 | 1.28 | -27% |
+| Plan A k=3 | 0.98 | -44% |
+
+Root cause: the partial-reject rerun is unconditional and expensive.
+Plan A main batch decodes `k+1` tokens, and on any partial reject at
+`j_mismatch < k` we restore recurrent state + re-decode `j_mismatch+1`
+tokens. Per-iter cost for `j=0 k=3`: 1.29s main + 0.53s rerun = 1.82s
+for 1 committed token = 0.55 t/s. Full accept (30% of iterations at
+k=3) is the only path that wins, and it isn't frequent enough.
+
+Per-draft acceptance also degrades with chained rollout depth —
+iter 0 matches 2-phase at ~76%, iter 1 drops to ~50%, iter 2 lower —
+because FastMTP's chained rollout feeds its own argmax forward and
+errors compound. 2-phase MTP reads only iter 0 and gets the full
+73% acceptance with no rerun cost.
+
+**Verdict**: kill Plan A development. 2-phase MTP remains the
+default. The Plan A Phase 1–4 code lives behind `LLAMA_MTP_PLAN_A=1`
+and is inert unless opted in — cheap to keep as dead code; future
+tree-drafts work could reuse the snapshot API and the chained
+rollout graph.
+
+**What replaces Plan A as the throughput lever**: op-launch
+overhead, GDN chunked kernel tuning, MoE expert routing batching,
+KV mirror NUMA path. None of these need spec decode infrastructure.
+
+See `memory/finding_plan_a_phase5_fails_gate.md` for the full
+cost-accounting breakdown.
