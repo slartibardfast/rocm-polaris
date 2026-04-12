@@ -74,7 +74,7 @@ for ck in "${K_CONFIGS[@]}"; do
             -m "$MODEL" \
             -p "$PROMPT" -n 20 -c 512 --simple-io -no-cnv --temp 0 \
             --cache-type-k "$ck" --cache-type-v "$cv" \
-            --no-warmup -ngl 0 -t $THREADS --seed $SEED 2>/dev/null || echo "CRASH")
+            --no-warmup -ngl 0 -t $THREADS --numa mirror --seed $SEED 2>/dev/null || echo "CRASH")
 
         if echo "$OUTPUT" | grep -q "seventeen.*eighteen.*nineteen.*twenty"; then
             echo "PASS (counts correctly)"
@@ -107,7 +107,7 @@ for ck in "${K_CONFIGS[@]}"; do
             -m "$MODEL" \
             -f "$WIKITEXT_SHORT" \
             --cache-type-k "$ck" --cache-type-v "$cv" \
-            -c 512 -ngl 0 -t $THREADS 2>&1 | grep "Final" | grep -oP 'PPL = \K[0-9.]+' || echo "CRASH")
+            -c 512 -ngl 0 -t $THREADS --numa mirror 2>&1 | grep "Final" | grep -oP 'PPL = \K[0-9.]+' || echo "CRASH")
 
         echo "PPL=$PPL"
         echo "K=$ck V=$cv PPL=$PPL" >> "$RESULTS"
@@ -132,7 +132,7 @@ for ck in "${K_CONFIGS[@]}"; do
             -m "$MODEL" \
             -p "$PROMPT_TPUT" -n 20 -c 512 --simple-io -no-cnv \
             --cache-type-k "$ck" --cache-type-v "$cv" \
-            --no-warmup -ngl 0 -t $THREADS --seed $SEED --temp 0 2>&1 | \
+            --no-warmup -ngl 0 -t $THREADS --numa mirror --seed $SEED --temp 0 2>&1 | \
             grep "eval time" | grep -oP '(\d+\.\d+) ms per token' | head -1 || echo "CRASH")
 
         echo "$SPEED"
@@ -204,7 +204,7 @@ for tag in A B C D; do
         -m "${FACEOFF_MODEL[$tag]}" \
         --cache-type-k "${FACEOFF_CK[$tag]}" --cache-type-v "${FACEOFF_CV[$tag]}" \
         --jinja -c "${FACEOFF_CTX[$tag]}" -ngl "${FACEOFF_NGL[$tag]}" \
-        -t $THREADS --port $PORT $DRAFT_ARGS 2>/dev/null &
+        -t $THREADS --numa mirror --port $PORT $DRAFT_ARGS 2>/dev/null &
     SRV=$!
 
     READY=0
@@ -277,7 +277,7 @@ for CTX in 512 1024 2048 4096 8192; do
             -m "$MODEL" \
             -p "$FILL" -n 32 -c "$CTX" --simple-io -no-cnv \
             --cache-type-k "$ck" --cache-type-v "$cv" \
-            --no-warmup -ngl 0 -t $THREADS --seed $SEED --temp 0 2>&1 | \
+            --no-warmup -ngl 0 -t $THREADS --numa mirror --seed $SEED --temp 0 2>&1 | \
             grep "eval time" | grep -oP '(\d+\.\d+) ms per token' | head -1 || echo "FAILED")
 
         echo "$RESULT"
@@ -303,7 +303,7 @@ for N_PREDICT in 32 64 128 256 512; do
             -p "Write a very long and detailed essay about the complete history of computing from the abacus to artificial intelligence." \
             -n "$N_PREDICT" -c 4096 --simple-io -no-cnv \
             --cache-type-k "$ck" --cache-type-v "$cv" \
-            --no-warmup -ngl 0 -t $THREADS --seed $SEED --temp 0 2>&1 | \
+            --no-warmup -ngl 0 -t $THREADS --numa mirror --seed $SEED --temp 0 2>&1 | \
             grep "eval time" | grep -oP '(\d+\.\d+) ms per token.*?(\d+\.\d+) tokens per second' | head -1 || echo "FAILED")
 
         echo "$RESULT"
