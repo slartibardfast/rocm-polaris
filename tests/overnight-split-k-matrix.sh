@@ -197,7 +197,7 @@ for tag in A B C D; do
     DRAFT_ARGS=""
     if [ "$tag" = "D" ]; then
         DRAFT_MODEL="/home/llm/models/Qwen3.5-0.8B-mtp-q6k.gguf"
-        DRAFT_ARGS="-md $DRAFT_MODEL --ngld 99"
+        DRAFT_ARGS="-md $DRAFT_MODEL -ngld 99"
     fi
 
     "$BIN/llama-server" \
