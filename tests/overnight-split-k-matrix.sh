@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 LLAMA_DIR="llama.cpp/src/llama.cpp-b8508"
 BIN="$LLAMA_DIR/build-tq/bin"
-MODEL="/home/llm/models/Qwen3.5-35B-A3B-Q4_K_M.gguf"
+MODEL="/home/llm/models/Qwen3.5-35B-A3B-mtp-q4km.gguf"
 WIKITEXT="tests/wikitext-2-test.txt"
 WIKITEXT_SHORT="/tmp/wikitext-overnight.txt"
 RESULTS="tests/overnight_split_k_results.txt"
@@ -151,7 +151,7 @@ echo ""
 echo "=== 4. THREE-WAY SERVER FACE-OFF ==="
 echo ""
 
-MODEL_MTP="/home/llm/models/Qwen3.5-35B-A3B-mtp-q4km.gguf"
+MODEL_DRAFT="/home/llm/models/Qwen3.5-0.8B-mtp-q6k.gguf"
 
 declare -A FACEOFF_LABEL
 declare -A FACEOFF_MODEL
@@ -160,50 +160,43 @@ declare -A FACEOFF_CV
 declare -A FACEOFF_NGL
 declare -A FACEOFF_CTX
 
-FACEOFF_LABEL[A]="Baseline (f16/f16, CPU)"
+FACEOFF_LABEL[A]="MTP Baseline (f16/f16, CPU)"
 FACEOFF_MODEL[A]="$MODEL"
 FACEOFF_CK[A]="f16"
 FACEOFF_CV[A]="f16"
 FACEOFF_NGL[A]=0
 FACEOFF_CTX[A]=2048
 
-FACEOFF_LABEL[B]="Split K + turbo V (CPU)"
+FACEOFF_LABEL[B]="MTP + Split K + turbo V (CPU)"
 FACEOFF_MODEL[B]="$MODEL"
 FACEOFF_CK[B]="q8_0:q4_0"
 FACEOFF_CV[B]="turbo_kv_4b"
 FACEOFF_NGL[B]=0
 FACEOFF_CTX[B]=2048
 
-FACEOFF_LABEL[C]="MTP + Split K + turbo V (CPU)"
-FACEOFF_MODEL[C]="$MODEL_MTP"
-FACEOFF_CK[C]="q8_0:q4_0"
-FACEOFF_CV[C]="turbo_kv_4b"
-FACEOFF_NGL[C]=0
+# C: 0.8B MTP standalone on GPU (lightweight fast endpoint)
+FACEOFF_LABEL[C]="0.8B MTP standalone (GPU)"
+FACEOFF_MODEL[C]="/home/llm/models/Qwen3.5-0.8B-mtp-q6k.gguf"
+FACEOFF_CK[C]="f16"
+FACEOFF_CV[C]="f16"
+FACEOFF_NGL[C]=99
 FACEOFF_CTX[C]=2048
 
-# D: 0.8B standalone on GPU (lightweight fast endpoint)
-FACEOFF_LABEL[D]="0.8B standalone (GPU)"
-FACEOFF_MODEL[D]="/home/llm/models/Qwen3.5-0.8B-Q4_K_M.gguf"
-FACEOFF_CK[D]="f16"
-FACEOFF_CV[D]="f16"
-FACEOFF_NGL[D]=99
+# D: 35B MTP CPU + 0.8B MTP GPU draft (cross-model spec decode)
+FACEOFF_LABEL[D]="35B MTP + 0.8B MTP draft (CPU+GPU)"
+FACEOFF_MODEL[D]="$MODEL"
+FACEOFF_CK[D]="q8_0:q4_0"
+FACEOFF_CV[D]="turbo_kv_4b"
+FACEOFF_NGL[D]=0
 FACEOFF_CTX[D]=2048
 
-# E: 35B CPU + 0.8B GPU draft (cross-model spec decode)
-FACEOFF_LABEL[E]="35B CPU + 0.8B GPU draft (spec decode)"
-FACEOFF_MODEL[E]="$MODEL"
-FACEOFF_CK[E]="q8_0:q4_0"
-FACEOFF_CV[E]="turbo_kv_4b"
-FACEOFF_NGL[E]=0
-FACEOFF_CTX[E]=2048
-
-for tag in A B C D E; do
+for tag in A B C D; do
     echo "  --- Config $tag: ${FACEOFF_LABEL[$tag]} ---"
     echo "  Starting server..."
 
     DRAFT_ARGS=""
-    if [ "$tag" = "E" ]; then
-        DRAFT_MODEL="/home/llm/models/Qwen3.5-0.8B-Q4_K_M.gguf"
+    if [ "$tag" = "D" ]; then
+        DRAFT_MODEL="/home/llm/models/Qwen3.5-0.8B-mtp-q6k.gguf"
         DRAFT_ARGS="-md $DRAFT_MODEL --ngld 99"
     fi
 
