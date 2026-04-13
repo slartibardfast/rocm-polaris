@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 LLAMA_DIR="llama.cpp/src/llama.cpp-b8508"
 BIN="$LLAMA_DIR/build-tq/bin"
-MODEL="/home/llm/models/Qwen3.5-35B-A3B-mtp-q4km.gguf"
+MODEL="/home/llm/models/Qwen3.5-27B-mtp-toolcall.gguf"
 WIKITEXT="tests/wikitext-2-test.txt"
 WIKITEXT_SHORT="/tmp/wikitext-overnight.txt"
 RESULTS="tests/overnight_split_k_results.txt"
@@ -196,7 +196,7 @@ for tag in A B C D; do
 
     DRAFT_ARGS=""
     if [ "$tag" = "D" ]; then
-        DRAFT_MODEL="/home/llm/models/Qwen3.5-0.8B-mtp-q6k.gguf"
+        DRAFT_MODEL="/home/llm/models/Qwen3.5-27B-mtp-toolcall.gguf"
         DRAFT_ARGS="-md $DRAFT_MODEL -ngld 99"
     fi
 
